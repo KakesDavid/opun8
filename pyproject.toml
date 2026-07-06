@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=70.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opun8"
+version = "0.1.0"
+description = "Developer-first deployment platform."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer",
+    "rich",
+    "httpx",
+    "python-dotenv",
+    "pydantic",
+    "gitpython",
+    "keyring"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+opun8 = "opun8.main:main"
