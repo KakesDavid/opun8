@@ -1,112 +1,237 @@
 """
 UI messages for Opun8.
+All user-facing messages in one place.
 """
 
-from __future__ import annotations
-
 import typer
+from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt, Confirm
 
-from .console import console
+console = Console()
 
 
-def welcome() -> None:
-    """Display the welcome message."""
+# ──────────────────────────────────────────────────────────────
+# CORE MESSAGES
+# ──────────────────────────────────────────────────────────────
+
+def success(message: str) -> None:
+    console.print(f"[bold green]✅ {message}[/bold green]")
+
+
+def info(message: str) -> None:
+    console.print(f"[bold blue]ℹ️ {message}[/bold blue]")
+
+
+def warning(message: str) -> None:
+    console.print(f"[bold yellow]⚠️ {message}[/bold yellow]")
+
+
+def error(message: str, suggestion: str = "") -> None:
     console.print()
     console.print(Panel(
-        "[bold cyan]Welcome to Opun8[/bold cyan]\n"
-        "[dim]The deployment platform for developers.[/dim]",
+        f"[bold red]❌ {message}[/bold red]\n\n"
+        f"[dim]💡 {suggestion or 'Try again or run: opun8 --help'}[/dim]",
+        border_style="red",
+        padding=(1, 2),
+        width=60,
+    ))
+    console.print()
+
+
+def goodbye() -> None:
+    console.print()
+    console.print(Panel(
+        "[bold cyan]👋 Thanks for using Opun8![/bold cyan]\n\n"
+        "[dim]Built by Kakes David Team[/dim]\n"
+        "[dim]⭐ Star us on GitHub: github.com/KakesDavid/opun8[/dim]",
         border_style="cyan",
         padding=(1, 2),
         width=60,
     ))
-    
     console.print()
-    console.print("I can help you deploy your projects without the usual hassle.")
-    console.print()
-    
-    console.print("[bold]Here's what I can do for you:[/bold]")
-    console.print()
-    
-    features = Table(show_header=False, box=None, padding=(0, 2))
-    features.add_column(style="bold", width=4)
-    features.add_column(style="white")
-    
-    features.add_row("", "Deploy to [bold]Vercel[/bold], [bold]Netlify[/bold], and more")
-    features.add_row("", "Detect your project type [bold]automatically[/bold]")
-    features.add_row("", "Connect to [bold]GitHub[/bold] seamlessly")
-    features.add_row("", "Check your environment with [bold]doctor[/bold]")
-    
-    console.print(features)
-    
-    console.print()
-    console.print("[bold]Quick Start:[/bold]")
-    console.print()
-    
-    commands = Table(show_header=False, box=None, padding=(0, 2))
-    commands.add_column(style="bold green", width=18)
-    commands.add_column(style="white")
-    
-    commands.add_row("opun8 doctor", "Check if everything is ready")
-    commands.add_row("opun8 detect", "Find out what project type you have")
-    commands.add_row("opun8 deploy", "Deploy your project")
-    
-    console.print(commands)
-    
-    console.print()
-    console.print("[dim]Need help? Visit: [cyan]https://opun8.dev/docs[/cyan][/dim]")
-    console.print()
-    
-    show_menu()
 
 
-def show_menu() -> None:
-    """Display interactive menu."""
+# ──────────────────────────────────────────────────────────────
+# WELCOME & MAIN MENU
+# ──────────────────────────────────────────────────────────────
+
+def show_welcome():
+    """Display the welcome screen."""
+    console.print("\n" * 2)
+    console.print(Panel(
+        "[bold cyan]🦉 Welcome to Opun8[/bold cyan]\n"
+        "[dim]The deployment platform that guides you from idea to live website.[/dim]\n\n"
+        "I'm here to help you deploy your project. Let's do this together.\n\n"
+        "[bold]Before we start, let me understand what you're working on.[/bold]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=65,
+    ))
     console.print()
     console.print("[bold]What would you like to do?[/bold]")
     console.print()
-    
-    console.print("  [bold cyan]1[/]  Deploy my project")
-    console.print("  [bold cyan]2[/]  Login to GitHub")
-    console.print("  [bold cyan]3[/]  Settings")
-    console.print("  [bold cyan]4[/]  Exit")
+    console.print("  [bold cyan]1[/] 📁  [white]Detect my project[/white]  [dim](Recommended)[/dim]")
+    console.print("  [bold cyan]2[/] 🔍  [white]Check my environment[/white]")
+    console.print("  [bold cyan]3[/] 📚  [white]View all commands[/white]")
+    console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
+    console.print()
+    console.print("[dim]💡 Tip: Start with 'Detect my project' so I can understand your code.[/dim]")
     console.print()
     
     choice = Prompt.ask(
-        "[bold cyan]Select an option[/]",
+        "[bold cyan]➜[/] Select an option",
         choices=["1", "2", "3", "4"],
         default="1",
         show_choices=False,
     )
     
     if choice == "1":
-        console.print("\n[yellow]Deploying your project... (coming soon)[/]")
+        from opun8.commands.detect import detect
+        detect()
     elif choice == "2":
-        console.print("\n[yellow]Connecting to GitHub... (coming soon)[/]")
+        from opun8.commands.doctor import doctor
+        doctor()
     elif choice == "3":
-        console.print("\n[yellow]Opening settings... (coming soon)[/]")
+        show_help()
     elif choice == "4":
-        console.print("\n[dim]Goodbye![/]")
+        goodbye()
         raise typer.Exit()
 
 
-def success(message: str) -> None:
-    """Display a success message."""
-    console.print(f"[bold green]OK[/bold green] {message}")
+def show_help():
+    """Display all commands."""
+    console.print("\n" * 2)
+    console.print(Panel(
+        "[bold cyan]📚 Opun8 Commands[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=60,
+    ))
+    console.print()
+    
+    table = Table(show_header=True, header_style="bold cyan", box=None)
+    table.add_column("Command", style="bold green", width=16)
+    table.add_column("Description", style="white", width=40)
+    
+    table.add_row("opun8", "Show welcome screen")
+    table.add_row("opun8 --version", "Show version")
+    table.add_row("opun8 doctor", "Check environment")
+    table.add_row("opun8 detect", "Detect project type")
+    table.add_row("opun8 deploy", "Deploy your project")
+    table.add_row("opun8 help", "Show this help")
+    
+    console.print(table)
+    console.print()
+    console.print("[dim]💡 For more details, visit: [cyan]https://opun8.dev/docs[/cyan][/dim]")
+    console.print()
+    
+    console.print("[bold]What would you like to do next?[/bold]")
+    console.print()
+    console.print("  [bold cyan]1[/] 🔙  [white]Go back to main menu[/white]")
+    console.print("  [bold cyan]2[/] 🚪  [white]Exit[/white]")
+    console.print()
+    
+    choice = Prompt.ask(
+        "[bold cyan]➜[/] Select an option",
+        choices=["1", "2"],
+        default="1",
+        show_choices=False,
+    )
+    
+    if choice == "1":
+        show_welcome()
+    else:
+        goodbye()
+        raise typer.Exit()
 
 
-def info(message: str) -> None:
-    """Display an informational message."""
-    console.print(f"[bold blue]Info[/bold blue] {message}")
+# ──────────────────────────────────────────────────────────────
+# DETECTION UI
+# ──────────────────────────────────────────────────────────────
+
+def detection_start():
+    console.print()
+    console.print(Panel(
+        "[bold cyan]📁 Detecting Your Project[/bold cyan]\n"
+        "[dim]Scanning your current folder...[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=60,
+    ))
 
 
-def warning(message: str) -> None:
-    """Display a warning message."""
-    console.print(f"[bold yellow]Warning[/bold yellow] {message}")
+def detection_complete(result: dict):
+    console.print()
+    console.print("[bold green]✅ Project detected successfully![/bold green]")
+    console.print()
+    console.print("[bold]🧠 I've analyzed your project:[/bold]")
+    console.print()
+    
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="bold white", width=16)
+    table.add_column(style="white", width=40)
+    
+    table.add_row("Type", result.get("type", "Unknown"))
+    table.add_row("Framework", result.get("framework", "Unknown"))
+    table.add_row("Package Manager", result.get("package_manager", "Unknown"))
+    table.add_row("Build Command", result.get("build_command", "Not found"))
+    table.add_row("Output Directory", result.get("output_dir", "Unknown"))
+    
+    console.print(table)
 
 
-def error(message: str) -> None:
-    """Display an error message."""
-    console.print(f"[bold red]Error[/bold red] {message}")
+def no_project_detected():
+    console.print()
+    console.print("[yellow]⚠️ No project detected.[/yellow]")
+    console.print()
+    console.print("[dim]Make sure you're in a project folder with:[/dim]")
+    console.print("[dim]  • package.json (Node.js/React/Next.js)[/dim]")
+    console.print("[dim]  • index.html (Static HTML)[/dim]")
+    console.print("[dim]  • requirements.txt (Python)[/dim]")
+    console.print()
+    
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print()
+    console.print("  [bold cyan]1[/] 📁  [white]Create a new project[/white]")
+    console.print("  [bold cyan]2[/] 📂  [white]Go to a different folder[/white]")
+    console.print("  [bold cyan]3[/] 🚪  [white]Exit[/white]")
+    console.print()
+
+
+def show_deploy_menu():
+    console.print()
+    console.print("[bold]What would you like to do next?[/bold]")
+    console.print()
+    console.print("  [bold cyan]1[/] 🚀  [white]Deploy this project[/white]")
+    console.print("  [bold cyan]2[/] 📊  [white]View more details[/white]")
+    console.print("  [bold cyan]3[/] 🔄  [white]Go back[/white]")
+    console.print()
+
+
+def show_details(result: dict):
+    console.print()
+    console.print("[bold cyan]📊 Project Details[/bold cyan]")
+    console.print()
+    
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="bold white", width=20)
+    table.add_column(style="white", width=40)
+    
+    fields = ["type", "framework", "package_manager", "build_command", "output_dir", "node_version"]
+    
+    for key in fields:
+        value = result.get(key)
+        if value:
+            display_key = key.replace("_", " ").title()
+            if isinstance(value, list):
+                value = ", ".join(value[:5]) + ("..." if len(value) > 5 else "")
+            table.add_row(display_key, str(value))
+    
+    deps = result.get("dependencies", [])
+    if deps:
+        table.add_row("Dependencies", ", ".join(deps[:5]) + ("..." if len(deps) > 5 else ""))
+    
+    console.print(table)
+    console.print()

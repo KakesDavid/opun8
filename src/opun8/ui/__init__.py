@@ -1,11 +1,5 @@
-from .console import console
-from .messages import welcome, success, info, warning, error
+"""
+UI module for Opun8.
+"""
 
-__all__ = [
-    "console",
-    "welcome",
-    "success",
-    "info",
-    "warning",
-    "error",
-]
+from opun8.ui.messages import *

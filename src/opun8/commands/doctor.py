@@ -24,11 +24,9 @@ def doctor():
         width=60,
     ))
 
-    # Run all checks
     checker = EnvironmentChecker()
     results = checker.check_all()
 
-    # Display results
     table = Table(
         title="Environment Status",
         box=box.ROUNDED,
@@ -40,13 +38,11 @@ def doctor():
     table.add_column("Details", style="dim", width=30)
 
     for key, result in results.items():
-        status_icon = "✅" if result["passed"] else "❌"
         status_text = "[green]OK[/green]" if result["passed"] else "[red]Missing[/red]"
         table.add_row(result["name"], status_text, result["details"])
 
     console.print(table)
 
-    # Summary
     all_passed = all(r["passed"] for r in results.values())
     if all_passed:
         console.print()
@@ -67,7 +63,6 @@ def doctor():
             width=60,
         ))
 
-    # Show project info if detected
     project_info = results.get("project", {})
     if project_info.get("passed"):
         console.print()
