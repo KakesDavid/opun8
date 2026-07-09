@@ -1,0 +1,8 @@
+typer
+rich
+httpx
+python-dotenv
+pydantic
+gitpython
+keyring
+requests

@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
 
+from opun8.auth import is_authenticated, get_authenticated_user
+
 console = Console()
 
 
@@ -70,19 +72,29 @@ def show_welcome():
         width=65,
     ))
     console.print()
+    
+    # Show GitHub status if connected
+    if is_authenticated():
+        user = get_authenticated_user()
+        console.print(f"[dim]🔗 Connected to GitHub as: [green]{user}[/green][/dim]")
+    else:
+        console.print("[dim]🔗 Not connected to GitHub. Use 'opun8 github' to connect.[/dim]")
+    
+    console.print()
     console.print("[bold]What would you like to do?[/bold]")
     console.print()
     console.print("  [bold cyan]1[/] 📁  [white]Detect my project[/white]  [dim](Recommended)[/dim]")
     console.print("  [bold cyan]2[/] 🔍  [white]Check my environment[/white]")
-    console.print("  [bold cyan]3[/] 📚  [white]View all commands[/white]")
-    console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
+    console.print("  [bold cyan]3[/] 🔗  [white]Connect GitHub[/white]")
+    console.print("  [bold cyan]4[/] 📚  [white]View all commands[/white]")
+    console.print("  [bold cyan]5[/] 🚪  [white]Exit[/white]")
     console.print()
     console.print("[dim]💡 Tip: Start with 'Detect my project' so I can understand your code.[/dim]")
     console.print()
     
     choice = Prompt.ask(
         "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3", "4"],
+        choices=["1", "2", "3", "4", "5"],
         default="1",
         show_choices=False,
     )
@@ -94,8 +106,11 @@ def show_welcome():
         from opun8.commands.doctor import doctor
         doctor()
     elif choice == "3":
-        show_help()
+        from opun8.cli import github
+        github()
     elif choice == "4":
+        show_help()
+    elif choice == "5":
         goodbye()
         raise typer.Exit()
 
@@ -120,6 +135,8 @@ def show_help():
     table.add_row("opun8 doctor", "Check environment")
     table.add_row("opun8 detect", "Detect project type")
     table.add_row("opun8 deploy", "Deploy your project")
+    table.add_row("opun8 github", "Connect to GitHub")
+    table.add_row("opun8 logout", "Logout from GitHub")
     table.add_row("opun8 help", "Show this help")
     
     console.print(table)
@@ -191,22 +208,17 @@ def no_project_detected():
     console.print("[dim]  • index.html (Static HTML)[/dim]")
     console.print("[dim]  • requirements.txt (Python)[/dim]")
     console.print()
-    
-    console.print("[bold]What would you like to do?[/bold]")
-    console.print()
-    console.print("  [bold cyan]1[/] 📁  [white]Create a new project[/white]")
-    console.print("  [bold cyan]2[/] 📂  [white]Go to a different folder[/white]")
-    console.print("  [bold cyan]3[/] 🚪  [white]Exit[/white]")
-    console.print()
 
 
 def show_deploy_menu():
+    """Show menu after detection with 4 options."""
     console.print()
     console.print("[bold]What would you like to do next?[/bold]")
     console.print()
     console.print("  [bold cyan]1[/] 🚀  [white]Deploy this project[/white]")
     console.print("  [bold cyan]2[/] 📊  [white]View more details[/white]")
     console.print("  [bold cyan]3[/] 🔄  [white]Go back[/white]")
+    console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
     console.print()
 
 

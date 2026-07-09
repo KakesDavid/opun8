@@ -13,6 +13,7 @@ from rich.table import Table
 from opun8.core.detector import ProjectDetector
 from opun8.core.templates import ProjectTemplates
 from opun8.services import navigation as nav
+from opun8.services.recent_projects import get_recent_projects, add_recent_project
 from opun8.ui.messages import (
     detection_start,
     detection_complete,
@@ -37,31 +38,18 @@ def detect():
     result = detector.detect()
     
     if not result["is_detected"]:
-        no_project_detected()
-        
-        choice = Prompt.ask(
-            "[bold cyan]➜[/] Select an option",
-            choices=["1", "2", "3"],
-            default="1",
-            show_choices=False,
-        )
-        
-        if choice == "1":
-            create_new_project()
-        elif choice == "2":
-            go_to_folder()
-        elif choice == "3":
-            goodbye()
-            return
-        
+        show_no_project_menu()
         return
+    
+    # Add to recent projects
+    add_recent_project(str(Path.cwd()))
     
     detection_complete(result)
     show_deploy_menu()
     
     choice = Prompt.ask(
         "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3"],
+        choices=["1", "2", "3", "4"],
         default="1",
         show_choices=False,
     )
@@ -74,6 +62,87 @@ def detect():
     elif choice == "3":
         from opun8.cli import main
         main()
+    elif choice == "4":
+        goodbye()
+        return
+
+
+def show_no_project_menu():
+    """Show menu when no project is detected with recent projects."""
+    console.print()
+    console.print("[yellow]⚠️ No project detected in current folder.[/yellow]")
+    console.print()
+    
+    # Show recent projects
+    recent = get_recent_projects()
+    if recent:
+        console.print("[bold]📁 Recent Projects:[/bold]")
+        console.print()
+        for i, project in enumerate(recent, 1):
+            console.print(f"  [bold cyan]{i}[/]  [white]{project['name']}[/white]  [dim]({project['path']})[/dim]")
+        console.print()
+        console.print(f"  [bold cyan]{len(recent) + 1}[/]  📂  [white]Browse for a different folder[/white]")
+        console.print(f"  [bold cyan]{len(recent) + 2}[/]  📁  [white]Create a new project[/white]")
+        console.print("  [bold cyan]0[/]  🚪  [white]Exit[/white]")
+        console.print()
+        
+        choice = Prompt.ask(
+            "[bold cyan]➜[/] Select an option",
+            choices=[str(i) for i in range(0, len(recent) + 3)],
+            default="1",
+            show_choices=False,
+        )
+        
+        try:
+            choice_num = int(choice)
+            if choice_num == 0:
+                goodbye()
+                return
+            elif 1 <= choice_num <= len(recent):
+                # Navigate to recent project
+                project_path = recent[choice_num - 1]["path"]
+                if Path(project_path).exists():
+                    os.chdir(project_path)
+                    console.print(f"[green]✅ Changed to: {project_path}[/green]")
+                    detect()
+                    return
+                else:
+                    console.print("[red]❌ Project path no longer exists.[/red]")
+                    from opun8.services.recent_projects import remove_recent_project
+                    remove_recent_project(project_path)
+                    show_no_project_menu()
+                    return
+            elif choice_num == len(recent) + 1:
+                go_to_folder()
+                return
+            elif choice_num == len(recent) + 2:
+                create_new_project()
+                return
+        except ValueError:
+            pass
+    
+    # If no recent projects or invalid choice
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print()
+    console.print("  [bold cyan]1[/] 📁  [white]Create a new project[/white]")
+    console.print("  [bold cyan]2[/] 📂  [white]Go to a different folder[/white]")
+    console.print("  [bold cyan]3[/] 🚪  [white]Exit[/white]")
+    console.print()
+    
+    choice = Prompt.ask(
+        "[bold cyan]➜[/] Select an option",
+        choices=["1", "2", "3"],
+        default="1",
+        show_choices=False,
+    )
+    
+    if choice == "1":
+        create_new_project()
+    elif choice == "2":
+        go_to_folder()
+    elif choice == "3":
+        goodbye()
+        return
 
 
 def create_new_project():
@@ -202,12 +271,10 @@ def open_folder_picker():
         import tkinter as tk
         from tkinter import filedialog
         
-        # Create a simple root window and hide it
         root = tk.Tk()
         root.withdraw()
         root.attributes('-topmost', True)
         
-        # Open folder dialog
         folder_path = filedialog.askdirectory(
             title="Select a folder for your new project",
             mustexist=True
@@ -220,15 +287,9 @@ def open_folder_picker():
         return None
         
     except ImportError:
-        # Fallback: try using ctypes if tkinter is not available
         try:
-            import ctypes
-            from ctypes import wintypes
-            
-            # Windows folder picker using shell32
-            # This is a simpler approach using the native Windows API
-            import subprocess
             import tempfile
+            import subprocess
             
             ps_script = '''
             Add-Type -AssemblyName System.Windows.Forms

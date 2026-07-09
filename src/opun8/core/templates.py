@@ -1,57 +1,59 @@
 """
 Project templates for Opun8.
+Fetches templates from remote sources instead of storing code locally.
 """
 
-import json
 import os
 import subprocess
+import zipfile
+import tempfile
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any
-
 from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+
+import requests
 
 console = Console()
 
 
 class ProjectTemplates:
-    """Generate project templates with user feedback."""
+    """Fetch and create project templates from remote sources."""
 
-    TEMPLATES: Dict[str, Dict[str, Any]] = {
+    TEMPLATES = {
         "react": {
             "name": "React + Vite",
             "description": "Modern React with Vite, fast and lightweight.",
-            "command": ["npm", "create", "vite@latest", "."],
-            "dependencies": ["react", "react-dom"],
-            "dev_dependencies": ["vite", "@vitejs/plugin-react"],
+            "source": "https://github.com/KakesDavid/opun8-template-react/archive/master.zip",
+            "dependencies": [],
+            "dev_dependencies": [],
         },
         "nextjs": {
             "name": "Next.js",
             "description": "Full-stack React framework with SSR and SSG.",
-            "command": ["npx", "create-next-app@latest", "."],
-            "dependencies": ["next", "react", "react-dom"],
+            "source": None,  # Placeholder - will implement later
+            "dependencies": [],
             "dev_dependencies": [],
         },
         "static": {
             "name": "Static HTML + CSS",
             "description": "Simple HTML, CSS, and JavaScript.",
-            "command": None,
+            "source": None,  # Created locally
             "dependencies": [],
             "dev_dependencies": [],
         },
         "node": {
             "name": "Node.js API",
             "description": "Express.js REST API with JavaScript.",
-            "command": ["npm", "init", "-y"],
-            "dependencies": ["express", "cors", "dotenv"],
-            "dev_dependencies": ["nodemon"],
+            "source": None,  # Created locally
+            "dependencies": [],
+            "dev_dependencies": [],
         },
     }
 
     @classmethod
     def create_project(cls, template: str, project_name: str, path: Optional[Path] = None) -> bool:
-        """Create a new project from template with progress feedback."""
+        """Create a new project from template."""
         if template not in cls.TEMPLATES:
             console.print("[red]Error: Unknown template.[/red]")
             return False
@@ -59,234 +61,106 @@ class ProjectTemplates:
         target_path = path or Path.cwd()
         project_path = target_path / project_name
 
-        # Check if directory already exists
         if project_path.exists():
             console.print(f"[yellow]Directory '{project_name}' already exists.[/yellow]")
-            overwrite = input("Overwrite? (y/N): ").strip().lower()
-            if overwrite != 'y':
-                console.print("[dim]Project creation cancelled.[/dim]")
-                return False
+            return False
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("[cyan]Creating project...", total=None)
+        project_path.mkdir(parents=True, exist_ok=True)
 
-            try:
-                # Create project directory
-                project_path.mkdir(parents=True, exist_ok=True)
-                os.chdir(project_path)
+        template_config = cls.TEMPLATES[template]
 
-                # Run template-specific creation
-                if template == "react":
-                    success = cls._create_react_project(project_path, project_name)
-                elif template == "nextjs":
-                    success = cls._create_nextjs_project(project_path, project_name)
-                elif template == "static":
-                    success = cls._create_static_project(project_path, project_name)
-                elif template == "node":
-                    success = cls._create_node_project(project_path, project_name)
-                else:
-                    success = False
-
-                if success:
-                    progress.update(task, description="[green]Project created successfully!")
-                    return True
-                else:
-                    progress.update(task, description="[red]Failed to create project.")
-                    return False
-
-            except Exception as e:
-                console.print(f"[red]Error creating project: {e}[/red]")
-                return False
-
-    # ──────────────────────────────────────────────────────────────
-    # REACT + VITE
-    # ──────────────────────────────────────────────────────────────
+        if template_config["source"]:
+            # Fetch from remote source
+            return cls._create_from_remote(template, project_path, template_config)
+        else:
+            # Create locally (static or node)
+            return cls._create_locally(template, project_path)
 
     @classmethod
-    def _create_react_project(cls, project_path: Path, project_name: str) -> bool:
-        """Create React + Vite project."""
+    def _create_from_remote(cls, template: str, project_path: Path, config: Dict) -> bool:
+        """Fetch and extract template from remote source."""
         try:
-            # Try Vite create command first
-            subprocess.run(
-                ["npm", "create", "vite@latest", project_name, "--", "--template", "react"],
-                cwd=project_path.parent,
-                check=True,
-                capture_output=True,
-            )
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            # Fallback to manual creation
-            return cls._create_react_manual(project_path, project_name)
+            console.print("[dim]📥 Downloading template...[/dim]")
 
-    @classmethod
-    def _create_react_manual(cls, project_path: Path, project_name: str) -> bool:
-        """Manually create React project (fallback)."""
-        try:
-            # package.json
-            package_json = {
-                "name": project_name,
-                "version": "1.0.0",
-                "type": "module",
-                "scripts": {
-                    "dev": "vite",
-                    "build": "vite build",
-                    "preview": "vite preview",
-                },
-                "dependencies": {
-                    "react": "^18.3.1",
-                    "react-dom": "^18.3.1",
-                },
-                "devDependencies": {
-                    "@vitejs/plugin-react": "^4.0.0",
-                    "vite": "^5.0.0",
-                },
-            }
-            with open(project_path / "package.json", "w", encoding="utf-8") as f:
-                json.dump(package_json, f, indent=2)
+            # Download ZIP
+            response = requests.get(config["source"], timeout=60)
+            response.raise_for_status()
 
-            # index.html
-            html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{project_name}</title>
-</head>
-<body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-</body>
-</html>"""
-            with open(project_path / "index.html", "w", encoding="utf-8") as f:
-                f.write(html)
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp_file:
+                tmp_file.write(response.content)
+                zip_path = tmp_file.name
 
-            # src folder
-            src_path = project_path / "src"
-            src_path.mkdir(exist_ok=True)
+            console.print("[dim]📦 Extracting template...[/dim]")
 
-            main_jsx = """import React from 'react'
-import ReactDOM from 'react-dom/client'
-import App from './App'
-import './index.css'
+            # Extract to a temporary directory
+            extract_dir = tempfile.mkdtemp()
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
 
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>,
-)"""
-            with open(src_path / "main.jsx", "w", encoding="utf-8") as f:
-                f.write(main_jsx)
+            # Find the extracted folder (GitHub wraps everything in a root folder)
+            extracted_items = list(Path(extract_dir).iterdir())
 
-            app_jsx = """import React from 'react'
-import './App.css'
+            # If there's exactly one folder and it contains a package.json, it's the wrapper
+            if len(extracted_items) == 1 and extracted_items[0].is_dir():
+                source_folder = extracted_items[0]
+            else:
+                # If multiple items, it's already flat
+                source_folder = Path(extract_dir)
 
-function App() {
-  return (
-    <div className="App">
-      <h1>Hello, Opun8!</h1>
-      <p>Your React app is ready.</p>
-    </div>
-  )
-}
+            # Move all contents from source_folder to project_path
+            for item in source_folder.iterdir():
+                dest = project_path / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest)
 
-export default App"""
-            with open(src_path / "App.jsx", "w", encoding="utf-8") as f:
-                f.write(app_jsx)
+            # Clean up
+            os.unlink(zip_path)
+            shutil.rmtree(extract_dir)
 
-            index_css = """:root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-}
-body {
-  margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
-}"""
-            with open(src_path / "index.css", "w", encoding="utf-8") as f:
-                f.write(index_css)
+            # Remove .git folder if it exists
+            git_folder = project_path / ".git"
+            if git_folder.exists():
+                shutil.rmtree(git_folder)
 
-            app_css = """.App {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
-}
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
-}"""
-            with open(src_path / "App.css", "w", encoding="utf-8") as f:
-                f.write(app_css)
+            # Check if package.json exists after extraction
+            if (project_path / "package.json").exists():
+                console.print("[green]✅ Template downloaded and extracted successfully![/green]")
+                return True
+            else:
+                console.print("[red]❌ Extraction failed: package.json not found.[/red]")
+                return False
 
-            # vite.config.js
-            vite_config = """import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-export default defineConfig({
-  plugins: [react()],
-})"""
-            with open(project_path / "vite.config.js", "w", encoding="utf-8") as f:
-                f.write(vite_config)
-
-            # Install dependencies
-            console.print("[dim]Installing dependencies (may take a moment)...[/dim]")
-            subprocess.run(["npm", "install"], cwd=project_path, check=True, capture_output=True)
-
-            return True
         except Exception as e:
-            console.print(f"[red]Manual React creation failed: {e}[/red]")
+            console.print(f"[red]Failed to fetch template: {e}[/red]")
             return False
 
-    # ──────────────────────────────────────────────────────────────
-    # NEXT.JS
-    # ──────────────────────────────────────────────────────────────
+    @classmethod
+    def _create_locally(cls, template: str, project_path: Path) -> bool:
+        """Create template locally (for static and node templates)."""
+        if template == "static":
+            return cls._create_static_project(project_path)
+        elif template == "node":
+            return cls._create_node_project(project_path)
+        return False
 
     @classmethod
-    def _create_nextjs_project(cls, project_path: Path, project_name: str) -> bool:
-        """Create Next.js project."""
-        try:
-            subprocess.run(
-                ["npx", "create-next-app@latest", project_name, "--js", "--tailwind", "--eslint"],
-                cwd=project_path.parent,
-                check=True,
-                capture_output=True,
-            )
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            console.print(f"[red]Next.js creation failed: {e}[/red]")
-            return False
-
-    # ──────────────────────────────────────────────────────────────
-    # STATIC HTML + CSS + JS
-    # ──────────────────────────────────────────────────────────────
-
-    @classmethod
-    def _create_static_project(cls, project_path: Path, project_name: str) -> bool:
+    def _create_static_project(cls, project_path: Path) -> bool:
         """Create static HTML project."""
         try:
-            # index.html
-            html = f"""<!DOCTYPE html>
+            html = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{project_name}</title>
+    <title>My Static Site</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
-        <h1>Welcome to {project_name}</h1>
+        <h1>Welcome to Opun8</h1>
         <p>Your static site is ready.</p>
         <button onclick="handleClick()">Click me!</button>
     </div>
@@ -296,7 +170,6 @@ export default defineConfig({
             with open(project_path / "index.html", "w", encoding="utf-8") as f:
                 f.write(html)
 
-            # style.css
             css = """* {
     margin: 0;
     padding: 0;
@@ -330,7 +203,6 @@ h1 {
 p {
     color: #666;
     margin-bottom: 24px;
-    font-size: 16px;
 }
 
 button {
@@ -351,7 +223,6 @@ button:hover {
             with open(project_path / "style.css", "w", encoding="utf-8") as f:
                 f.write(css)
 
-            # script.js
             js = """function handleClick() {
     alert('Hello from Opun8!');
 }"""
@@ -363,17 +234,14 @@ button:hover {
             console.print(f"[red]Static creation failed: {e}[/red]")
             return False
 
-    # ──────────────────────────────────────────────────────────────
-    # NODE.JS API
-    # ──────────────────────────────────────────────────────────────
-
     @classmethod
-    def _create_node_project(cls, project_path: Path, project_name: str) -> bool:
+    def _create_node_project(cls, project_path: Path) -> bool:
         """Create Node.js API project."""
         try:
-            # package.json
+            import json
+
             package_json = {
-                "name": project_name,
+                "name": project_path.name,
                 "version": "1.0.0",
                 "description": "Node.js API with Express",
                 "main": "server.js",
@@ -393,19 +261,16 @@ button:hover {
             with open(project_path / "package.json", "w", encoding="utf-8") as f:
                 json.dump(package_json, f, indent=2)
 
-            # server.js
-            server = """require('dotenv').config();
+            server_js = """require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Routes
 app.get('/', (req, res) => {
     res.json({ message: 'Hello from Opun8!' });
 });
@@ -414,20 +279,18 @@ app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-// Start server
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
 });"""
             with open(project_path / "server.js", "w", encoding="utf-8") as f:
-                f.write(server)
+                f.write(server_js)
 
-            # .env
             env = f"""PORT=3000
 NODE_ENV=development"""
             with open(project_path / ".env", "w", encoding="utf-8") as f:
                 f.write(env)
 
-            console.print("[dim]Installing dependencies (may take a moment)...[/dim]")
+            console.print("[dim]Installing dependencies...[/dim]")
             subprocess.run(["npm", "install"], cwd=project_path, check=True, capture_output=True)
 
             return True
