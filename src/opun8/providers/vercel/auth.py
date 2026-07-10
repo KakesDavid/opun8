@@ -15,7 +15,7 @@ import secrets
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -61,6 +61,24 @@ if not CLIENT_ID:
     )
 
 TOKEN_FILE = Path.home() / ".opun8" / "vercel_token.json"
+
+
+# ------------------------------------------------------------------------------
+# Deploy Callback
+# ------------------------------------------------------------------------------
+
+_DEPLOY_CALLBACK: Optional[Callable] = None
+
+
+def set_deploy_callback(callback: Callable) -> None:
+    """Set the deploy callback function for empty-state flow."""
+    global _DEPLOY_CALLBACK
+    _DEPLOY_CALLBACK = callback
+
+
+def get_deploy_callback() -> Optional[Callable]:
+    """Get the deploy callback function."""
+    return _DEPLOY_CALLBACK
 
 
 # ------------------------------------------------------------------------------
@@ -500,6 +518,10 @@ def show_vercel_projects(deploy_callback=None, team_id: Optional[str] = None) ->
     if not token:
         console.print("[yellow]Not connected to Vercel yet. Run the login flow first.[/yellow]")
         return
+
+    # Use provided callback or fallback to global one
+    if deploy_callback is None:
+        deploy_callback = get_deploy_callback()
 
     user = get_vercel_user()
     scope = get_vercel_scope()

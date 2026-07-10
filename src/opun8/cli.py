@@ -21,6 +21,7 @@ from opun8.providers.vercel.auth import (
     logout_vercel,
     show_vercel_projects,
     switch_vercel_team,
+    set_deploy_callback,
 )
 
 app = typer.Typer(
@@ -51,6 +52,10 @@ def main(
         show_welcome()
 
 
+# ──────────────────────────────────────────────────────────────
+# COMMANDS
+# ──────────────────────────────────────────────────────────────
+
 @app.command()
 def doctor():
     """Check your environment and project."""
@@ -69,8 +74,14 @@ def detect():
 def deploy():
     """Deploy your project to the cloud."""
     from opun8.commands.deploy import deploy as deploy_cmd
+    # Set the deploy callback for Vercel empty-state flow
+    set_deploy_callback(deploy_cmd)
     deploy_cmd()
 
+
+# ──────────────────────────────────────────────────────────────
+# GITHUB COMMANDS
+# ──────────────────────────────────────────────────────────────
 
 @app.command()
 def github(
@@ -142,6 +153,10 @@ def github(
         console.print("[red]❌ Connection failed.[/red]")
 
 
+# ──────────────────────────────────────────────────────────────
+# VERCEL COMMANDS
+# ──────────────────────────────────────────────────────────────
+
 @app.command()
 def vercel(
     logout_flag: bool = typer.Option(
@@ -174,7 +189,8 @@ def vercel(
 
     if show_flag:
         from opun8.commands.deploy import deploy as deploy_cmd
-        show_vercel_projects(deploy_callback=deploy_cmd)
+        set_deploy_callback(deploy_cmd)
+        show_vercel_projects()
         return
 
     if is_vercel_authenticated():
@@ -183,7 +199,8 @@ def vercel(
         console.print("[dim]To switch teams, run: opun8 vercel --switch[/dim]")
         console.print()
         from opun8.commands.deploy import deploy as deploy_cmd
-        show_vercel_projects(deploy_callback=deploy_cmd)
+        set_deploy_callback(deploy_cmd)
+        show_vercel_projects()
         return
 
     console.print()
@@ -192,13 +209,19 @@ def vercel(
     console.print()
 
     from opun8.commands.deploy import deploy as deploy_cmd
-    token = login_to_vercel(deploy_callback=deploy_cmd)
+    set_deploy_callback(deploy_cmd)
+
+    token = login_to_vercel()
 
     if token:
         console.print("[green]✅ Connected to Vercel successfully![/green]")
     else:
         console.print("[red]❌ Connection failed.[/red]")
 
+
+# ──────────────────────────────────────────────────────────────
+# LOGOUT
+# ──────────────────────────────────────────────────────────────
 
 @app.command(name="logout")
 def logout_all():
@@ -207,6 +230,10 @@ def logout_all():
     logout_vercel()
     console.print("[green]✅ Logged out from all services.[/green]")
 
+
+# ──────────────────────────────────────────────────────────────
+# HELP
+# ──────────────────────────────────────────────────────────────
 
 @app.command()
 def help():

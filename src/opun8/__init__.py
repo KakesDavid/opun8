@@ -1,7 +1,9 @@
 """
-Opun8 package.
+Opun8 - Universal Deployment Platform.
+
+Build. Deploy. Scale.
 """
 
-from .version import __version__
+from opun8.version import __version__
 
 __all__ = ["__version__"]
