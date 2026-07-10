@@ -14,6 +14,7 @@ from rich.table import Table
 from rich.prompt import Prompt
 
 from opun8.auth import is_authenticated, get_authenticated_user
+from opun8.services.recent_projects import get_recent_projects
 
 console = Console()
 
@@ -49,6 +50,7 @@ _SYMBOLS = {
     "arrow": "➜" if not _NO_EMOJI else ">",
     "point": "👉" if not _NO_EMOJI else "->",
     "party": "🎉" if not _NO_EMOJI else "",
+    "browse": "📂" if not _NO_EMOJI else "",
 }
 
 
@@ -161,6 +163,17 @@ def _render_welcome_and_get_next() -> str:
         console.print(f"[dim]{_sym('link')} Connected to GitHub as [green]{user}[/green] — you're all set to deploy.[/dim]")
     else:
         console.print(f"[dim]{_sym('link')} Not connected to GitHub yet. Run 'opun8 github' anytime to connect.[/dim]")
+
+    # Show recent projects
+    recent = get_recent_projects()
+    if recent:
+        console.print()
+        console.print("[bold]📁 Recent Projects:[/bold]")
+        console.print()
+        for i, project in enumerate(recent[:5], 1):
+            console.print(f"  [bold cyan]{i}[/]  [white]{project['name']}[/white]  [dim]({project['path']})[/dim]")
+        if len(recent) > 5:
+            console.print(f"  [dim]... and {len(recent) - 5} more[/dim]")
 
     console.print()
     console.print("[bold]What would you like to do?[/bold]")
@@ -311,12 +324,10 @@ def no_project_detected():
     console.print("[dim]  • index.html (Static HTML)[/dim]")
     console.print("[dim]  • requirements.txt (Python)[/dim]")
     console.print()
-    console.print("[dim]Navigate to your project folder and run 'opun8 detect' again — I'll be ready.[/dim]")
-    console.print()
 
 
 def show_deploy_menu():
-    """Show menu after detection with 4 options."""
+    """Show menu after detection with 5 options."""
     console.print()
     console.print(f"[bold]{_sym('party')} Nice! Your project is ready. What would you like to do next?[/bold]")
     console.print()
@@ -324,6 +335,7 @@ def show_deploy_menu():
     console.print(f"  [bold cyan]2[/] {_sym('chart')}  [white]View more details[/white]")
     console.print(f"  [bold cyan]3[/] {_sym('cycle')}  [white]Go back[/white]")
     console.print(f"  [bold cyan]4[/] {_sym('door')}  [white]Exit[/white]")
+    console.print(f"  [bold cyan]5[/] {_sym('browse')}  [white]Select a different project[/white]")
     console.print()
 
 

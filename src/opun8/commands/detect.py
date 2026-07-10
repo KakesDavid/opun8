@@ -5,6 +5,7 @@ Detect command - Detect project type and guide user.
 import os
 import shutil
 from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -49,7 +50,7 @@ def detect():
     
     choice = Prompt.ask(
         "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3", "4"],
+        choices=["1", "2", "3", "4", "5"],
         default="1",
         show_choices=False,
     )
@@ -60,10 +61,14 @@ def detect():
     elif choice == "2":
         show_more_details(result)
     elif choice == "3":
-        from opun8.cli import main
-        main()
+        from opun8.ui.messages import show_welcome
+        show_welcome()
+        return
     elif choice == "4":
         goodbye()
+        return
+    elif choice == "5":
+        go_to_folder()
         return
 
 
@@ -125,7 +130,7 @@ def show_no_project_menu():
     console.print("[bold]What would you like to do?[/bold]")
     console.print()
     console.print("  [bold cyan]1[/] 📁  [white]Create a new project[/white]")
-    console.print("  [bold cyan]2[/] 📂  [white]Go to a different folder[/white]")
+    console.print("  [bold cyan]2[/] 📂  [white]Browse for a different folder[/white]")
     console.print("  [bold cyan]3[/] 🚪  [white]Exit[/white]")
     console.print()
     
@@ -276,7 +281,7 @@ def open_folder_picker():
         root.attributes('-topmost', True)
         
         folder_path = filedialog.askdirectory(
-            title="Select a folder for your new project",
+            title="Select a folder for your project",
             mustexist=True
         )
         
@@ -294,7 +299,7 @@ def open_folder_picker():
             ps_script = '''
             Add-Type -AssemblyName System.Windows.Forms
             $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
-            $folderDialog.Description = "Select a folder for your new project"
+            $folderDialog.Description = "Select a folder for your project"
             $folderDialog.ShowNewFolderButton = $true
             $result = $folderDialog.ShowDialog()
             if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -327,14 +332,15 @@ def open_folder_picker():
 
 
 def go_to_folder():
-    """Interactive folder browser to select a project."""
+    """Interactive folder browser with file explorer option."""
     current_path = Path.cwd()
     
     while True:
         console.print("\n" * 2)
         console.print(Panel(
             "[bold cyan]📂 Folder Browser[/bold cyan]\n"
-            f"[dim]Current: {current_path}[/dim]",
+            f"[dim]Current: {current_path}[/dim]\n\n"
+            "You can browse folders here or open the file explorer.",
             border_style="cyan",
             padding=(1, 2),
             width=70,
@@ -346,6 +352,7 @@ def go_to_folder():
         console.print("[bold]📁 Folders:[/bold]")
         console.print()
         
+        # Option to go up
         if str(current_path) != current_path.drive + "\\":
             console.print("  ..  📂  Go up")
         
@@ -358,20 +365,25 @@ def go_to_folder():
         console.print()
         console.print("[bold]Options:[/bold]")
         console.print()
-        console.print("  1  📂  Select a folder (by number)")
-        console.print("  2  🔍  Enter path manually")
-        console.print("  3  💾  Select this folder (choose this project)")
-        console.print("  4  🔄  Go back")
+        console.print("  1  📂  Select a folder by number")
+        console.print("  2  📂  Open file explorer to pick a folder")
+        console.print("  3  🔍  Enter path manually")
+        console.print("  4  💾  Select this folder (run detection)")
+        console.print("  5  🔄  Go back")
         console.print()
         
         if str(current_path) != current_path.drive + "\\":
-            console.print("  5  ⬆️  Go up one level")
+            console.print("  6  ⬆️  Go up one level")
         
         console.print()
         
+        valid_choices = ["1", "2", "3", "4", "5"]
+        if str(current_path) != current_path.drive + "\\":
+            valid_choices.append("6")
+        
         choice = Prompt.ask(
             "➜ Select an option",
-            choices=["1", "2", "3", "4", "5"] if str(current_path) != current_path.drive + "\\" else ["1", "2", "3", "4"],
+            choices=valid_choices,
             default="1",
             show_choices=False,
         )
@@ -379,7 +391,6 @@ def go_to_folder():
         if choice == "1":
             if not folders:
                 console.print("[yellow]No folders to select.[/yellow]")
-                Prompt.ask("[dim]Press Enter to continue[/dim]")
                 continue
             
             console.print()
@@ -394,12 +405,29 @@ def go_to_folder():
                     continue
                 else:
                     console.print("[red]Invalid number.[/red]")
-                    Prompt.ask("[dim]Press Enter to continue[/dim]")
             except ValueError:
                 console.print("[red]Please enter a valid number.[/red]")
-                Prompt.ask("[dim]Press Enter to continue[/dim]")
         
         elif choice == "2":
+            console.print()
+            console.print("[dim]📂 Opening file explorer...[/dim]")
+            console.print("[dim]Select a folder and close the window to continue.[/dim]")
+            console.print()
+            
+            selected = open_folder_picker()
+            if selected:
+                new_path = Path(selected)
+                if new_path.exists() and new_path.is_dir():
+                    current_path = new_path
+                    nav.change_directory(str(current_path))
+                    console.print(f"[green]✅ Selected: {current_path}[/green]")
+                    continue
+                else:
+                    console.print("[red]Invalid path selected.[/red]")
+            else:
+                console.print("[yellow]No folder selected.[/yellow]")
+        
+        elif choice == "3":
             console.print()
             console.print("[dim]Enter a full path (e.g., C:\\Projects\\my-app)[/dim]")
             manual_path = Prompt.ask("➜ Path")
@@ -409,27 +437,26 @@ def go_to_folder():
                 if new_path.exists() and new_path.is_dir():
                     current_path = new_path
                     nav.change_directory(str(current_path))
+                    console.print(f"[green]✅ Changed to: {current_path}[/green]")
                 else:
                     console.print(f"[red]Invalid path: {manual_path}[/red]")
-                    Prompt.ask("[dim]Press Enter to continue[/dim]")
         
-        elif choice == "3":
+        elif choice == "4":
             console.print()
-            console.print(f"[green]Selected: {current_path}[/green]")
+            console.print(f"[green]✅ Selected: {current_path}[/green]")
             console.print("[dim]Running detection on this folder...[/dim]")
             detect()
             return
         
-        elif choice == "4":
+        elif choice == "5":
             detect()
             return
         
-        elif choice == "5":
+        elif choice == "6":
             if nav.go_up():
                 current_path = Path.cwd()
             else:
                 console.print("[yellow]Already at root.[/yellow]")
-                Prompt.ask("[dim]Press Enter to continue[/dim]")
 
 
 def show_more_details(result: dict):

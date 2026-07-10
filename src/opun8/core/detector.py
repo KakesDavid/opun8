@@ -6,11 +6,6 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-import typer
-from rich.prompt import Prompt
-
-from opun8.ui import messages
-
 
 class ProjectDetector:
     """Detect project type and configuration."""
@@ -39,9 +34,6 @@ class ProjectDetector:
         package_json = self.project_path / "package.json"
         if package_json.exists():
             result = self._detect_node_project(package_json, result)
-            # Only mark as detected if we actually managed to read the
-            # file — a malformed package.json shouldn't be reported as a
-            # successful detection with every field blank.
             result["is_detected"] = "error" not in result
             return result
 
@@ -108,7 +100,6 @@ class ProjectDetector:
                 result["build_command"] = "npm run build"
                 result["output_dir"] = "dist"
             else:
-                # Node.js backend or generic
                 result["framework"] = "Node.js"
                 result["type"] = "node"
                 result["build_command"] = "npm start" if "start" in data.get("scripts", {}) else None
@@ -134,56 +125,3 @@ class ProjectDetector:
         elif (self.project_path / "build").exists():
             return "build"
         return "dist"  # default
-
-
-def detect() -> Optional[str]:
-    """Scan the current folder and guide the user through the result."""
-    messages.detection_start()
-
-    detector = ProjectDetector()
-    with messages.scanning_spinner():
-        result = detector.detect()
-
-    if result.get("error"):
-        messages.error(
-            f"Found a package.json but couldn't read it: {result['error']}",
-            suggestion="Check that package.json is valid JSON, then run 'opun8 detect' again.",
-        )
-        return None
-
-    if not result.get("is_detected"):
-        messages.no_project_detected()
-        return None
-
-    messages.detection_complete(result)
-    return _post_detection_menu(result)
-
-
-def _post_detection_menu(result: Dict[str, Any]) -> Optional[str]:
-    """Handle the 'what next' menu shown after a successful detection."""
-    while True:
-        messages.show_deploy_menu()
-        choice = Prompt.ask(
-            "[bold cyan]➜[/] Select an option",
-            choices=["1", "2", "3", "4"],
-            default="1",
-            show_choices=False,
-        )
-
-        if choice == "1":
-            _deploy(result)
-            return None
-        elif choice == "2":
-            messages.show_details(result)
-            continue  # redraw the same menu so they can still deploy or exit
-        elif choice == "3":
-            return "welcome"
-        else:  # choice == "4"
-            messages.goodbye()
-            raise typer.Exit()
-
-
-def _deploy(result: Dict[str, Any]) -> None:
-    """Placeholder deploy hook — wire this up to the real deploy flow."""
-    from opun8.commands.deploy import deploy as deploy_cmd
-    deploy_cmd()

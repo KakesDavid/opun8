@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
@@ -85,7 +86,6 @@ class GitService:
     def add_remote(self, repo_url: str) -> bool:
         """Add a remote origin, or update it if one already exists."""
         try:
-            # Check if remote already exists
             existing = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=self.project_path,
@@ -95,7 +95,6 @@ class GitService:
             )
 
             if existing.returncode == 0:
-                # Remote exists, update it
                 result = subprocess.run(
                     ["git", "remote", "set-url", "origin", repo_url],
                     cwd=self.project_path,
@@ -104,7 +103,6 @@ class GitService:
                     timeout=10
                 )
             else:
-                # Remote doesn't exist, add it
                 result = subprocess.run(
                     ["git", "remote", "add", "origin", repo_url],
                     cwd=self.project_path,
@@ -113,10 +111,6 @@ class GitService:
                     timeout=10
                 )
 
-            # Both branches above assign `result` — check it instead of
-            # assuming success, otherwise a failed `remote add`/`set-url`
-            # (bad URL, permissions, etc.) gets reported as a success and
-            # the real error only surfaces later as a confusing push failure.
             if result.returncode == 0:
                 return True
             else:
@@ -127,11 +121,7 @@ class GitService:
             return False
 
     def push(self, branch: str = "main", force: bool = False) -> bool:
-        """Push to remote repository.
-
-        force=True should only be used as an explicit, user-confirmed
-        choice — it overwrites whatever history is on the remote.
-        """
+        """Push to remote repository."""
         try:
             cmd = ["git", "push", "-u", "origin", branch]
             if force:
@@ -146,6 +136,9 @@ class GitService:
             if result.returncode == 0:
                 return True
             else:
+                # Check if it's a "repository not found" error
+                if "repository not found" in result.stderr.lower():
+                    return "not_found"
                 console.print(f"[red]Git push failed: {result.stderr}[/red]")
                 return False
         except Exception as e:
@@ -186,28 +179,125 @@ class GitService:
         """Check if there are uncommitted changes."""
         return bool(self.status())
 
+    def repo_exists_on_github(self, token: str, repo_name: str) -> bool:
+        """Check if a repository already exists on GitHub."""
+        try:
+            import requests
+            
+            # Try to get the repo
+            response = requests.get(
+                f"https://api.github.com/repos/{repo_name}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github.v3+json"
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return True
+            elif response.status_code == 404:
+                return False
+            else:
+                # Any other error, assume it doesn't exist
+                return False
+        except Exception:
+            return False
+
+    def create_github_repo(self, token: str, repo_name: str, description: str = "", private: bool = False) -> Tuple[bool, str]:
+        """
+        Create a GitHub repository using the API.
+        Returns: (success, message)
+        """
+        try:
+            import requests
+            
+            # First check if repo already exists
+            if self.repo_exists_on_github(token, repo_name):
+                return "exists", f"Repository '{repo_name}' already exists on GitHub."
+            
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            data = {
+                "name": repo_name,
+                "description": description,
+                "private": private,
+                "auto_init": True
+            }
+            
+            response = requests.post(
+                "https://api.github.com/user/repos",
+                headers=headers,
+                json=data,
+                timeout=30
+            )
+            
+            if response.status_code == 201:
+                return True, "Repository created successfully."
+            else:
+                return False, f"Failed to create repository: {response.text}"
+        except Exception as e:
+            return False, f"Error creating repository: {e}"
+
     def push_to_github(
         self,
         repo_url: str,
         branch: Optional[str] = None,
         force: bool = False,
+        token: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Complete Git workflow: init, add, commit, remote, push.
-
-        Args:
-            repo_url: Remote URL to push to.
-            branch: Branch to push. Defaults to the repo's current
-                branch (falls back to "main" for a brand new repo)
-                instead of assuming every project uses "main".
-            force: If True, force-push when a normal push is rejected.
-                Defaults to False, so a rejected push (e.g. the remote
-                has commits this repo doesn't) is reported as a
-                failure instead of silently overwriting the remote's
-                history.
-
         Returns: (success, message)
         """
+        # Extract repo name from URL
+        repo_name = repo_url.rstrip('/').split('/')[-1]
+        if repo_name.endswith('.git'):
+            repo_name = repo_name[:-4]
+        
+        # Create repo on GitHub if it doesn't exist
+        if token:
+            result, message = self.create_github_repo(token, repo_name)
+            
+            if result == "exists":
+                # Repository already exists — ask user what to do
+                console.print()
+                console.print(f"[yellow]⚠️  Repository '{repo_name}' already exists on GitHub.[/yellow]")
+                console.print("[dim]What would you like to do?[/dim]")
+                console.print()
+                console.print("  [bold cyan]1[/] 📝  [white]Use a different name[/white]")
+                console.print("  [bold cyan]2[/] 🔄  [white]Skip GitHub[/white]  [dim](continue without pushing)[/dim]")
+                console.print("  [bold cyan]3[/] 🚪  [white]Cancel deployment[/white]")
+                console.print()
+                
+                choice = Prompt.ask(
+                    "[bold cyan]➜[/] Select an option",
+                    choices=["1", "2", "3"],
+                    default="1",
+                    show_choices=False,
+                )
+                
+                if choice == "3":
+                    return False, "Deployment cancelled by user."
+                elif choice == "2":
+                    return False, "Skipping GitHub push."
+                elif choice == "1":
+                    # Ask for new repo name
+                    console.print()
+                    new_name = Prompt.ask("[bold cyan]➜[/] Enter a new repository name")
+                    if new_name:
+                        # Update repo_url with new name
+                        new_repo_url = f"https://github.com/{repo_url.split('/')[-2]}/{new_name}"
+                        # Try again with new name
+                        return self.push_to_github(new_repo_url, branch, force, token)
+                    else:
+                        console.print("[red]No name provided. Skipping GitHub.[/red]")
+                        return False, "Skipping GitHub push."
+            elif not result:
+                return False, message
+        
         branch = branch or self.get_branch()
 
         with Progress(
@@ -217,76 +307,39 @@ class GitService:
             transient=True,
         ) as progress:
 
-            # Step 1: Initialize Git if needed
             if not self.is_git_repo():
                 task = progress.add_task("[cyan]Initializing Git repository...", total=None)
                 if not self.init_repo():
                     return False, "Failed to initialize Git repository."
                 progress.update(task, description="[green]Git repository initialized.")
 
-            # Step 2: Add files
             task = progress.add_task("[cyan]Adding files...", total=None)
             if not self.add_all():
                 return False, "Failed to add files to Git."
             progress.update(task, description="[green]Files added.")
 
-            # Step 3: Commit, but only if there's actually something staged.
-            # Re-running this on a clean repo used to call `git commit`
-            # anyway, which fails with "nothing to commit" and made the
-            # whole workflow report failure even though there was nothing
-            # wrong.
             if self.has_changes():
                 task = progress.add_task("[cyan]Committing files...", total=None)
                 if not self.commit():
                     return False, "Failed to commit files."
                 progress.update(task, description="[green]Files committed.")
 
-            # Step 4: Add remote
             task = progress.add_task("[cyan]Adding remote...", total=None)
             if not self.add_remote(repo_url):
                 return False, "Failed to add remote."
             progress.update(task, description="[green]Remote added.")
 
-            # Step 5: Push
             task = progress.add_task("[cyan]Pushing to GitHub...", total=None)
-            success, push_message = self._push_with_optional_force(branch, force)
-            if not success:
-                return False, push_message
-            progress.update(task, description="[green]Successfully pushed to GitHub!")
+            push_result = self.push(branch)
+            
+            if push_result == "not_found":
+                return False, "Repository not found on GitHub. Please create it first or check the name."
+            elif not push_result:
+                return False, "Failed to push to GitHub."
+            elif push_result is True:
+                progress.update(task, description="[green]Successfully pushed to GitHub!")
 
         return True, f"Successfully pushed to GitHub ({branch} branch)."
 
-    def _push_with_optional_force(self, branch: str, force: bool) -> Tuple[bool, str]:
-        """Push to `branch`. Only force-pushes if `force=True` was
-        explicitly requested AND a normal push was rejected — never as
-        the default path.
-        """
-        if self.push(branch):
-            return True, "Pushed."
-
-        if not force:
-            return False, (
-                "Push was rejected — the remote has commits this repo "
-                "doesn't have locally. Pull and merge first, or re-run "
-                "with force=True if you're sure you want to overwrite "
-                "the remote's history."
-            )
-
-        if self.push(branch, force=True):
-            return True, "Force-pushed."
-
-        return False, "Push failed even with --force. Check the remote URL and your permissions."
-
     def create_and_push(self, repo_url: str, force: bool = False) -> Tuple[bool, str]:
-        """
-        Create an initial commit (if needed) and push to GitHub.
-
-        This used to duplicate push_to_github() with its own git
-        workflow that force-pushed unconditionally on every call,
-        including the very first attempt — meaning any push through
-        this method could silently overwrite a remote's existing
-        history. It's now a thin wrapper around push_to_github(),
-        which only force-pushes when force=True is passed explicitly
-        and a normal push was actually rejected first.
-        """
         return self.push_to_github(repo_url, force=force)
