@@ -2,67 +2,164 @@
 GitHub OAuth authentication for Opun8.
 """
 
+import os
 import webbrowser
 import requests
 import json
+import threading
+import secrets
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Dict, List
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 console = Console()
 
-# OAuth Configuration
-CLIENT_ID = "Ov23li4Xo94q11E9y4Xz"
-CLIENT_SECRET = "4f63ccff0474443868df3a41ba61c5f320ed52ee"
-REDIRECT_URI = "http://localhost:8080/callback"
-AUTHORIZE_URL = f"https://github.com/login/oauth/authorize?client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope=repo,workflow"
+# ------------------------------------------------------------------------------
+# OAuth Configuration — READ FROM .env ONLY — NO HARDCODED VALUES
+# ------------------------------------------------------------------------------
 
-# Storage for tokens
+CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET")
+
+# Actually honor GITHUB_REDIRECT_URI from .env instead of silently ignoring it.
+REDIRECT_URI = os.environ.get("GITHUB_REDIRECT_URI", "http://localhost:8080/callback")
+
+_parsed_redirect = urllib.parse.urlparse(REDIRECT_URI)
+CALLBACK_HOST = _parsed_redirect.hostname or "localhost"
+CALLBACK_PORT = _parsed_redirect.port or 8080
+CALLBACK_PATH = _parsed_redirect.path or "/callback"
+
+SCOPES = "repo,workflow"  # GitHub accepts comma-delimited scopes.
+
+AUTHORIZATION_ENDPOINT = "https://github.com/login/oauth/authorize"
+TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
+
+if not CLIENT_ID or not CLIENT_SECRET:
+    console.print("[red]❌ GitHub credentials not found in .env file.[/red]")
+    console.print("[dim]Please ensure GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are set in .env[/dim]")
+
 TOKEN_FILE = Path.home() / ".opun8" / "github_token.json"
 
 
+def _build_authorize_url(state: str) -> str:
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "state": state,
+    }
+    return f"{AUTHORIZATION_ENDPOINT}?{urllib.parse.urlencode(params)}"
+
+
+# ------------------------------------------------------------------------------
+# Local callback server — catches the redirect instead of asking the user
+# to copy/paste a code out of a dead browser tab.
+# ------------------------------------------------------------------------------
+
+class _CallbackResult:
+    code: Optional[str] = None
+    state: Optional[str] = None
+    error: Optional[str] = None
+
+
+def _make_handler(result: _CallbackResult, done_event: threading.Event):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != CALLBACK_PATH:
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            params = urllib.parse.parse_qs(parsed.query)
+            result.code = params.get("code", [None])[0]
+            result.state = params.get("state", [None])[0]
+            result.error = params.get("error_description", params.get("error", [None]))[0]
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            if result.code:
+                self.wfile.write(
+                    b"<html><body><h2>GitHub authorization complete.</h2>"
+                    b"<p>You can close this tab and return to the terminal.</p></body></html>"
+                )
+            else:
+                self.wfile.write(
+                    b"<html><body><h2>Authorization failed.</h2>"
+                    b"<p>You can close this tab and return to the terminal.</p></body></html>"
+                )
+            done_event.set()
+
+        def log_message(self, format, *args):
+            pass  # silence default HTTP server logging
+
+    return Handler
+
+
+def _wait_for_callback(timeout: int = 180) -> _CallbackResult:
+    """Start a local server, wait for GitHub's redirect, then shut down."""
+    result = _CallbackResult()
+    done_event = threading.Event()
+    handler = _make_handler(result, done_event)
+
+    server = HTTPServer((CALLBACK_HOST, CALLBACK_PORT), handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    got_it = done_event.wait(timeout=timeout)
+    server.shutdown()
+    server_thread.join()
+
+    if not got_it:
+        result.error = "timed out waiting for GitHub to redirect back"
+
+    return result
+
+
+# ------------------------------------------------------------------------------
+# Token Storage
+# ------------------------------------------------------------------------------
+
 def get_github_token() -> Optional[str]:
-    """Get saved GitHub token."""
     if TOKEN_FILE.exists():
         try:
             with open(TOKEN_FILE, "r") as f:
-                data = json.load(f)
-                return data.get("access_token")
-        except:
+                return json.load(f).get("access_token")
+        except Exception:
             return None
     return None
 
 
 def get_github_user() -> Optional[Dict]:
-    """Get saved GitHub user info."""
     if TOKEN_FILE.exists():
         try:
             with open(TOKEN_FILE, "r") as f:
-                data = json.load(f)
-                return data.get("user")
-        except:
+                return json.load(f).get("user")
+        except Exception:
             return None
     return None
 
 
 def save_github_token(token: str, user_info: Dict) -> None:
-    """Save GitHub token locally."""
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(TOKEN_FILE, "w") as f:
-        json.dump({
-            "access_token": token,
-            "user": user_info
-        }, f, indent=2)
+        json.dump({"access_token": token, "user": user_info}, f, indent=2)
 
+
+# ------------------------------------------------------------------------------
+# Login Flow
+# ------------------------------------------------------------------------------
 
 def login_to_github() -> Optional[str]:
-    """
-    Start GitHub OAuth flow.
-    Opens browser for user to authorize Opun8.
-    Returns access token or None.
-    """
     console.print()
     console.print(Panel(
         "[bold cyan]🔐 GitHub Authentication[/bold cyan]\n\n"
@@ -79,50 +176,64 @@ def login_to_github() -> Optional[str]:
     console.print("[bold]1[/] 🔑  [white]Login with GitHub[/white]  [dim](opens browser)[/dim]")
     console.print("[bold]2[/] ⏭️  [white]Skip[/white]  [dim](deploy without GitHub)[/dim]")
     console.print()
-    
+
     choice = Prompt.ask(
         "[bold cyan]➜[/] Select an option",
         choices=["1", "2"],
         default="1",
         show_choices=False,
     )
-    
+
     if choice == "2":
         console.print("\n[yellow]Skipping GitHub authentication.[/yellow]")
         return None
-    
-    if choice != "1":
-        console.print("\n[red]Invalid option.[/red]")
+
+    if not CLIENT_ID or not CLIENT_SECRET:
+        console.print("[red]❌ Missing GitHub credentials in .env file.[/red]")
         return None
-    
-    # Open browser for OAuth
+
+    state = secrets.token_urlsafe(32)
+    authorize_url = _build_authorize_url(state)
+
     console.print()
-    console.print(f"[dim]🌐 Opening browser...[/dim]")
-    console.print("[dim]If browser doesn't open, visit:[/dim]")
-    console.print(f"[dim]{AUTHORIZE_URL}[/dim]")
+    console.print("[dim]🌐 Opening browser for GitHub authorization...[/dim]")
+    console.print(f"[dim]Waiting on {REDIRECT_URI} for the redirect...[/dim]")
     console.print()
-    
-    webbrowser.open(AUTHORIZE_URL)
-    
+
+    webbrowser.open(authorize_url)
+
     console.print("[bold]Waiting for GitHub to redirect back...[/bold]")
-    console.print("[dim]You should see a localhost page when done.[/dim]")
+    console.print("[dim]This happens automatically — no need to paste anything.[/dim]")
     console.print()
-    console.print("[yellow]📋 After authorizing, GitHub will show a code.[/yellow]")
-    
-    code = Prompt.ask("[bold cyan]➜[/] Paste the code from the browser")
-    
-    if not code:
-        console.print("[red]No code provided.[/red]")
+
+    result = _wait_for_callback()
+
+    if result.error and not result.code:
+        console.print(f"[red]❌ Authorization failed: {result.error}[/red]")
         return None
-    
-    return exchange_code_for_token(code)
+
+    if result.state != state:
+        console.print("[red]❌ State mismatch — possible CSRF, aborting.[/red]")
+        return None
+
+    token = exchange_github_code_for_token(result.code)
+    if not token:
+        console.print("[red]❌ Failed to exchange code for a token.[/red]")
+    return token
 
 
-def exchange_code_for_token(code: str) -> Optional[str]:
-    """Exchange OAuth code for access token."""
+def exchange_github_code_for_token(code: str) -> Optional[str]:
     try:
+        if not code:
+            console.print("[red]❌ No authorization code received.[/red]")
+            return None
+
+        if not CLIENT_SECRET:
+            console.print("[red]❌ GITHUB_CLIENT_SECRET not found in .env file.[/red]")
+            return None
+
         response = requests.post(
-            "https://github.com/login/oauth/access_token",
+            TOKEN_ENDPOINT,
             headers={"Accept": "application/json"},
             data={
                 "client_id": CLIENT_ID,
@@ -130,59 +241,51 @@ def exchange_code_for_token(code: str) -> Optional[str]:
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
             },
-            timeout=30
+            timeout=30,
         )
-        
+
         data = response.json()
-        
+
         if "access_token" in data:
             token = data["access_token"]
-            
-            user = get_user_info(token)
+
+            user = get_github_user_info(token)
             if user:
                 save_github_token(token, user)
                 console.print()
                 console.print(f"[bold green]✅ Connected as: {user.get('login', 'Unknown')}[/bold green]")
                 console.print("[dim]Token saved securely for future use.[/dim]")
             else:
-                console.print("[yellow]Could not get user info, but token saved.[/yellow]")
                 save_github_token(token, {"login": "Unknown"})
-            
+
             return token
         else:
-            console.print(f"[red]Failed to get token: {data.get('error', 'Unknown error')}[/red]")
+            error_msg = data.get("error_description", data.get("error", "Unknown error"))
+            console.print(f"[red]Failed to get token: {error_msg}[/red]")
             return None
-            
+
     except Exception as e:
         console.print(f"[red]Error exchanging code: {e}[/red]")
         return None
 
 
-def get_user_info(token: str) -> Optional[Dict]:
-    """Get GitHub user information."""
+def get_github_user_info(token: str) -> Optional[Dict]:
     try:
         response = requests.get(
             "https://api.github.com/user",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=10
+            timeout=10,
         )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            console.print(f"[red]Failed to get user info: {response.status_code}[/red]")
-            return None
-    except Exception as e:
-        console.print(f"[red]Error getting user info: {e}[/red]")
+        return response.json() if response.status_code == 200 else None
+    except Exception:
         return None
 
 
 def is_authenticated() -> bool:
-    """Check if user is authenticated with GitHub."""
     return get_github_token() is not None
 
 
 def logout() -> None:
-    """Remove saved GitHub token."""
     if TOKEN_FILE.exists():
         TOKEN_FILE.unlink()
         console.print("[green]✅ Logged out of GitHub.[/green]")
@@ -191,29 +294,27 @@ def logout() -> None:
 
 
 def get_authenticated_user() -> Optional[str]:
-    """Get the username of the authenticated user."""
     user = get_github_user()
     if user:
         return user.get("login")
     return None
 
 
-def list_github_repos(token: str = None) -> List[Dict]:
-    """List all repositories for the authenticated user."""
+def list_github_repos(token: Optional[str] = None) -> List[Dict]:
     if token is None:
         token = get_github_token()
-    
+
     if not token:
         return []
-    
+
     try:
         response = requests.get(
             "https://api.github.com/user/repos",
             headers={"Authorization": f"Bearer {token}"},
             params={"per_page": 50, "sort": "updated"},
-            timeout=10
+            timeout=10,
         )
-        
+
         if response.status_code == 200:
             repos = response.json()
             return [
@@ -223,43 +324,40 @@ def list_github_repos(token: str = None) -> List[Dict]:
                     "private": repo["private"],
                     "url": repo["html_url"],
                     "description": repo.get("description", ""),
-                    "updated_at": repo.get("updated_at", "")
+                    "updated_at": repo.get("updated_at", ""),
                 }
                 for repo in repos
             ]
-        else:
-            return []
+        return []
     except Exception:
         return []
 
 
-def create_github_repo(token: str, name: str, description: str = "", private: bool = False) -> Optional[Dict]:
-    """Create a new GitHub repository."""
+def create_github_repo(token: Optional[str], name: str, description: str = "", private: bool = False) -> Optional[Dict]:
     if token is None:
         token = get_github_token()
-    
+
     if not token:
         return None
-    
+
     try:
         response = requests.post(
             "https://api.github.com/user/repos",
             headers={
                 "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
             json={
                 "name": name,
                 "description": description,
                 "private": private,
-                "auto_init": True
+                "auto_init": True,
             },
-            timeout=30
+            timeout=30,
         )
-        
+
         if response.status_code == 201:
             return response.json()
-        else:
-            return None
+        return None
     except Exception:
         return None

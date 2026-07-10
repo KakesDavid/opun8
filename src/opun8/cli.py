@@ -4,15 +4,23 @@ Opun8 CLI - Command Line Interface for the Universal Deployment Platform.
 
 import typer
 from rich.console import Console
+from rich.prompt import Prompt
 
 from opun8 import __version__
 from opun8.ui.messages import show_welcome
 from opun8.auth import (
     login_to_github,
-    logout,
+    logout as logout_github,
     is_authenticated,
     get_authenticated_user,
     list_github_repos,
+)
+from opun8.providers.vercel.auth import (
+    login_to_vercel,
+    is_vercel_authenticated,
+    logout_vercel,
+    show_vercel_projects,
+    switch_vercel_team,
 )
 
 app = typer.Typer(
@@ -74,18 +82,17 @@ def github(
     ),
 ):
     """Connect to GitHub account."""
-    
+
     if logout_flag:
-        logout()
+        logout_github()
         return
-    
+
     if is_authenticated():
         user = get_authenticated_user()
         console.print(f"[green]✅ Already connected as: {user}[/green]")
         console.print("[dim]To disconnect, run: opun8 github --logout[/dim]")
         console.print()
-        
-        # Show repositories
+
         console.print("[bold]📁 Your GitHub Repositories:[/bold]")
         console.print()
         repos = list_github_repos()
@@ -104,9 +111,14 @@ def github(
         console.print("  [bold cyan]2[/] 📁  [white]Detect my current project[/white]")
         console.print("  [bold cyan]3[/] 🔄  [white]Go back[/white]")
         console.print()
-        
-        choice = typer.prompt("[bold cyan]➜[/] Select an option", default="3")
-        
+
+        choice = Prompt.ask(
+            "[bold cyan]➜[/] Select an option",
+            choices=["1", "2", "3"],
+            default="3",
+            show_choices=False,
+        )
+
         if choice == "1":
             console.print("[yellow]🚀 Deploy repository coming soon![/yellow]")
         elif choice == "2":
@@ -115,19 +127,85 @@ def github(
         else:
             show_welcome()
         return
-    
+
     console.print()
     console.print("[bold cyan]🔐 Connect to GitHub[/bold cyan]")
     console.print("[dim]This will allow Opun8 to create repositories and push code on your behalf.[/dim]")
     console.print()
-    
+
     token = login_to_github()
-    
+
     if token:
         console.print("[green]✅ Connected successfully![/green]")
         console.print("[dim]Run [cyan]opun8 github[/cyan] again to see your repositories.[/dim]")
     else:
         console.print("[red]❌ Connection failed.[/red]")
+
+
+@app.command()
+def vercel(
+    logout_flag: bool = typer.Option(
+        False,
+        "--logout",
+        "-l",
+        help="Logout from Vercel.",
+    ),
+    switch_flag: bool = typer.Option(
+        False,
+        "--switch",
+        "-s",
+        help="Switch Vercel team/scope.",
+    ),
+    show_flag: bool = typer.Option(
+        False,
+        "--show",
+        help="Show projects without re-authenticating.",
+    ),
+):
+    """Connect to Vercel account."""
+
+    if logout_flag:
+        logout_vercel()
+        return
+
+    if switch_flag:
+        switch_vercel_team()
+        return
+
+    if show_flag:
+        from opun8.commands.deploy import deploy as deploy_cmd
+        show_vercel_projects(deploy_callback=deploy_cmd)
+        return
+
+    if is_vercel_authenticated():
+        console.print("[green]✅ Already connected to Vercel.[/green]")
+        console.print("[dim]To disconnect, run: opun8 vercel --logout[/dim]")
+        console.print("[dim]To switch teams, run: opun8 vercel --switch[/dim]")
+        console.print()
+        from opun8.commands.deploy import deploy as deploy_cmd
+        show_vercel_projects(deploy_callback=deploy_cmd)
+        return
+
+    console.print()
+    console.print("[bold cyan]▲ Connect to Vercel[/bold cyan]")
+    console.print("[dim]This will allow Opun8 to deploy projects to Vercel.[/dim]")
+    console.print()
+
+    from opun8.commands.deploy import deploy as deploy_cmd
+    token = login_to_vercel(deploy_callback=deploy_cmd)
+
+    if token:
+        console.print("[green]✅ Connected to Vercel successfully![/green]")
+    else:
+        console.print("[red]❌ Connection failed.[/red]")
+
+
+@app.command(name="logout")
+def logout_all():
+    """Logout from all services."""
+    logout_github()
+    logout_vercel()
+    console.print("[green]✅ Logged out from all services.[/green]")
 
 
 @app.command()
