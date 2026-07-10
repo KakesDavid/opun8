@@ -41,6 +41,7 @@ SECURITY:
 import hashlib
 import threading
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Callable
@@ -116,6 +117,35 @@ def _build_session(token: str) -> requests.Session:
 
 
 # ──────────────────────────────────────────────────────────────
+# PROJECT NAME SANITIZATION
+# ──────────────────────────────────────────────────────────────
+
+def _sanitize_project_name(name: str) -> str:
+    """
+    Sanitize project name for Vercel.
+    Vercel rules:
+    - Lowercase only
+    - Can include: letters, digits, '.', '_', '-'
+    - Cannot contain '---' (three hyphens in a row)
+    - Max 100 characters
+    """
+    # Lowercase
+    name = name.lower()
+    # Replace spaces with hyphens
+    name = name.replace(" ", "-")
+    # Replace any invalid characters with hyphens
+    name = re.sub(r'[^a-z0-9._-]', '-', name)
+    # Remove consecutive hyphens (--- not allowed)
+    name = re.sub(r'-{2,}', '-', name)
+    # Remove leading/trailing hyphens
+    name = name.strip('-')
+    # Truncate to 100 characters
+    if len(name) > 100:
+        name = name[:100]
+    return name
+
+
+# ──────────────────────────────────────────────────────────────
 # MAIN DEPLOY FUNCTION
 # ──────────────────────────────────────────────────────────────
 
@@ -143,6 +173,12 @@ def deploy_to_vercel(
         (success, message/url)
     """
     env_vars = env_vars or {}
+
+    # Sanitize project name for Vercel
+    original_name = project_name
+    project_name = _sanitize_project_name(project_name)
+    if original_name != project_name:
+        console.print(f"[dim]ℹ️  Using project name: [cyan]{project_name}[/cyan][/dim]")
 
     console.print()
     console.print("[bold cyan]▲ Deploying to Vercel...[/bold cyan]")
@@ -398,7 +434,7 @@ def _get_or_create_project(
                 if project.get("name") == project_name:
                     return project.get("id")
 
-        # Create new project
+        # Create new project with sanitized name
         payload = {
             "name": project_name,
             "framework": _map_framework(framework),

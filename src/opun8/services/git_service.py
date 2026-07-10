@@ -1,6 +1,6 @@
 """
 Git service for Opun8.
-Handles all Git operations: init, add, commit, push.
+Handles all Git operations: init, add, commit, push, and branch management.
 """
 
 import os
@@ -21,6 +21,10 @@ class GitService:
     def __init__(self, project_path: Optional[Path] = None):
         self.project_path = project_path or Path.cwd()
         self.git_path = self.project_path / ".git"
+
+    # ──────────────────────────────────────────────────────────────
+    # BASIC GIT OPERATIONS
+    # ──────────────────────────────────────────────────────────────
 
     def is_git_repo(self) -> bool:
         """Check if the current directory is a Git repository."""
@@ -77,6 +81,9 @@ class GitService:
             if result.returncode == 0:
                 return True
             else:
+                # If nothing to commit, that's fine — just report success
+                if "nothing to commit" in result.stderr.lower():
+                    return True
                 console.print(f"[red]Git commit failed: {result.stderr}[/red]")
                 return False
         except Exception as e:
@@ -145,6 +152,10 @@ class GitService:
             console.print(f"[red]Git push error: {e}[/red]")
             return False
 
+    # ──────────────────────────────────────────────────────────────
+    # BRANCH MANAGEMENT
+    # ──────────────────────────────────────────────────────────────
+
     def get_branch(self) -> str:
         """Get the current branch name."""
         try:
@@ -160,6 +171,56 @@ class GitService:
             return "main"
         except Exception:
             return "main"
+
+    def get_default_branch(self) -> str:
+        """Get the default branch name from remote if available."""
+        try:
+            # Try to get the default branch from remote
+            result = subprocess.run(
+                ["git", "remote", "show", "origin"],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            for line in result.stdout.split('\n'):
+                if "HEAD branch" in line:
+                    return line.split(":")[-1].strip()
+            return "main"
+        except Exception:
+            return "main"
+
+    def rename_branch(self, old_name: str, new_name: str) -> bool:
+        """Rename a branch locally."""
+        try:
+            result = subprocess.run(
+                ["git", "branch", "-m", old_name, new_name],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def set_upstream(self, branch: str) -> bool:
+        """Set upstream for the current branch."""
+        try:
+            result = subprocess.run(
+                ["git", "push", "-u", "origin", branch],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    # ──────────────────────────────────────────────────────────────
+    # STATUS AND CHANGES
+    # ──────────────────────────────────────────────────────────────
 
     def status(self) -> str:
         """Get Git status."""
@@ -178,6 +239,24 @@ class GitService:
     def has_changes(self) -> bool:
         """Check if there are uncommitted changes."""
         return bool(self.status())
+
+    def has_remote(self) -> bool:
+        """Check if a remote exists."""
+        try:
+            result = subprocess.run(
+                ["git", "remote"],
+                cwd=self.project_path,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            return bool(result.stdout.strip())
+        except Exception:
+            return False
+
+    # ──────────────────────────────────────────────────────────────
+    # GITHUB REPOSITORY MANAGEMENT
+    # ──────────────────────────────────────────────────────────────
 
     def repo_exists_on_github(self, token: str, repo_name: str) -> bool:
         """Check if a repository already exists on GitHub."""
@@ -241,6 +320,10 @@ class GitService:
         except Exception as e:
             return False, f"Error creating repository: {e}"
 
+    # ──────────────────────────────────────────────────────────────
+    # COMPLETE PUSH WORKFLOW
+    # ──────────────────────────────────────────────────────────────
+
     def push_to_github(
         self,
         repo_url: str,
@@ -288,6 +371,11 @@ class GitService:
                     console.print()
                     new_name = Prompt.ask("[bold cyan]➜[/] Enter a new repository name")
                     if new_name:
+                        # Sanitize the new name
+                        import re
+                        new_name = new_name.replace(" ", "-")
+                        new_name = re.sub(r'[^a-zA-Z0-9\-_]', '', new_name)
+                        new_name = new_name.lower()
                         # Update repo_url with new name
                         new_repo_url = f"https://github.com/{repo_url.split('/')[-2]}/{new_name}"
                         # Try again with new name
@@ -298,8 +386,21 @@ class GitService:
             elif not result:
                 return False, message
         
-        branch = branch or self.get_branch()
-
+        # Determine branch to use
+        if branch is None:
+            branch = self.get_branch()
+            
+            # If it's 'master', we might want to rename to 'main'
+            if branch == "master" and self.has_remote():
+                # Check what the remote default is
+                remote_default = self.get_default_branch()
+                if remote_default == "main" and branch == "master":
+                    console.print("[dim]Renaming 'master' to 'main' for GitHub compatibility...[/dim]")
+                    if self.rename_branch("master", "main"):
+                        branch = "main"
+                    else:
+                        console.print("[yellow]Could not rename branch. Using 'master'.[/yellow]")
+        
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -307,34 +408,39 @@ class GitService:
             transient=True,
         ) as progress:
 
+            # Initialize Git if needed
             if not self.is_git_repo():
                 task = progress.add_task("[cyan]Initializing Git repository...", total=None)
                 if not self.init_repo():
                     return False, "Failed to initialize Git repository."
                 progress.update(task, description="[green]Git repository initialized.")
 
+            # Add files
             task = progress.add_task("[cyan]Adding files...", total=None)
             if not self.add_all():
                 return False, "Failed to add files to Git."
             progress.update(task, description="[green]Files added.")
 
+            # Commit changes
             if self.has_changes():
                 task = progress.add_task("[cyan]Committing files...", total=None)
                 if not self.commit():
                     return False, "Failed to commit files."
                 progress.update(task, description="[green]Files committed.")
 
+            # Add remote
             task = progress.add_task("[cyan]Adding remote...", total=None)
             if not self.add_remote(repo_url):
                 return False, "Failed to add remote."
             progress.update(task, description="[green]Remote added.")
 
+            # Push to GitHub
             task = progress.add_task("[cyan]Pushing to GitHub...", total=None)
-            push_result = self.push(branch)
+            push_result = self.push(branch, force)
             
             if push_result == "not_found":
                 return False, "Repository not found on GitHub. Please create it first or check the name."
-            elif not push_result:
+            elif push_result is False:
                 return False, "Failed to push to GitHub."
             elif push_result is True:
                 progress.update(task, description="[green]Successfully pushed to GitHub!")
@@ -342,4 +448,5 @@ class GitService:
         return True, f"Successfully pushed to GitHub ({branch} branch)."
 
     def create_and_push(self, repo_url: str, force: bool = False) -> Tuple[bool, str]:
+        """Legacy wrapper for push_to_github."""
         return self.push_to_github(repo_url, force=force)
