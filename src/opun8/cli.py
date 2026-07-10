@@ -71,12 +71,38 @@ def detect():
 
 
 @app.command()
-def deploy():
-    """Deploy your project to the cloud."""
-    from opun8.commands.deploy import deploy as deploy_cmd
-    # Set the deploy callback for Vercel empty-state flow
-    set_deploy_callback(deploy_cmd)
-    deploy_cmd()
+def deploy(
+    platform: str = typer.Argument(
+        None,
+        help="Platform to deploy to (vercel, netlify, render).",
+    ),
+):
+    """Deploy your project to the specified platform."""
+    if platform is None:
+        console.print()
+        console.print("[yellow]⚠️ Please specify a platform:[/yellow]")
+        console.print()
+        console.print("  [cyan]opun8 deploy vercel[/cyan]  [dim]▲ Deploy to Vercel[/dim]")
+        console.print("  [cyan]opun8 deploy netlify[/cyan]  [dim]📦 Deploy to Netlify (coming soon)[/dim]")
+        console.print("  [cyan]opun8 deploy render[/cyan]   [dim]☁️ Deploy to Render (coming soon)[/dim]")
+        console.print()
+        console.print("[dim]💡 Need to connect first? Run: [cyan]opun8 vercel[/cyan][/dim]")
+        return
+    
+    platform = platform.lower()
+    
+    if platform == "vercel":
+        from opun8.commands.deploy import deploy as deploy_cmd
+        # Set the deploy callback for Vercel empty-state flow
+        set_deploy_callback(deploy_cmd)
+        deploy_cmd()
+    elif platform == "netlify":
+        console.print("[yellow]📦 Netlify support coming soon![/yellow]")
+    elif platform == "render":
+        console.print("[yellow]☁️ Render support coming soon![/yellow]")
+    else:
+        console.print(f"[red]❌ Unknown platform: {platform}[/red]")
+        console.print("[dim]Available platforms: vercel, netlify, render[/dim]")
 
 
 # ──────────────────────────────────────────────────────────────
