@@ -3,6 +3,7 @@ Opun8 CLI - Command Line Interface for the Universal Deployment Platform.
 """
 
 import typer
+from typing import Optional
 from rich.console import Console
 from rich.prompt import Prompt
 
@@ -72,37 +73,28 @@ def detect():
 
 @app.command()
 def deploy(
-    platform: str = typer.Argument(
+    platform: Optional[str] = typer.Argument(
         None,
-        help="Platform to deploy to (vercel, netlify, render).",
+        help="Platform to deploy to (vercel, netlify, render). Optional.",
     ),
 ):
-    """Deploy your project to the specified platform."""
-    if platform is None:
-        console.print()
-        console.print("[yellow]⚠️ Please specify a platform:[/yellow]")
-        console.print()
-        console.print("  [cyan]opun8 deploy vercel[/cyan]  [dim]▲ Deploy to Vercel[/dim]")
-        console.print("  [cyan]opun8 deploy netlify[/cyan]  [dim]📦 Deploy to Netlify (coming soon)[/dim]")
-        console.print("  [cyan]opun8 deploy render[/cyan]   [dim]☁️ Deploy to Render (coming soon)[/dim]")
-        console.print()
-        console.print("[dim]💡 Need to connect first? Run: [cyan]opun8 vercel[/cyan][/dim]")
-        return
-    
-    platform = platform.lower()
-    
-    if platform == "vercel":
-        from opun8.commands.deploy import deploy as deploy_cmd
-        # Set the deploy callback for Vercel empty-state flow
-        set_deploy_callback(deploy_cmd)
-        deploy_cmd()
-    elif platform == "netlify":
-        console.print("[yellow]📦 Netlify support coming soon![/yellow]")
-    elif platform == "render":
-        console.print("[yellow]☁️ Render support coming soon![/yellow]")
-    else:
-        console.print(f"[red]❌ Unknown platform: {platform}[/red]")
-        console.print("[dim]Available platforms: vercel, netlify, render[/dim]")
+    """Deploy your project to the cloud."""
+    from opun8.commands.deploy import deploy as deploy_cmd
+    deploy_cmd(platform_arg=platform)
+
+
+@app.command()
+def history():
+    """View and manage your deployment history."""
+    from opun8.commands.history import history as history_cmd
+    history_cmd()
+
+
+@app.command()
+def badges():
+    """Show your badge progress and achievements."""
+    from opun8.commands.badges import badges as badges_cmd
+    badges_cmd()
 
 
 # ──────────────────────────────────────────────────────────────

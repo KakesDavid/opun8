@@ -5,7 +5,9 @@ Detect command - Detect project type and guide user.
 import os
 import shutil
 from pathlib import Path
+from typing import Optional
 
+import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -15,28 +17,48 @@ from opun8.core.detector import ProjectDetector
 from opun8.core.templates import ProjectTemplates
 from opun8.services import navigation as nav
 from opun8.services.recent_projects import get_recent_projects, add_recent_project
-from opun8.ui.messages import (
-    detection_start,
-    detection_complete,
-    no_project_detected,
-    show_deploy_menu,
-    show_details,
-    success,
-    error,
-    warning,
-    goodbye,
-)
+from opun8.ui import messages as msg
 
 console = Console()
+
+
+# ──────────────────────────────────────────────────────────────
+# SAFE PROMPT (handles Ctrl+C / Ctrl+Z)
+# ──────────────────────────────────────────────────────────────
+
+def _safe_prompt(
+    message: str,
+    choices: Optional[list] = None,
+    default: str = "1",
+    show_choices: bool = False,
+) -> Optional[str]:
+    """
+    Prompt the user with graceful handling of Ctrl+C and Ctrl+Z.
+    Returns None if the user cancels.
+    """
+    try:
+        if choices:
+            return Prompt.ask(
+                message,
+                choices=choices,
+                default=default,
+                show_choices=show_choices,
+            )
+        else:
+            return Prompt.ask(message, default=default)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
+        return None
 
 
 def detect():
     """Detect project type and guide user."""
     
-    detection_start()
+    msg.detection_start()
     
     detector = ProjectDetector()
-    result = detector.detect()
+    with msg.scanning_spinner():
+        result = detector.detect()
     
     if not result["is_detected"]:
         show_no_project_menu()
@@ -45,31 +67,58 @@ def detect():
     # Add to recent projects
     add_recent_project(str(Path.cwd()))
     
-    detection_complete(result)
-    show_deploy_menu()
-    
-    choice = Prompt.ask(
-        "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3", "4", "5"],
-        default="1",
-        show_choices=False,
-    )
-    
-    if choice == "1":
-        from opun8.commands.deploy import deploy as deploy_cmd
-        deploy_cmd()
-    elif choice == "2":
-        show_more_details(result)
-    elif choice == "3":
-        from opun8.ui.messages import show_welcome
-        show_welcome()
-        return
-    elif choice == "4":
-        goodbye()
-        return
-    elif choice == "5":
-        go_to_folder()
-        return
+    msg.detection_complete(result)
+    return _post_detection_menu(result)
+
+
+def _post_detection_menu(result: dict) -> None:
+    """
+    Handle the 'what next' menu shown after a successful detection.
+    """
+    while True:
+        console.print()
+        console.print("[bold]🎉 Nice! Your project is ready. What would you like to do?[/bold]")
+        console.print()
+        console.print("  [bold cyan]1[/] 🚀  [white]Deploy this project (with GitHub)[/white]")
+        console.print("  [bold cyan]2[/] ⏭️  [white]Deploy without GitHub[/white]")
+        console.print("  [bold cyan]3[/] 📂  [white]Select a different project[/white]")
+        console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
+        console.print()
+        
+        choice = _safe_prompt(
+            "[bold cyan]➜[/] Select an option",
+            choices=["1", "2", "3", "4"],
+            default="1",
+        )
+
+        if choice is None:
+            return
+
+        if choice == "1":
+            _deploy_with_github(result)
+            return None
+        elif choice == "2":
+            _deploy_without_github(result)
+            return None
+        elif choice == "3":
+            from opun8.commands.detect import go_to_folder
+            go_to_folder()
+            return None
+        else:  # choice == "4"
+            msg.goodbye()
+            raise typer.Exit()
+
+
+def _deploy_with_github(result: dict) -> None:
+    """Deploy with GitHub push."""
+    from opun8.commands.deploy import deploy as deploy_cmd
+    deploy_cmd(platform_arg=None, skip_github=False)
+
+
+def _deploy_without_github(result: dict) -> None:
+    """Deploy without GitHub push."""
+    from opun8.commands.deploy import deploy as deploy_cmd
+    deploy_cmd(platform_arg=None, skip_github=True)
 
 
 def show_no_project_menu():
@@ -91,17 +140,19 @@ def show_no_project_menu():
         console.print("  [bold cyan]0[/]  🚪  [white]Exit[/white]")
         console.print()
         
-        choice = Prompt.ask(
+        choice = _safe_prompt(
             "[bold cyan]➜[/] Select an option",
             choices=[str(i) for i in range(0, len(recent) + 3)],
             default="1",
-            show_choices=False,
         )
+        
+        if choice is None:
+            return
         
         try:
             choice_num = int(choice)
             if choice_num == 0:
-                goodbye()
+                msg.goodbye()
                 return
             elif 1 <= choice_num <= len(recent):
                 # Navigate to recent project
@@ -133,20 +184,22 @@ def show_no_project_menu():
     console.print("  [bold cyan]2[/] 📂  [white]Browse for a different folder[/white]")
     console.print("  [bold cyan]3[/] 🚪  [white]Exit[/white]")
     console.print()
-    
-    choice = Prompt.ask(
+
+    choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
         choices=["1", "2", "3"],
         default="1",
-        show_choices=False,
     )
+    
+    if choice is None:
+        return
     
     if choice == "1":
         create_new_project()
     elif choice == "2":
         go_to_folder()
-    elif choice == "3":
-        goodbye()
+    else:
+        msg.goodbye()
         return
 
 
@@ -164,12 +217,14 @@ def create_new_project():
     console.print("  [bold cyan]5[/] 🔄  [white]Go back[/white]")
     console.print()
     
-    choice = Prompt.ask(
+    choice = _safe_prompt(
         "[bold cyan]➜[/] Select a template",
         choices=["1", "2", "3", "4", "5"],
         default="1",
-        show_choices=False,
     )
+    
+    if choice is None:
+        return
     
     if choice == "5":
         detect()
@@ -188,12 +243,14 @@ def create_new_project():
     console.print("  [bold cyan]2[/]  [white]Choose a location[/white]  [dim](opens file explorer)[/dim]")
     console.print()
     
-    location_choice = Prompt.ask(
+    location_choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
         choices=["1", "2"],
         default="1",
-        show_choices=False,
     )
+    
+    if location_choice is None:
+        return
     
     target_path = Path.cwd()
     
@@ -212,7 +269,10 @@ def create_new_project():
             console.print("[yellow]No folder selected. Using current folder.[/yellow]")
     
     console.print()
-    project_name = Prompt.ask("[bold cyan]➜[/] Project name", default="my-app")
+    project_name = _safe_prompt("[bold cyan]➜[/] Project name", default="my-app")
+    
+    if project_name is None:
+        return
     
     project_path = target_path / project_name
     
@@ -352,7 +412,6 @@ def go_to_folder():
         console.print("[bold]📁 Folders:[/bold]")
         console.print()
         
-        # Option to go up
         if str(current_path) != current_path.drive + "\\":
             console.print("  ..  📂  Go up")
         
@@ -381,12 +440,14 @@ def go_to_folder():
         if str(current_path) != current_path.drive + "\\":
             valid_choices.append("6")
         
-        choice = Prompt.ask(
+        choice = _safe_prompt(
             "➜ Select an option",
             choices=valid_choices,
             default="1",
-            show_choices=False,
         )
+        
+        if choice is None:
+            return
         
         if choice == "1":
             if not folders:
@@ -394,7 +455,9 @@ def go_to_folder():
                 continue
             
             console.print()
-            folder_num = Prompt.ask("➜ Enter folder number", default="1")
+            folder_num = _safe_prompt("➜ Enter folder number", default="1")
+            if folder_num is None:
+                return
             
             try:
                 idx = int(folder_num) - 1
@@ -430,7 +493,9 @@ def go_to_folder():
         elif choice == "3":
             console.print()
             console.print("[dim]Enter a full path (e.g., C:\\Projects\\my-app)[/dim]")
-            manual_path = Prompt.ask("➜ Path")
+            manual_path = _safe_prompt("➜ Path")
+            if manual_path is None:
+                return
             
             if manual_path:
                 new_path = Path(manual_path).resolve()
@@ -457,21 +522,3 @@ def go_to_folder():
                 current_path = Path.cwd()
             else:
                 console.print("[yellow]Already at root.[/yellow]")
-
-
-def show_more_details(result: dict):
-    """Show detailed project information."""
-    show_details(result)
-    
-    choice = Prompt.ask(
-        "[bold cyan]➜[/] Select an option",
-        choices=["1", "2"],
-        default="1",
-        show_choices=False,
-    )
-    
-    if choice == "1":
-        from opun8.commands.deploy import deploy as deploy_cmd
-        deploy_cmd()
-    else:
-        detect()

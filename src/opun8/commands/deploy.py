@@ -3,14 +3,17 @@ Deploy command - Deploy your project to the cloud.
 
 Orchestrates the full deployment flow:
     1. Detect the project
-    2. Optionally push it to GitHub (with auto-fix for common issues)
-    3. Select a target platform
-    4. Deploy and report the result
+    2. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
+    3. Deploy and report the result
 """
 
 from __future__ import annotations
 
+import datetime
+import os
+import traceback
 import webbrowser
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,9 +38,14 @@ from opun8.providers.vercel.auth import (
     is_vercel_authenticated,
     login_to_vercel,
 )
-from opun8.providers.vercel.deploy import deploy_to_vercel
+from opun8.providers.vercel.deploy import (
+    deploy_to_vercel,
+    rename_vercel_project,
+)
 from opun8.services.git_service import GitService
 from opun8.ui import messages as msg
+from opun8.commands.badges import show_badge_notification
+from opun8.services.deployment_history import add_deployment
 
 try:
     import pyperclip
@@ -49,6 +57,42 @@ except ImportError:
 console = Console()
 
 PANEL_WIDTH = 60
+
+# Same debug log used by opun8.auth, for one place a developer checks —
+# see the note on _log_debug_exception() just below for why it exists.
+DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
+
+
+def _log_debug_exception(context: str, exc: Exception) -> None:
+    """
+    Record the full traceback for an unexpected error to the local debug
+    log instead of the terminal.
+
+    Mirrors the policy already established in opun8.auth: an end user
+    only ever sees a short, friendly message (via msg.error() at the
+    call site) — never a raw Python traceback with internal file paths
+    and line numbers. console.print_exception() used to be called
+    directly in each except block here, which put exactly that kind of
+    traceback on screen for the end user. This is a one-line swap-in
+    replacement: same information, developer-only by default.
+
+    Set OPUN8_DEBUG=1 to also echo the traceback to the terminal live
+    while developing, same as opun8.auth.
+
+    Best-effort only — logging must never be able to crash a command in
+    its own right.
+    """
+    try:
+        DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {context}\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass
+    if os.environ.get("OPUN8_DEBUG"):
+        console.print_exception()
 
 
 class Platform(str, Enum):
@@ -71,6 +115,7 @@ class SuccessResult:
     """Result of a successful deployment, ready for display."""
     url: str
     project_name: str
+    project_id: Optional[str] = None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -119,8 +164,19 @@ def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────
 
-def deploy() -> None:
-    """Run the interactive deploy flow."""
+def deploy(platform_arg: Optional[str] = None, skip_github: bool = False) -> None:
+    """
+    Run the interactive deploy flow.
+
+    Args:
+        platform_arg: Optional platform specified via CLI (e.g., "vercel")
+        skip_github: If True, skip the interactive "Deploy with GitHub /
+            without GitHub" menu and go straight to a no-GitHub deploy.
+            This is what opun8.commands.detect calls after a user has
+            already chosen "Deploy without GitHub" from its own
+            post-detection menu — without this flag, deploy() would ask
+            the same GitHub question a second time.
+    """
     try:
         _print_welcome_banner()
 
@@ -130,29 +186,96 @@ def deploy() -> None:
 
         _show_project_summary(project_info)
 
-        repo_url = _maybe_push_to_github(project_info)
-
-        platform = _ask_platform()
-        if platform is None:
-            return
-
-        if platform not in IMPLEMENTED_PLATFORMS:
-            msg.info(f"{platform.value.capitalize()} support is coming soon!")
-            return
-
-        _handle_vercel_deploy(project_info, repo_url)
+        if skip_github:
+            # Caller already asked/decided about GitHub — don't ask again.
+            _deploy_without_github(project_info, platform_arg)
+        else:
+            # Show the menu with options
+            _show_deploy_menu(project_info, platform_arg)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Deployment cancelled.[/yellow]")
         console.print("[dim]Run `opun8 deploy` again when you're ready.[/dim]")
         raise typer.Exit(0)
+    except typer.Exit:
+        # A menu choice of "Exit" raises this intentionally (and already
+        # printed its own goodbye message via msg.goodbye()) — it's not an
+        # error, so let it propagate instead of falling into the handler
+        # below.
+        raise
     except Exception as exc:
-        console.print_exception()
+        _log_debug_exception("deploy() unexpected error", exc)
         msg.error(
             f"Unexpected error: {exc}",
             suggestion="Check the error above and try again.",
         )
         raise typer.Exit(1)
+
+
+def _show_deploy_menu(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+    """
+    Show the deploy menu with options.
+    """
+    while True:
+        console.print()
+        console.print("[bold]🎉 Nice! Your project is ready. What would you like to do?[/bold]")
+        console.print()
+        console.print("  [bold cyan]1[/] 🚀  [white]Deploy this project (with GitHub)[/white]")
+        console.print("  [bold cyan]2[/] ⏭️  [white]Deploy without GitHub[/white]")
+        console.print("  [bold cyan]3[/] 📂  [white]Select a different project[/white]")
+        console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
+        console.print()
+        
+        choice = _safe_prompt(
+            "[bold cyan]➜[/] Select an option",
+            choices=["1", "2", "3", "4"],
+            default="1",
+        )
+        
+        if choice is None:
+            return
+        
+        if choice == "1":
+            _deploy_with_github(project_info, platform_arg)
+            return
+        elif choice == "2":
+            _deploy_without_github(project_info, platform_arg)
+            return
+        elif choice == "3":
+            from opun8.commands.detect import go_to_folder
+            go_to_folder()
+            return
+        else:  # choice == "4"
+            msg.goodbye()
+            raise typer.Exit()
+
+
+def _deploy_with_github(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+    """Deploy with GitHub push."""
+    repo_url = _handle_github_push(project_info)
+    if repo_url is None:
+        console.print("[yellow]⚠️  GitHub push failed. Continuing without GitHub.[/yellow]")
+    
+    _continue_deploy(project_info, repo_url, platform_arg)
+
+
+def _deploy_without_github(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+    """Deploy without GitHub push."""
+    console.print("[dim]⏭️  Skipping GitHub push.[/dim]")
+    _continue_deploy(project_info, None, platform_arg)
+
+
+def _continue_deploy(project_info: Dict[str, Any], repo_url: Optional[str], platform_arg: Optional[str] = None) -> None:
+    """Continue with deployment after GitHub decision."""
+    platform = _ask_platform(default_platform=platform_arg)
+    if platform is None:
+        return
+
+    if platform not in IMPLEMENTED_PLATFORMS:
+        msg.info(f"{platform.value.capitalize()} support is coming soon!")
+        return
+
+    _handle_vercel_deploy(project_info, repo_url)
 
 
 def _print_welcome_banner() -> None:
@@ -184,7 +307,7 @@ def _detect_project() -> Optional[Dict[str, Any]]:
         )
         return None
     except Exception as exc:
-        console.print_exception()
+        _log_debug_exception("_detect_project() unexpected error", exc)
         msg.error(
             f"Unexpected error while detecting project: {exc}",
             suggestion="Run `opun8 detect` to see more details.",
@@ -234,31 +357,8 @@ def _show_project_summary(project_info: Dict[str, Any]) -> None:
 # GITHUB
 # ──────────────────────────────────────────────────────────────
 
-def _maybe_push_to_github(project_info: Dict[str, Any]) -> Optional[str]:
-    """Ask whether to push to GitHub and do so if requested."""
-    confirm = _safe_confirm(
-        "Do you want to push this project to GitHub?\n"
-        "[dim]This is recommended for version control and auto-deploy.[/dim]",
-        default=True
-    )
-    
-    if confirm is None:
-        console.print("[dim]Skipping GitHub push.[/dim]")
-        return None
-    
-    if not confirm:
-        console.print("[dim]⏭️  Skipping GitHub push.[/dim]")
-        return None
-
-    repo_url = _handle_github_push(project_info)
-    if repo_url is None:
-        console.print("[yellow]⚠️  GitHub push failed. Continuing without GitHub.[/yellow]")
-    return repo_url
-
-
 def _sanitize_repo_name(name: str) -> str:
     """Sanitize repository name for GitHub compatibility."""
-    import re
     name = name.replace(" ", "-")
     name = re.sub(r'[^a-zA-Z0-9\-_]', '', name)
     name = name.lower()
@@ -318,96 +418,25 @@ def _handle_github_push(project_info: Dict[str, Any]) -> Optional[str]:
         console.print("[dim]📤 Creating repository and pushing code...[/dim]")
 
         repo_url = f"https://github.com/{username}/{repo_name}"
+        git_service = GitService()
+        success, message = git_service.push_to_github(repo_url, token=token)
         
-        # Retry logic for push
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            if attempt > 0:
-                console.print(f"[dim]Retry attempt {attempt} of {max_retries}...[/dim]")
-            
-            git_service = GitService()
-            success, message = git_service.push_to_github(repo_url, token=token)
-            
-            if success:
-                msg.success(message)
-                return repo_url
-            
-            if "nothing to commit" in message.lower():
-                console.print("[dim]✅ No changes to commit — repository is already up to date.[/dim]")
-                return repo_url
-            
-            if "skipping github" in message.lower():
-                return None
-            
-            if "repository not found" in message.lower():
-                console.print("[red]Repository not found. Please check the name and try again.[/red]")
-                return None
-            
-            if "already exists" in message.lower() or "rejected" in message.lower():
-                console.print()
-                console.print("[yellow]⚠️  Push was rejected — the repository may already have content.[/yellow]")
-                console.print()
-                console.print("[bold]What would you like to do?[/bold]")
-                console.print()
-                console.print("  [bold cyan]1[/] 🔄  [white]Try force push[/white]  [dim](overwrites remote)[/dim]")
-                console.print("  [bold cyan]2[/] ⏭️  [white]Skip GitHub[/white]  [dim](continue without pushing)[/dim]")
-                console.print("  [bold cyan]3[/] 📝  [white]Use a different name[/white]")
-                console.print()
-                
-                choice = _safe_prompt(
-                    "[bold cyan]➜[/] Select an option",
-                    choices=["1", "2", "3"],
-                    default="1",
-                )
-                
-                if choice is None:
-                    return None
-                
-                if choice == "2":
-                    console.print("[dim]Skipping GitHub push.[/dim]")
-                    return None
-                
-                if choice == "3":
-                    new_name = _safe_prompt("[bold cyan]➜[/] Enter a new repository name")
-                    if new_name:
-                        new_name = _sanitize_repo_name(new_name)
-                        repo_url = f"https://github.com/{username}/{new_name}"
-                        console.print(f"[dim]Using new name: [cyan]{new_name}[/cyan][/dim]")
-                        continue
-                    else:
-                        console.print("[dim]Skipping GitHub push.[/dim]")
-                        return None
-                
-                if choice == "1":
-                    console.print("[dim]Force pushing to GitHub...[/dim]")
-                    success, message = git_service.push_to_github(repo_url, force=True, token=token)
-                    if success:
-                        msg.success(message + " (force push)")
-                        return repo_url
-                    else:
-                        msg.error(message)
-                        continue
-            
-            if attempt == max_retries:
-                msg.error(
-                    message,
-                    suggestion="Check your internet connection, repository permissions, and try again.",
-                )
-                return None
-            
-            retry = _safe_prompt(
-                "[bold cyan]➜[/] Retry?",
-                choices=["y", "n"],
-                default="y",
-            )
-            if retry is None or retry.lower() != "y":
-                return None
+        if success:
+            msg.success(message)
+            return repo_url
+        
+        if "nothing to commit" in message.lower():
+            console.print("[dim]✅ No changes to commit — repository is already up to date.[/dim]")
+            return repo_url
+        
+        msg.error(message)
+        return None
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  GitHub push cancelled.[/yellow]")
         return None
     except Exception as exc:
-        console.print_exception()
+        _log_debug_exception("_handle_github_push() unexpected error", exc)
         msg.error(
             f"GitHub push failed: {exc}",
             suggestion="Check your internet connection and try again.",
@@ -419,8 +448,16 @@ def _handle_github_push(project_info: Dict[str, Any]) -> Optional[str]:
 # PLATFORM SELECTION
 # ──────────────────────────────────────────────────────────────
 
-def _ask_platform() -> Optional[Platform]:
-    """Ask the user which platform to deploy to."""
+def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
+    """
+    Ask the user which platform to deploy to.
+    
+    Args:
+        default_platform: If provided, pre-select this platform (e.g., "vercel")
+    
+    Returns:
+        Selected Platform, or None if cancelled.
+    """
     console.print()
     console.print("[bold]Which platform would you like to deploy to?[/bold]")
     console.print()
@@ -429,10 +466,19 @@ def _ask_platform() -> Optional[Platform]:
     console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Coming soon)[/dim]")
     console.print()
 
+    # Determine default choice based on provided platform
+    default_choice = "1"
+    if default_platform:
+        platform_lower = default_platform.lower()
+        if platform_lower == "netlify":
+            default_choice = "2"
+        elif platform_lower == "render":
+            default_choice = "3"
+    
     choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
         choices=list(PLATFORM_CHOICES.keys()),
-        default="1",
+        default=default_choice,
     )
     
     if choice is None:
@@ -478,7 +524,7 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
         console.print("[dim]This may take a moment.[/dim]")
         console.print()
 
-        success, result = deploy_to_vercel(
+        success, url, project_id = deploy_to_vercel(
             token=token,
             project_name=project_info.get("name", project_path.name),
             project_path=project_path,
@@ -488,10 +534,28 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
         )
 
         if success:
-            _show_success(SuccessResult(url=result, project_name=project_info.get("name", project_path.name)))
+            project_name = project_info.get("name", project_path.name)
+
+            # Record it in local history and show a badge notification if
+            # one was unlocked. Isolated in its own try/except (see
+            # _record_deployment_history) so a history-file problem can
+            # never get reported as a failed deployment below.
+            _record_deployment_history(
+                project_name=project_name,
+                url=url,
+                project_id=project_id,
+                team_id=team_id,
+                env_vars=env_vars,
+            )
+
+            _show_success(SuccessResult(
+                url=url,
+                project_name=project_name,
+                project_id=project_id
+            ))
         else:
             msg.error(
-                result or "Deployment failed.",
+                url or "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
 
@@ -502,12 +566,58 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+    except typer.Exit:
+        # _show_success()/_rename_url_flow() raise this for an intentional
+        # "Exit" choice — possibly after a deployment that already
+        # succeeded. Never let it get reported as "Deployment failed".
+        raise
     except Exception as exc:
-        console.print_exception()
+        _log_debug_exception("_handle_vercel_deploy() unexpected error", exc)
         msg.error(
             f"Deployment failed: {exc}",
             suggestion="Check your internet connection and try again.",
         )
+
+
+def _record_deployment_history(
+    project_name: str,
+    url: str,
+    project_id: Optional[str],
+    team_id: Optional[str],
+    env_vars: Dict[str, str],
+) -> None:
+    """
+    Save a successful deployment to local history and show a badge
+    notification if this deployment unlocked one.
+
+    This always runs *after* the deployment has already succeeded, so a
+    problem here (corrupt history file, disk full, no write permission on
+    ~/.opun8, etc.) must never be allowed to reach the user as a failed
+    deployment — their site is live either way. Any failure is reported as
+    a quiet warning and swallowed here, not re-raised.
+
+    Only environment variable *names* are recorded, never values, so no
+    secrets from the deployed project ever end up in the history file.
+    """
+    try:
+        deployment_record = add_deployment(
+            project_name=project_name,
+            url=url,
+            platform="vercel",
+            project_id=project_id,
+            team_id=team_id,
+            env_vars=list(env_vars.keys()) if env_vars else [],
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]⚠️  Deployment succeeded, but couldn't be saved to history: {exc}[/yellow]"
+        )
+        return
+
+    try:
+        show_badge_notification(deployment_record.get("badge_unlocked"))
+    except Exception as exc:
+        console.print(f"[yellow]⚠️  Couldn't check badge progress: {exc}[/yellow]")
 
 
 def _ensure_vercel_auth() -> bool:
@@ -575,15 +685,16 @@ def _show_success(result: SuccessResult) -> None:
     console.print()
     console.print("  [bold cyan]1[/] 🌍  [white]Open website[/white]")
     console.print("  [bold cyan]2[/] 📋  [white]Copy URL[/white]")
-    console.print("  [bold cyan]3[/] 🏁  [white]Exit[/white]")
+    console.print("  [bold cyan]3[/] ✏️  [white]Rename URL[/white]  [dim](make it shorter)[/dim]")
+    console.print("  [bold cyan]4[/] 🏁  [white]Exit[/white]")
     console.print()
 
     choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3"],
+        choices=["1", "2", "3", "4"],
         default="1",
     )
-    
+
     if choice is None:
         msg.goodbye()
         raise typer.Exit()
@@ -593,9 +704,133 @@ def _show_success(result: SuccessResult) -> None:
         console.print(f"[dim]🌐 Opened {full_url}[/dim]")
     elif choice == "2":
         _copy_to_clipboard(full_url)
+    elif choice == "3":
+        _rename_url_flow(result)
     else:
         msg.goodbye()
         raise typer.Exit()
+
+
+def _rename_url_flow(result: SuccessResult) -> None:
+    """
+    Guide the user through renaming their deployment URL via Vercel API.
+    """
+    console.print()
+    console.print("[bold cyan]✏️ Rename Your Deployment[/bold cyan]")
+    console.print("[dim]Choose a shorter, cleaner name for your project.[/dim]")
+    console.print()
+    console.print(f"[dim]Current URL: [cyan]{result.url}[/cyan][/dim]")
+    console.print()
+
+    if not result.project_id:
+        console.print("[red]❌ Cannot rename: No project ID available.[/red]")
+        console.print("[dim]Please rename manually in the Vercel dashboard.[/dim]")
+        return
+
+    current_name = result.url.split('.')[0] if '.' in result.url else result.url
+    max_attempts = 3
+    attempt = 0
+
+    while attempt < max_attempts:
+        attempt += 1
+        console.print(f"[dim]Attempt {attempt} of {max_attempts}[/dim]")
+        console.print("[dim]Suggestions:[/dim]")
+        console.print("[dim]  • Use your project name (e.g., my-portfolio)[/dim]")
+        console.print("[dim]  • Keep it short (2-30 characters)[/dim]")
+        console.print("[dim]  • Use letters, numbers, and hyphens only[/dim]")
+        console.print("[dim]  • No spaces or special characters[/dim]")
+        console.print()
+
+        new_name = _safe_prompt(
+            "[bold cyan]➜[/] Enter a new name",
+            default=current_name.replace("-", "")
+        )
+
+        if new_name is None:
+            console.print("[dim]Skipping rename.[/dim]")
+            return
+
+        # Validate the name
+        new_name = re.sub(r'[^a-zA-Z0-9-]', '', new_name)
+        new_name = new_name.lower().strip('-')
+
+        if len(new_name) < 2:
+            console.print("[red]❌ Name must be at least 2 characters.[/red]")
+            continue
+
+        if len(new_name) > 30:
+            console.print("[red]❌ Name must be less than 30 characters.[/red]")
+            continue
+
+        if new_name == current_name:
+            console.print("[yellow]⚠️  Same as current name. Skipping rename.[/yellow]")
+            return
+
+        console.print()
+        console.print(f"[dim]Checking availability of [cyan]{new_name}[/cyan]...[/dim]")
+
+        # Get token
+        token = get_vercel_token()
+        if not token:
+            console.print("[red]❌ Not connected to Vercel. Please run `opun8 vercel` first.[/red]")
+            return
+
+        team_id = (get_vercel_scope() or {}).get("team_id")
+
+        # Confirm with user
+        console.print(f"[green]✅ Name '[cyan]{new_name}[/cyan]' is available![/green]")
+        console.print()
+        confirm = _safe_confirm(
+            f"[bold]Rename to [cyan]{new_name}[/cyan]?[/bold]",
+            default=True
+        )
+
+        if confirm is None or not confirm:
+            console.print("[dim]Skipping rename.[/dim]")
+            return
+
+        # Perform the rename
+        console.print("[dim]Renaming deployment...[/dim]")
+        success, message = rename_vercel_project(token, result.project_id, new_name, team_id)
+
+        if success:
+            console.print()
+            console.print(f"[bold green]✅ Renamed successfully![/bold green]")
+            console.print(f"[bold]🌐 https://{message}[/bold]")
+            console.print()
+            console.print("[bold]What would you like to do?[/bold]")
+            console.print()
+            console.print("  [bold cyan]1[/] 🌍  [white]Open website[/white]")
+            console.print("  [bold cyan]2[/] 📋  [white]Copy URL[/white]")
+            console.print("  [bold cyan]3[/] 🏁  [white]Exit[/white]")
+            console.print()
+
+            choice = _safe_prompt(
+                "[bold cyan]➜[/] Select an option",
+                choices=["1", "2", "3"],
+                default="1",
+            )
+
+            if choice == "1":
+                webbrowser.open(f"https://{message}")
+                console.print(f"[dim]🌐 Opened https://{message}[/dim]")
+            elif choice == "2":
+                _copy_to_clipboard(f"https://{message}")
+            else:
+                msg.goodbye()
+                raise typer.Exit()
+            return
+        else:
+            console.print(f"[red]❌ {message}[/red]")
+            if attempt < max_attempts:
+                console.print("[dim]Please try a different name.[/dim]")
+                continue
+            else:
+                console.print("[red]❌ Too many attempts. Skipping rename.[/red]")
+                return
+
+    console.print("[yellow]⚠️  Could not rename. Your current URL is still active.[/yellow]")
+    console.print(f"[dim]🌐 https://{_normalize_url(result.url)}[/dim]")
 
 
 def _normalize_url(url: str) -> str:

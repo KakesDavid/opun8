@@ -1,0 +1,67 @@
+OPUN8/
+│
+├── .venv/                          # Virtual environment (not committed to Git)
+│
+├── .git/                           # Git repository (not committed)
+│
+├── src/
+│   └── opun8/
+│       ├── __init__.py             # Package init — exports version
+│       ├── version.py              # Version information
+│       ├── cli.py                  # CLI entry point — all commands registered
+│       ├── main.py                 # Main entry point
+│       │
+│       ├── auth/                   # Authentication modules
+│       │   ├── __init__.py         # Auth exports (GitHub + Vercel)
+│       │   └── github_oauth.py     # GitHub OAuth flow
+│       │
+│       ├── commands/               # CLI command implementations
+│       │   ├── __init__.py         # Command exports
+│       │   ├── badges.py           # Badge viewing command
+│       │   ├── deploy.py           # Deployment command
+│       │   ├── detect.py           # Project detection command
+│       │   ├── doctor.py           # Environment check command
+│       │   └── history.py          # History viewing command
+│       │
+│       ├── core/                   # Core business logic
+│       │   ├── __init__.py         # Core exports
+│       │   ├── detector.py         # Project detection logic
+│       │   ├── environment.py      # System environment checks
+│       │   └── templates.py        # Project creation templates
+│       │
+│       ├── providers/              # Platform integrations
+│       │   ├── __init__.py         # Provider exports
+│       │   └── vercel/             # Vercel platform
+│       │       ├── __init__.py     # Vercel exports
+│       │       ├── auth.py         # Vercel OAuth + PAT fallback
+│       │       └── deploy.py       # Vercel deployment logic
+│       │
+│       ├── services/               # Shared services
+│       │   ├── __init__.py         # Service exports
+│       │   ├── deployment_history.py # History storage
+│       │   ├── git_service.py      # Git operations
+│       │   ├── navigation.py       # File system navigation
+│       │   └── recent_projects.py  # Recent projects tracking
+│       │
+│       └── ui/                     # User interface
+│           ├── __init__.py         # UI exports
+│           └── messages.py         # All user-facing messages
+│
+├── tests/                          # Test files
+│   ├── __init__.py
+│   ├── test_detector.py
+│   ├── test_git_service.py
+│   └── test_deployment_history.py
+│
+├── docs/                           # Documentation
+│   ├── installation.md
+│   ├── commands.md
+│   └── contributing.md
+│
+├── .env                            # Environment variables (not committed)
+├── .gitignore                      # Git ignore file
+├── pyproject.toml                  # Project configuration
+├── README.md                       # Project README
+├── requirements.txt                # Dependencies
+├── setup.py                        # Setup script
+└── LICENSE                         # License file

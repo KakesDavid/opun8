@@ -2,42 +2,18 @@
 Vercel deployment for Opun8.
 Handles project creation, file upload, and deployment via Vercel API.
 
-Follows Vercel's documented non-git deployment flow exactly:
-  1. Hash + upload every file individually to POST /v2/files
-     (Authorization + Content-Length + x-vercel-digest headers, raw body).
-  2. Create the deployment with POST /v13/deployments, referencing each
-     file by {file, sha, size} in the `files` array.
-  3. Poll GET /v13/deployments/:id and watch `readyState`
-     (QUEUED -> INITIALIZING -> BUILDING -> READY | ERROR).
-
-`teamId` is passed as a query parameter on every call, per Vercel's docs
-("Accessing Resources Owned by a Team") — never as a JSON body field.
-This matches the scoping already used in auth.py (list_vercel_teams,
-list_vercel_projects, etc.), so a team selected during login deploys
-to that same team.
-
-PERFORMANCE:
-  - A single requests.Session per deploy reuses TCP/TLS connections
-    (HTTP keep-alive) across every API call instead of paying a fresh
-    handshake per request.
-  - File uploads to /v2/files run concurrently across a bounded thread
-    pool (each file is independently content-addressed by its own SHA1,
-    so there's no ordering dependency between them).
-  - Transient network hiccups and Vercel rate limits (429/5xx) are
-    retried automatically with backoff at the transport layer.
-
-SECURITY:
-  - TLS certificate verification is left on (requests' default) — never
-    disable it, even for debugging.
-  - Only GET/POST are ever retried automatically, and only on this
-    idempotent, content-addressed file upload path — not on deployment
-    creation, which is not safe to blindly resubmit.
-  - Bearer tokens are set once on the session and never logged; error
-    messages print Vercel's response body/status only.
-  - Secrets (.env*) are excluded from the upload set by name, in addition
-    to whatever the caller passes explicitly via env_vars.
+Error handling philosophy (matches auth.py):
+  - What the END USER sees on screen is short, plain-English, and
+    actionable. It never contains raw HTTP response bodies or Python
+    exception text.
+  - Technical detail goes to _debug_log() (~/.opun8/debug.log) instead,
+    for whoever is building/operating Opun8 to diagnose. Set
+    OPUN8_DEBUG=1 to also echo these live in the terminal.
+  - Every network call and file operation is wrapped so failures degrade
+    to a friendly message instead of a crash.
 """
 
+import os
 import hashlib
 import threading
 import time
@@ -50,6 +26,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from rich.console import Console
+from rich.prompt import Confirm
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -60,53 +37,199 @@ from rich.progress import (
 )
 
 console = Console()
+_console_lock = threading.Lock()
+
+DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
+
+
+def _safe_print(*args, **kwargs) -> None:
+    """Thread-safe console printing (multiple upload workers print concurrently)."""
+    with _console_lock:
+        console.print(*args, **kwargs)
+
+
+def _debug_log(message: str) -> None:
+    """
+    Record technical detail (raw HTTP bodies, exception text, etc.) for
+    later troubleshooting. Never shown in normal command output.
+    Best-effort only — logging must never be able to crash a deploy.
+    """
+    try:
+        DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+    if os.environ.get("OPUN8_DEBUG"):
+        _safe_print(f"[dim]debug: {message}[/dim]")
+
+
+def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
+    """
+    The single place non-threaded code prints an error to the terminal UI.
+    Short, plain-English, actionable; technical detail goes to the debug
+    log instead of the screen.
+    """
+    console.print(f"[red]❌ {message}[/red]")
+    if hint:
+        console.print(f"[dim]{hint}[/dim]")
+    if debug_detail:
+        _debug_log(debug_detail)
+
+
+def _safe_show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
+    """Thread-safe version of _show_error, for the concurrent upload workers."""
+    with _console_lock:
+        console.print(f"[red]❌ {message}[/red]")
+        if hint:
+            console.print(f"[dim]{hint}[/dim]")
+    if debug_detail:
+        _debug_log(debug_detail)
+
 
 DEPLOYMENTS_ENDPOINT = "https://api.vercel.com/v13/deployments"
 FILES_ENDPOINT = "https://api.vercel.com/v2/files"
 PROJECTS_ENDPOINT = "https://api.vercel.com/v9/projects"
 ENV_ENDPOINT_TMPL = "https://api.vercel.com/v10/projects/{project_id}/env"
+TEAMS_ENDPOINT = "https://api.vercel.com/v2/teams"
+DOMAINS_ENDPOINT_TMPL = "https://api.vercel.com/v10/projects/{project_id}/domains"
 
-# How many files to upload in parallel. Vercel doesn't publish a hard
-# concurrent-connection cap for /v2/files, but 8 is a safe, fast default
-# that respects their per-token rate limits without tripping 429s on
-# typical project sizes.
 MAX_CONCURRENT_UPLOADS = 8
+PROJECT_LIST_PAGE_SIZE = 100
 
-# Directories/files never worth deploying.
 EXCLUDE_DIR_NAMES = {
     "node_modules", ".git", "__pycache__", ".venv", "venv",
     ".pytest_cache", ".next", ".vercel", ".turbo",
     "dist", "build", "out", ".cache", "coverage",
+    ".idea", ".vscode",
 }
-EXCLUDE_FILE_NAMES = {".env", ".env.local", ".env.development", ".env.production", ".DS_Store"}
+EXCLUDE_FILE_NAMES = {".DS_Store"}
 EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".tmp"}
 
 
+def _is_env_file(name: str) -> bool:
+    """
+    Matches .env and any variant (.env.local, .env.production, .env.test,
+    .env.anything) so secrets never get swept into a deployment upload.
+    """
+    return name == ".env" or name.startswith(".env.")
+
+
+_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
+
+
+def _parse_env_file(path: Path) -> Dict[str, str]:
+    """
+    Parse a .env-style file into {key: value}. Supports 'KEY=VALUE',
+    optional 'export KEY=VALUE', single/double-quoted values, '#' comments
+    (full-line or trailing on unquoted values), and blank lines.
+    """
+    values: Dict[str, str] = {}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        _debug_log(f"_parse_env_file couldn't read {path}: {e}")
+        return values
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        elif "#" in value:
+            value = value.split("#", 1)[0].rstrip()
+        values[key] = value
+    return values
+
+
+def detect_env_files(project_path: Path) -> List[Path]:
+    """
+    Find .env-style files sitting directly in the project root. Root-only
+    (not recursive) so files under node_modules/nested example apps/etc.
+    are never picked up as "the" project's env vars.
+    """
+    if not project_path.exists() or not project_path.is_dir():
+        return []
+    try:
+        return sorted(
+            entry for entry in project_path.iterdir()
+            if entry.is_file() and _is_env_file(entry.name)
+        )
+    except Exception as e:
+        _debug_log(f"detect_env_files couldn't scan {project_path}: {e}")
+        return []
+
+
+def prompt_for_env_vars(project_path: Path) -> Dict[str, str]:
+    """
+    Scan the project for .env files and interactively ask the user which
+    variables, if any, should be uploaded to Vercel as encrypted
+    environment variables. Returns {} if there's nothing to offer or the
+    user declines — never raises, so a bad .env file can't break a deploy.
+    """
+    env_files = detect_env_files(project_path)
+    if not env_files:
+        return {}
+
+    all_vars: Dict[str, str] = {}
+    for env_file in env_files:
+        all_vars.update(_parse_env_file(env_file))
+
+    if not all_vars:
+        return {}
+
+    console.print()
+    names = ", ".join(f.name for f in env_files)
+    console.print(f"[cyan]🔐 Found local env file(s): {names}[/cyan]")
+    console.print(f"[dim]Detected {len(all_vars)} variable(s): {', '.join(all_vars.keys())}[/dim]")
+
+    if not Confirm.ask(
+        "[bold cyan]➜[/] Upload these as encrypted environment variables on Vercel?",
+        default=True,
+    ):
+        console.print("[yellow]Skipping environment variables.[/yellow]")
+        return {}
+
+    include_all = Confirm.ask("[bold cyan]➜[/] Include all of them?", default=True)
+    if include_all:
+        selected = dict(all_vars)
+    else:
+        selected = {
+            key: value for key, value in all_vars.items()
+            if Confirm.ask(f"  [bold cyan]➜[/] Include [white]{key}[/white]?", default=True)
+        }
+
+    console.print(f"[green]✅ {len(selected)} environment variable(s) will be uploaded.[/green]")
+    return selected
+
+
 # ──────────────────────────────────────────────────────────────
-# SHARED HTTP SESSION (connection pooling + safe retries)
+# SHARED HTTP SESSION
 # ──────────────────────────────────────────────────────────────
 
 def _build_session(token: str) -> requests.Session:
-    """
-    One session per deploy, reused for every request:
-      - Authorization header set once (never re-passed/logged per call).
-      - Connection pool sized to MAX_CONCURRENT_UPLOADS so parallel
-        uploads reuse warm TLS connections instead of opening new ones.
-      - Retries with exponential backoff only for transient failures
-        (429 rate limit, 5xx) on GET/POST — safe here because every
-        POST this session makes to /v2/files is idempotent (content is
-        addressed by its own SHA1, so re-sending it is harmless).
-    """
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
 
-    retry = Retry(
+    retry_kwargs = dict(
         total=4,
         backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["GET", "POST"]),
         respect_retry_after_header=True,
     )
+    try:
+        # urllib3 >= 1.26
+        retry = Retry(allowed_methods=frozenset(["GET", "POST"]), **retry_kwargs)
+    except TypeError:
+        # urllib3 < 1.26 uses the old kwarg name
+        retry = Retry(method_whitelist=frozenset(["GET", "POST"]), **retry_kwargs)
+
     adapter = HTTPAdapter(
         max_retries=retry,
         pool_connections=MAX_CONCURRENT_UPLOADS,
@@ -121,28 +244,268 @@ def _build_session(token: str) -> requests.Session:
 # ──────────────────────────────────────────────────────────────
 
 def _sanitize_project_name(name: str) -> str:
-    """
-    Sanitize project name for Vercel.
-    Vercel rules:
-    - Lowercase only
-    - Can include: letters, digits, '.', '_', '-'
-    - Cannot contain '---' (three hyphens in a row)
-    - Max 100 characters
-    """
-    # Lowercase
+    """Sanitize project name for Vercel."""
     name = name.lower()
-    # Replace spaces with hyphens
     name = name.replace(" ", "-")
-    # Replace any invalid characters with hyphens
     name = re.sub(r'[^a-z0-9._-]', '-', name)
-    # Remove consecutive hyphens (--- not allowed)
     name = re.sub(r'-{2,}', '-', name)
-    # Remove leading/trailing hyphens
     name = name.strip('-')
-    # Truncate to 100 characters
     if len(name) > 100:
         name = name[:100]
     return name
+
+
+def get_team_name(session_or_token, team_id: str) -> Optional[str]:
+    """Get the team name from team ID. Accepts a Session or a raw token."""
+    session, owns_session = _coerce_session(session_or_token)
+    try:
+        response = session.get(f"{TEAMS_ENDPOINT}/{team_id}", timeout=10)
+        if response.status_code == 200:
+            return response.json().get("name")
+        _debug_log(f"get_team_name HTTP {response.status_code}: {response.text}")
+        return None
+    except Exception as e:
+        _debug_log(f"get_team_name error: {e}")
+        return None
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _coerce_session(session_or_token) -> Tuple[requests.Session, bool]:
+    """Allow helper functions to accept either a shared Session or a raw token."""
+    if isinstance(session_or_token, requests.Session):
+        return session_or_token, False
+    return _build_session(session_or_token), True
+
+
+def _list_all_projects(
+    session: requests.Session,
+    team_id: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Fetch every project visible to this token/team, following Vercel's
+    cursor-based pagination instead of assuming everything fits on one page.
+    """
+    projects: List[Dict] = []
+    params: Dict[str, object] = {"limit": PROJECT_LIST_PAGE_SIZE}
+    if team_id:
+        params["teamId"] = team_id
+
+    next_cursor: Optional[int] = None
+    while True:
+        page_params = dict(params)
+        if next_cursor is not None:
+            page_params["until"] = next_cursor
+
+        try:
+            response = session.get(PROJECTS_ENDPOINT, params=page_params, timeout=30)
+        except Exception as e:
+            _debug_log(f"_list_all_projects network error: {e}")
+            break
+
+        if response.status_code != 200:
+            _debug_log(f"_list_all_projects HTTP {response.status_code}: {response.text}")
+            break
+
+        data = response.json()
+        projects.extend(data.get("projects", []))
+
+        pagination = data.get("pagination") or {}
+        next_cursor = pagination.get("next")
+        if not next_cursor:
+            break
+
+    return projects
+
+
+# ──────────────────────────────────────────────────────────────
+# RESOLVE THE CLEAN PRODUCTION DOMAIN
+# ──────────────────────────────────────────────────────────────
+
+def _resolve_production_domain(
+    session: requests.Session,
+    project_id: str,
+    project_name: str,
+    team_id: Optional[str],
+    deployment_data: Optional[Dict] = None,
+) -> str:
+    """
+    Vercel's raw deployment 'url' field (e.g. from GET /v13/deployments/:id)
+    always looks like '<name>-<random-hash>-<scope-slug>.vercel.app' — every
+    account, personal or team, has an implicit scope slug, and that slug
+    leaks into the raw url. That's not a domain anyone should have to share.
+
+    Prefer, in order:
+      1. An alias already returned on the deployment payload itself.
+      2. The project's current production alias (same clean value the
+         project list/dashboard shows).
+      3. The predictable default '<project-name>.vercel.app'.
+      4. The raw deployment url, only as an absolute last resort.
+    """
+    deployment_data = deployment_data or {}
+
+    aliases = deployment_data.get("alias") or []
+    for alias in aliases:
+        if isinstance(alias, str) and alias:
+            return alias
+
+    try:
+        params: Dict[str, str] = {}
+        if team_id:
+            params["teamId"] = team_id
+        response = session.get(f"{PROJECTS_ENDPOINT}/{project_id}", params=params, timeout=15)
+        if response.status_code == 200:
+            production = (response.json().get("targets") or {}).get("production") or {}
+            prod_aliases = production.get("alias") or []
+            if prod_aliases:
+                return prod_aliases[0]
+        else:
+            _debug_log(f"_resolve_production_domain HTTP {response.status_code}: {response.text}")
+    except Exception as e:
+        _debug_log(f"_resolve_production_domain error: {e}")
+
+    return f"{project_name}.vercel.app" if project_name else (deployment_data.get("url") or "")
+
+
+# ──────────────────────────────────────────────────────────────
+# RENAME VERCEL PROJECT
+# ──────────────────────────────────────────────────────────────
+
+def _add_vercel_app_domain(
+    session: requests.Session,
+    project_id: str,
+    domain_name: str,
+    team_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Claim `domain_name` (a full '<name>.vercel.app' string) as a domain
+    on this project, via POST /v10/projects/{id}/domains.
+
+    This is the piece a plain project rename is missing. Renaming a
+    project (PATCH /v9/projects) only changes the project's `name`
+    field — it is metadata-only and does not create, move, or reassign
+    any '<name>.vercel.app' domain. Without this call, the project ends
+    up "renamed" while still only resolving under its old URL.
+
+    '<name>.vercel.app' domains are unique across ALL of Vercel, not
+    just this account, and can't be reserved ahead of time — so this
+    can legitimately fail with 409 if someone else already has it.
+
+    Returns:
+        (True, domain_name) once the domain is confirmed live on this
+        project.
+        (False, message) otherwise — message is plain-English and safe
+        to show directly.
+    """
+    params: Dict[str, str] = {}
+    if team_id:
+        params["teamId"] = team_id
+    try:
+        response = session.post(
+            DOMAINS_ENDPOINT_TMPL.format(project_id=project_id),
+            headers={"Content-Type": "application/json"},
+            params=params,
+            json={"name": domain_name},
+            timeout=30,
+        )
+    except Exception as e:
+        _debug_log(f"_add_vercel_app_domain error for {domain_name}: {e}")
+        return False, "Couldn't reach Vercel to claim that URL. Please try again."
+
+    if response.status_code in (200, 201):
+        try:
+            verified = response.json().get("verified", True)
+        except Exception:
+            verified = True
+        if not verified:
+            # Shouldn't happen for *.vercel.app (Vercel owns that whole
+            # zone, so there's no external DNS challenge to complete) —
+            # log it, but the domain IS attached to the project at this
+            # point, which is the state that matters here.
+            _debug_log(f"_add_vercel_app_domain: {domain_name} added but verified=False")
+        return True, domain_name
+
+    if response.status_code == 409:
+        return False, f"'{domain_name}' is already taken by someone else on Vercel — try a different name."
+
+    try:
+        api_error = response.json().get("error", {}).get("message", response.text)
+    except Exception:
+        api_error = response.text
+    _debug_log(f"_add_vercel_app_domain HTTP {response.status_code} for {domain_name}: {api_error}")
+    return False, "Couldn't claim that URL on Vercel. Please try again."
+
+
+def rename_vercel_project(
+    token: str,
+    project_id: str,
+    new_name: str,
+    team_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Rename a Vercel project AND claim the matching
+    '<new_name>.vercel.app' domain, so the URL this function reports
+    back is one that actually resolves.
+
+    Order matters: the domain is claimed FIRST, before the project's
+    name is touched. A '<name>.vercel.app' domain can legitimately
+    already belong to someone else and can't be reserved in advance —
+    claiming it before renaming anything means a failure here leaves
+    the project completely untouched, so the caller can just ask for a
+    different name and retry, with nothing to roll back.
+
+    Returns: (success, message/new_url) — the message is always
+    plain-English and safe to show directly to whoever ran the command.
+    """
+    session = _build_session(token)
+    try:
+        new_name = _sanitize_project_name(new_name)
+        if not new_name:
+            return False, "That name isn't usable as a Vercel project name — try letters, numbers, and dashes."
+
+        # Check if the name is available across ALL pages of YOUR
+        # projects. This is a narrower, separate check from the domain
+        # claim below — project names only need to be unique within
+        # your own account, not across all of Vercel.
+        for project in _list_all_projects(session, team_id):
+            if project.get("name") == new_name and project.get("id") != project_id:
+                return False, f"The name '{new_name}' is already in use by another project."
+
+        # '<name>.vercel.app' is unique across ALL of Vercel — claim it
+        # before touching the project's own name at all.
+        new_domain = f"{new_name}.vercel.app"
+        claimed, domain_message = _add_vercel_app_domain(session, project_id, new_domain, team_id)
+        if not claimed:
+            return False, domain_message
+
+        # The domain is live. Now update the project's own name to
+        # match, so the dashboard and the URL agree. This part is
+        # cosmetic at this point — if it fails, the new URL still
+        # works, so don't undo the domain claim over it.
+        rename_params: Dict[str, str] = {}
+        if team_id:
+            rename_params["teamId"] = team_id
+        response = session.patch(
+            f"{PROJECTS_ENDPOINT}/{project_id}",
+            headers={"Content-Type": "application/json"},
+            params=rename_params,
+            json={"name": new_name},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            _debug_log(
+                f"rename_vercel_project: domain claimed but project name PATCH failed "
+                f"HTTP {response.status_code}: {response.text}"
+            )
+
+        return True, new_domain
+
+    except Exception as e:
+        _debug_log(f"rename_vercel_project unexpected error: {e}")
+        return False, "Something went wrong renaming the project. Please try again."
+    finally:
+        session.close()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -156,27 +519,29 @@ def deploy_to_vercel(
     framework: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
     team_id: Optional[str] = None,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Optional[str]]:
     """
     Deploy a project to Vercel.
 
-    Args:
-        token: Vercel access token
-        project_name: Name of the project
-        project_path: Path to the project directory
-        framework: Framework name (e.g., "react", "nextjs")
-        env_vars: Environment variables to set
-        team_id: Team ID (if deploying to a team) — same scope value
-                 persisted by auth.py's save_vercel_scope()
+    If env_vars is left as None, the project directory is scanned for
+    .env-style files and the user is interactively prompted about which
+    variables (if any) to upload. Pass env_vars={} explicitly to skip
+    detection entirely (e.g. non-interactive/CI use).
 
-    Returns:
-        (success, message/url)
+    Returns: (success, url_or_message, project_id) — the message is
+    always plain-English and safe to show directly to the user.
     """
-    env_vars = env_vars or {}
+    project_path = Path(project_path)
+    if not project_path.exists() or not project_path.is_dir():
+        _debug_log(f"deploy_to_vercel: project path not found or not a directory: {project_path}")
+        return False, f"We couldn't find the project folder: {project_path}", None
 
-    # Sanitize project name for Vercel
+    env_vars = prompt_for_env_vars(project_path) if env_vars is None else env_vars
+
     original_name = project_name
     project_name = _sanitize_project_name(project_name)
+    if not project_name:
+        return False, "That project name isn't usable — try letters, numbers, and dashes.", None
     if original_name != project_name:
         console.print(f"[dim]ℹ️  Using project name: [cyan]{project_name}[/cyan][/dim]")
 
@@ -186,82 +551,85 @@ def deploy_to_vercel(
     console.print(f"[dim]Path: {project_path}[/dim]")
     console.print()
 
-    # One pooled, retrying session reused for every request in this deploy.
     session = _build_session(token)
+    project_id: Optional[str] = None
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=30),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=30),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
 
-        # Step 1: Collect files to deploy
-        task = progress.add_task("[cyan]📦 Analyzing project...", total=None)
-        files_to_upload = _collect_project_files(project_path)
-        if not files_to_upload:
-            progress.update(task, description="[red]❌ No files found to deploy.")
-            return False, "No deployable files found in the project directory."
-        progress.update(
-            task, description=f"[green]✅ {len(files_to_upload)} file(s) found."
-        )
+            task = progress.add_task("[cyan]📦 Analyzing project...", total=None)
+            files_to_upload = _collect_project_files(project_path)
+            if not files_to_upload:
+                progress.update(task, description="[red]❌ No files found to deploy.")
+                return False, "No deployable files found in the project directory.", None
+            progress.update(task, description=f"[green]✅ {len(files_to_upload)} file(s) found.")
 
-        # Step 2: Get or create project
-        task = progress.add_task("[cyan]▲ Getting/creating project...", total=None)
-        project_id = _get_or_create_project(session, project_name, framework, team_id)
-        if not project_id:
-            return False, "Failed to create Vercel project."
-        progress.update(task, description="[green]✅ Project ready.")
+            task = progress.add_task("[cyan]▲ Getting/creating project...", total=None)
+            project_id = _get_or_create_project(session, project_name, framework, team_id)
+            if not project_id:
+                return False, "Couldn't set up the project on Vercel. Please try again.", None
+            progress.update(task, description="[green]✅ Project ready.")
 
-        # Step 3: Set environment variables if provided
-        if env_vars:
-            task = progress.add_task("[cyan]🔐 Setting environment variables...", total=None)
-            _set_env_vars(session, project_id, env_vars, team_id)
-            progress.update(task, description="[green]✅ Environment variables set.")
+            if env_vars:
+                task = progress.add_task("[cyan]🔐 Setting environment variables...", total=None)
+                _set_env_vars(session, project_id, env_vars, team_id)
+                progress.update(task, description="[green]✅ Environment variables set.")
 
-        # Step 4: Upload every file concurrently, with a live percentage bar
-        upload_task = progress.add_task(
-            "[cyan]☁️ Uploading files...", total=len(files_to_upload)
-        )
+            upload_task = progress.add_task(
+                "[cyan]☁️ Uploading files...", total=len(files_to_upload)
+            )
+            progress_lock = threading.Lock()
 
-        def _on_file_done():
-            progress.advance(upload_task)
+            def _on_file_done():
+                with progress_lock:
+                    progress.advance(upload_task)
 
-        files_manifest = _upload_project_files(
-            session, project_path, files_to_upload, team_id,
-            progress_callback=_on_file_done,
-        )
-        if files_manifest is None:
-            progress.update(upload_task, description="[red]❌ File upload failed.")
-            return False, "Failed to upload one or more files to Vercel."
-        progress.update(upload_task, description="[green]✅ Files uploaded.")
+            files_manifest = _upload_project_files(
+                session, project_path, files_to_upload, team_id,
+                progress_callback=_on_file_done,
+            )
+            if files_manifest is None:
+                progress.update(upload_task, description="[red]❌ File upload failed.")
+                return False, "Couldn't upload one or more files to Vercel. Please try again.", project_id
+            progress.update(upload_task, description="[green]✅ Files uploaded.")
 
-        # Step 5: Create the deployment, referencing the uploaded files by sha
-        task = progress.add_task("[cyan]🚀 Creating deployment...", total=None)
-        deployment_id = _create_deployment(
-            session, project_id, project_name, files_manifest, framework, team_id
-        )
-        if not deployment_id:
-            return False, "Failed to create deployment."
-        progress.update(task, description="[green]✅ Deployment created.")
+            task = progress.add_task("[cyan]🚀 Creating deployment...", total=None)
+            deployment_id = _create_deployment(
+                session, project_id, project_name, files_manifest, framework, team_id
+            )
+            if not deployment_id:
+                return False, "Couldn't create the deployment on Vercel. Please try again.", project_id
+            progress.update(task, description="[green]✅ Deployment created.")
 
-        # Step 6: Wait for deployment to finish building
-        task = progress.add_task("[cyan]⏳ Building...", total=None)
-        final_url = _wait_for_deployment(session, deployment_id, team_id)
-        if not final_url:
-            return False, "Deployment failed or timed out."
-        progress.update(task, description="[green]✅ Deployment complete!")
+            task = progress.add_task("[cyan]⏳ Building...", total=None)
+            final_url = _wait_for_deployment(
+                session, deployment_id, project_id, project_name, team_id
+            )
+            if not final_url:
+                return False, "The deployment failed or timed out. Please try again.", project_id
+            progress.update(task, description="[green]✅ Deployment complete!")
 
-    session.close()
+        console.print()
+        console.print("[bold green]🎉 Deployment successful![/bold green]")
+        console.print(f"[dim]🌐 https://{final_url}[/dim]")
 
-    console.print()
-    console.print(f"[bold green]🎉 Deployment successful![/bold green]")
-    console.print(f"[dim]🌐 https://{final_url}[/dim]")
+        return True, final_url, project_id
 
-    return True, final_url
+    except Exception as e:
+        _debug_log(f"deploy_to_vercel unexpected error: {e}")
+        return False, "Something went wrong during the deployment. Please try again.", project_id
+
+    finally:
+        # Always release the connection pool, even on early returns/errors.
+        session.close()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -269,39 +637,39 @@ def deploy_to_vercel(
 # ──────────────────────────────────────────────────────────────
 
 def _collect_project_files(project_path: Path) -> List[Path]:
-    """
-    Walk the project directory and return the list of files to deploy,
-    skipping build artifacts, VCS metadata, virtualenvs, and secrets.
-    """
     files: List[Path] = []
+    if not project_path.exists() or not project_path.is_dir():
+        _show_error(
+            "We couldn't find the project folder to deploy.",
+            hint=f"Check that this path exists: {project_path}",
+        )
+        return []
     try:
         for file_path in project_path.rglob("*"):
             if not file_path.is_file():
                 continue
-
             rel_parts = file_path.relative_to(project_path).parts
-
-            # Skip if any parent directory is excluded
             if any(part in EXCLUDE_DIR_NAMES for part in rel_parts[:-1]):
                 continue
-
             if file_path.name in EXCLUDE_FILE_NAMES:
                 continue
-
+            if _is_env_file(file_path.name):
+                continue
             if file_path.suffix in EXCLUDE_SUFFIXES:
                 continue
-
             files.append(file_path)
-
     except Exception as e:
-        console.print(f"[red]Error scanning project directory: {e}[/red]")
+        _show_error(
+            "We couldn't read your project files.",
+            hint="Check that the project folder is readable, then try again.",
+            debug_detail=f"_collect_project_files error: {e}",
+        )
         return []
-
     return files
 
 
 # ──────────────────────────────────────────────────────────────
-# UPLOAD FILES (POST /v2/files, one call per file, keyed by SHA1)
+# UPLOAD FILES
 # ──────────────────────────────────────────────────────────────
 
 def _upload_project_files(
@@ -312,21 +680,6 @@ def _upload_project_files(
     progress_callback: Optional[Callable[[], None]] = None,
     max_workers: int = MAX_CONCURRENT_UPLOADS,
 ) -> Optional[List[Dict]]:
-    """
-    Upload every file to Vercel's content-addressed file store, in parallel,
-    and build the manifest ({file, sha, size} per entry) that
-    /v13/deployments expects in its `files` array.
-
-    Each file is uploaded independently — there's no ordering requirement
-    between them, so a bounded thread pool gives a large speedup on
-    projects with many small files (the common case) without overwhelming
-    Vercel's per-token rate limits.
-
-    Returns None if any single file fails to upload (fail the whole deploy
-    rather than shipping a partial, broken build). On first failure, any
-    not-yet-started uploads are cancelled so we don't keep spending
-    bandwidth on a deploy we already know will be rejected.
-    """
     manifest: List[Dict] = []
     manifest_lock = threading.Lock()
     failed = threading.Event()
@@ -334,30 +687,31 @@ def _upload_project_files(
     def _upload_one(file_path: Path) -> Optional[Dict]:
         if failed.is_set():
             return None
-
         rel_posix_path = file_path.relative_to(project_path).as_posix()
         try:
             content = file_path.read_bytes()
         except Exception as e:
-            console.print(f"[red]Error reading {rel_posix_path}: {e}[/red]")
+            _safe_show_error(
+                f"Couldn't read {rel_posix_path}.",
+                debug_detail=f"_upload_one read error for {rel_posix_path}: {e}",
+            )
             return None
-
         sha1 = hashlib.sha1(content).hexdigest()
         return _upload_single_file(session, content, sha1, rel_posix_path, team_id)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_upload_one, fp): fp for fp in files}
-
         for future in as_completed(futures):
-            entry = future.result()
-
+            try:
+                entry = future.result()
+            except Exception as e:
+                _debug_log(f"_upload_project_files worker raised: {e}")
+                entry = None
             if entry is None:
                 failed.set()
-                # Best-effort: stop any uploads that haven't started yet.
                 for f in futures:
                     f.cancel()
                 continue
-
             with manifest_lock:
                 manifest.append(entry)
             if progress_callback:
@@ -365,7 +719,6 @@ def _upload_project_files(
 
     if failed.is_set():
         return None
-
     return manifest
 
 
@@ -376,14 +729,10 @@ def _upload_single_file(
     rel_posix_path: str,
     team_id: Optional[str] = None,
 ) -> Optional[Dict]:
-    """Upload one file's raw bytes to POST /v2/files, keyed by its SHA1 digest."""
     try:
         params = {}
         if team_id:
             params["teamId"] = team_id
-
-        # Authorization comes from the session's default headers — never
-        # re-passed (or logged) per call.
         response = session.post(
             FILES_ENDPOINT,
             headers={
@@ -394,19 +743,18 @@ def _upload_single_file(
             data=content,
             timeout=60,
         )
-
-        # Vercel returns 200 for both "stored" and "already exists" cases.
         if response.status_code == 200:
             return {"file": rel_posix_path, "sha": sha1, "size": len(content)}
-
-        console.print(
-            f"[red]Failed to upload {rel_posix_path}: "
-            f"HTTP {response.status_code}: {response.text}[/red]"
+        _safe_show_error(
+            f"Couldn't upload {rel_posix_path}.",
+            debug_detail=f"_upload_single_file HTTP {response.status_code} for {rel_posix_path}: {response.text}",
         )
         return None
-
     except Exception as e:
-        console.print(f"[red]Error uploading {rel_posix_path}: {e}[/red]")
+        _safe_show_error(
+            f"Couldn't upload {rel_posix_path}.",
+            debug_detail=f"_upload_single_file error for {rel_posix_path}: {e}",
+        )
         return None
 
 
@@ -420,25 +768,12 @@ def _get_or_create_project(
     framework: Optional[str] = None,
     team_id: Optional[str] = None,
 ) -> Optional[str]:
-    """Get existing project or create a new one. `teamId` is always a query param."""
     try:
-        params = {"limit": 100}
-        if team_id:
-            params["teamId"] = team_id
+        for project in _list_all_projects(session, team_id):
+            if project.get("name") == project_name:
+                return project.get("id")
 
-        response = session.get(PROJECTS_ENDPOINT, params=params, timeout=30)
-
-        if response.status_code == 200:
-            projects = response.json().get("projects", [])
-            for project in projects:
-                if project.get("name") == project_name:
-                    return project.get("id")
-
-        # Create new project with sanitized name
-        payload = {
-            "name": project_name,
-            "framework": _map_framework(framework),
-        }
+        payload = {"name": project_name, "framework": _map_framework(framework)}
         create_params = {}
         if team_id:
             create_params["teamId"] = team_id
@@ -453,12 +788,19 @@ def _get_or_create_project(
 
         if response.status_code in (200, 201):
             return response.json().get("id")
-        else:
-            console.print(f"[red]Failed to create project: {response.text}[/red]")
-            return None
+        _show_error(
+            "We couldn't set up the Vercel project.",
+            hint="Please try again in a moment.",
+            debug_detail=f"_get_or_create_project HTTP {response.status_code}: {response.text}",
+        )
+        return None
 
     except Exception as e:
-        console.print(f"[red]Error getting/creating project: {e}[/red]")
+        _show_error(
+            "We couldn't reach Vercel to set up the project.",
+            hint="Check your internet connection and try again.",
+            debug_detail=f"_get_or_create_project error: {e}",
+        )
         return None
 
 
@@ -466,35 +808,62 @@ def _get_or_create_project(
 # MAP FRAMEWORK
 # ──────────────────────────────────────────────────────────────
 
+_FRAMEWORK_MAP = {
+    "react": "create-react-app",
+    "next": "nextjs",
+    "nextjs": "nextjs",
+    "vue": "vue",
+    "angular": "angular",
+    "svelte": "svelte",
+    "sveltekit": "sveltekit",
+    "node": "node",
+    "nodejs": "node",
+    "python": "python",
+    "django": "django",
+    "flask": "flask",
+    "static": None,
+    "html": None,
+    "vite": "vite",
+    "astro": "astro",
+}
+
+
 def _map_framework(framework: Optional[str]) -> Optional[str]:
-    """Map a user-facing framework name to Vercel's `projectSettings.framework` enum."""
     if not framework:
         return None
-
-    framework_map = {
-        "react": "create-react-app",
-        "next": "nextjs",
-        "nextjs": "nextjs",
-        "vue": "vue",
-        "angular": "angular",
-        "svelte": "svelte",
-        "sveltekit": "sveltekit",
-        "node": "node",
-        "nodejs": "node",
-        "python": "python",
-        "django": "django",
-        "flask": "flask",
-        "static": None,
-        "html": None,
-        "vite": "vite",
-        "astro": "astro",
-    }
-    return framework_map.get(framework.lower(), None)
+    return _FRAMEWORK_MAP.get(framework.lower(), None)
 
 
 # ──────────────────────────────────────────────────────────────
-# SET ENVIRONMENT VARIABLES
+# SET ENVIRONMENT VARIABLES (create-or-update)
 # ──────────────────────────────────────────────────────────────
+
+def _get_existing_env_vars(
+    session: requests.Session,
+    project_id: str,
+    team_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Map of env var key -> its Vercel env-record id, for upsert logic."""
+    params = {}
+    if team_id:
+        params["teamId"] = team_id
+    try:
+        response = session.get(
+            ENV_ENDPOINT_TMPL.format(project_id=project_id),
+            params=params,
+            timeout=30,
+        )
+        if response.status_code == 200:
+            return {
+                item["key"]: item["id"]
+                for item in response.json().get("envs", [])
+                if "key" in item and "id" in item
+            }
+        _debug_log(f"_get_existing_env_vars HTTP {response.status_code}: {response.text}")
+    except Exception as e:
+        _debug_log(f"_get_existing_env_vars error: {e}")
+    return {}
+
 
 def _set_env_vars(
     session: requests.Session,
@@ -503,40 +872,53 @@ def _set_env_vars(
     team_id: Optional[str] = None,
 ) -> None:
     """
-    Set environment variables for a project via POST /v10/projects/:id/env.
-
-    Note: the legacy "secret" env var type was sunset in May 2024 (values now
-    must reference a secret ID, not a raw string). "encrypted" is the current
-    equivalent for values that should stay hidden after creation.
+    Create or update each environment variable. A plain POST fails with a
+    conflict if the key already exists (e.g. on redeploy), so existing keys
+    are looked up first and updated in place via PATCH.
     """
-    try:
-        params = {}
-        if team_id:
-            params["teamId"] = team_id
+    params = {}
+    if team_id:
+        params["teamId"] = team_id
+    base_url = ENV_ENDPOINT_TMPL.format(project_id=project_id)
+    existing = _get_existing_env_vars(session, project_id, team_id)
+    failed_keys: List[str] = []
 
-        url = ENV_ENDPOINT_TMPL.format(project_id=project_id)
-
-        for key, value in env_vars.items():
-            payload = {
-                "key": key,
-                "value": value,
-                "target": ["production", "preview", "development"],
-                "type": "encrypted",
-            }
-
-            response = session.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                params=params,
-                json=payload,
-                timeout=30,
-            )
-
+    for key, value in env_vars.items():
+        payload = {
+            "key": key,
+            "value": value,
+            "target": ["production", "preview", "development"],
+            "type": "encrypted",
+        }
+        try:
+            if key in existing:
+                response = session.patch(
+                    f"{base_url}/{existing[key]}",
+                    headers={"Content-Type": "application/json"},
+                    params=params,
+                    json={"value": value, "target": payload["target"]},
+                    timeout=30,
+                )
+            else:
+                response = session.post(
+                    base_url,
+                    headers={"Content-Type": "application/json"},
+                    params=params,
+                    json=payload,
+                    timeout=30,
+                )
             if response.status_code not in (200, 201):
-                console.print(f"[yellow]Warning: Failed to set {key}: {response.text}[/yellow]")
+                failed_keys.append(key)
+                _debug_log(f"_set_env_vars HTTP {response.status_code} for key={key}: {response.text}")
+        except Exception as e:
+            failed_keys.append(key)
+            _debug_log(f"_set_env_vars error for key={key}: {e}")
 
-    except Exception as e:
-        console.print(f"[yellow]Warning: Error setting env vars: {e}[/yellow]")
+    if failed_keys:
+        console.print(
+            f"[yellow]⚠️ Couldn't set {len(failed_keys)} environment variable(s) "
+            f"({', '.join(failed_keys)}) — deployment will continue without them.[/yellow]"
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -551,28 +933,14 @@ def _create_deployment(
     framework: Optional[str] = None,
     team_id: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Create a deployment referencing already-uploaded files by sha/size.
-    Returns the deployment ID (used to poll status) — NOT the deployment url.
-
-    Note: this call is deliberately NOT covered by the session's automatic
-    retry-on-5xx/429 policy in practice, since a 5xx here can occur *after*
-    Vercel has partially registered the deployment; blindly resubmitting an
-    identical payload isn't guaranteed idempotent the way /v2/files is. If
-    it fails, surface the error and let the caller decide whether to retry
-    the whole deploy.
-    """
     try:
         payload = {
             "name": project_name,
             "project": project_id,
             "target": "production",
             "files": files_manifest,
-            "projectSettings": {
-                "framework": _map_framework(framework),
-            },
+            "projectSettings": {"framework": _map_framework(framework)},
         }
-
         params = {"skipAutoDetectionConfirmation": "1"}
         if team_id:
             params["teamId"] = team_id
@@ -587,12 +955,19 @@ def _create_deployment(
 
         if response.status_code in (200, 201):
             return response.json().get("id")
-        else:
-            console.print(f"[red]Deployment failed: HTTP {response.status_code}: {response.text}[/red]")
-            return None
+        _show_error(
+            "Vercel rejected the deployment.",
+            hint="Please try again in a moment.",
+            debug_detail=f"_create_deployment HTTP {response.status_code}: {response.text}",
+        )
+        return None
 
     except Exception as e:
-        console.print(f"[red]Error creating deployment: {e}[/red]")
+        _show_error(
+            "We couldn't reach Vercel to create the deployment.",
+            hint="Check your internet connection and try again.",
+            debug_detail=f"_create_deployment error: {e}",
+        )
         return None
 
 
@@ -603,19 +978,15 @@ def _create_deployment(
 def _wait_for_deployment(
     session: requests.Session,
     deployment_id: str,
+    project_id: str,
+    project_name: str,
     team_id: Optional[str] = None,
     timeout: int = 180,
 ) -> Optional[str]:
-    """
-    Poll GET /v13/deployments/:id and watch `readyState`
-    (QUEUED -> INITIALIZING -> BUILDING -> READY | ERROR | CANCELED).
-    Returns the deployment's public url (host, no scheme) once READY.
-    """
     try:
         params = {}
         if team_id:
             params["teamId"] = team_id
-
         start_time = time.time()
         interval = 3
 
@@ -625,32 +996,35 @@ def _wait_for_deployment(
                 params=params,
                 timeout=30,
             )
-
             if response.status_code == 200:
                 data = response.json()
                 ready_state = data.get("readyState", "QUEUED")
-
                 if ready_state == "READY":
-                    return data.get("url")
+                    return _resolve_production_domain(
+                        session, project_id, project_name, team_id, data
+                    )
                 elif ready_state in ("ERROR", "CANCELED"):
+                    # This is about the user's own build/code, not our API
+                    # plumbing, so it's genuinely actionable — show it.
                     error_msg = (
                         data.get("errorMessage")
                         or (data.get("aliasError") or {}).get("message")
                         or f"deployment ended with state {ready_state}"
                     )
-                    console.print(f"[red]Deployment failed: {error_msg}[/red]")
+                    console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
+                    _debug_log(f"_wait_for_deployment ended in {ready_state}: {error_msg}")
                     return None
-                # else: still QUEUED / INITIALIZING / BUILDING — keep polling
             else:
-                console.print(
-                    f"[yellow]Warning: status check returned HTTP {response.status_code}[/yellow]"
-                )
-
+                _debug_log(f"_wait_for_deployment status check HTTP {response.status_code}: {response.text}")
             time.sleep(interval)
 
-        console.print("[red]Deployment timed out.[/red]")
+        _show_error("The deployment took too long and timed out.", hint="Please try again.")
         return None
 
     except Exception as e:
-        console.print(f"[red]Error waiting for deployment: {e}[/red]")
+        _show_error(
+            "We couldn't check on the deployment's progress.",
+            hint="Check your internet connection and try again.",
+            debug_detail=f"_wait_for_deployment error: {e}",
+        )
         return None

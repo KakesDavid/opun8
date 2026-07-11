@@ -22,9 +22,6 @@ console = Console()
 # ──────────────────────────────────────────────────────────────
 # EMOJI / SYMBOL HANDLING
 # ──────────────────────────────────────────────────────────────
-# Some terminals (older Windows cmd.exe, SSH sessions, CI logs) and
-# screen readers don't render emoji well. Set OPUN8_NO_EMOJI=1 to
-# fall back to plain-text tags instead.
 
 _NO_EMOJI = os.environ.get("OPUN8_NO_EMOJI", "").lower() in ("1", "true", "yes")
 
@@ -51,6 +48,8 @@ _SYMBOLS = {
     "point": "👉" if not _NO_EMOJI else "->",
     "party": "🎉" if not _NO_EMOJI else "",
     "browse": "📂" if not _NO_EMOJI else "",
+    "history": "📜" if not _NO_EMOJI else "",
+    "badge": "🏅" if not _NO_EMOJI else "",
 }
 
 
@@ -61,9 +60,6 @@ def _sym(key: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # WIDTH HANDLING
 # ──────────────────────────────────────────────────────────────
-# Panels adapt to the terminal width instead of using a fixed size,
-# so they don't wrap awkwardly on narrow terminals or look tiny and
-# off-center on wide ones.
 
 def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
     term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
@@ -115,15 +111,6 @@ def goodbye() -> None:
 # ──────────────────────────────────────────────────────────────
 # WELCOME & MAIN MENU
 # ──────────────────────────────────────────────────────────────
-#
-# show_welcome() and show_help() used to call each other directly
-# ("go back" -> show_welcome(), "view commands" -> show_help()).
-# That mutual recursion grows the call stack by one frame every
-# time a user bounces between menus, and will eventually hit
-# Python's recursion limit on a long interactive session.
-#
-# Both entry points now drive the same small state machine instead,
-# so navigating between screens is a loop, not recursive calls.
 
 def show_welcome():
     """Display the welcome screen and route to the chosen action."""
@@ -157,14 +144,12 @@ def _render_welcome_and_get_next() -> str:
     ))
     console.print()
 
-    # Show GitHub status if connected
     if is_authenticated():
         user = get_authenticated_user()
         console.print(f"[dim]{_sym('link')} Connected to GitHub as [green]{user}[/green] — you're all set to deploy.[/dim]")
     else:
         console.print(f"[dim]{_sym('link')} Not connected to GitHub yet. Run 'opun8 github' anytime to connect.[/dim]")
 
-    # Show recent projects
     recent = get_recent_projects()
     if recent:
         console.print()
@@ -208,7 +193,7 @@ def _render_welcome_and_get_next() -> str:
         return "done"
     elif choice == "4":
         return "help"
-    else:  # choice == "5"
+    else:
         goodbye()
         raise typer.Exit()
 
@@ -235,6 +220,8 @@ def _render_help_and_get_next() -> str:
     table.add_row("opun8 deploy", "Deploy your project")
     table.add_row("opun8 github", "Connect to GitHub")
     table.add_row("opun8 logout", "Logout from GitHub")
+    table.add_row("opun8 history", "View deployment history")
+    table.add_row("opun8 badges", "View badge progress")
     table.add_row("opun8 help", "Show this help")
 
     console.print(table)
@@ -279,18 +266,6 @@ def detection_start():
 
 @contextmanager
 def scanning_spinner(message: str = "Scanning your current folder..."):
-    """Live spinner shown while the actual detection logic runs.
-
-    detection_start() only prints a static header now; wrap the real
-    scanning call in this context manager from commands/detect.py so
-    users get live feedback instead of a screen that looks frozen on
-    larger repos:
-
-        messages.detection_start()
-        with messages.scanning_spinner():
-            result = run_detection()
-        messages.detection_complete(result)
-    """
     with console.status(f"[dim]{message}[/dim]", spinner="dots"):
         yield
 
@@ -329,13 +304,13 @@ def no_project_detected():
 def show_deploy_menu():
     """Show menu after detection with 5 options."""
     console.print()
-    console.print(f"[bold]{_sym('party')} Nice! Your project is ready. What would you like to do next?[/bold]")
+    console.print(f"[bold]{_sym('party')} Nice! Your project is ready. What would you like to do?[/bold]")
     console.print()
     console.print(f"  [bold cyan]1[/] {_sym('rocket')}  [white]Deploy this project[/white]")
-    console.print(f"  [bold cyan]2[/] {_sym('chart')}  [white]View more details[/white]")
-    console.print(f"  [bold cyan]3[/] {_sym('cycle')}  [white]Go back[/white]")
-    console.print(f"  [bold cyan]4[/] {_sym('door')}  [white]Exit[/white]")
-    console.print(f"  [bold cyan]5[/] {_sym('browse')}  [white]Select a different project[/white]")
+    console.print(f"  [bold cyan]2[/] {_sym('browse')}  [white]Select a different project[/white]")
+    console.print(f"  [bold cyan]3[/] {_sym('history')}  [white]View deployment history[/white]")
+    console.print(f"  [bold cyan]4[/] {_sym('badge')}  [white]View badges[/white]")
+    console.print(f"  [bold cyan]5[/] {_sym('door')}  [white]Exit[/white]")
     console.print()
 
 
