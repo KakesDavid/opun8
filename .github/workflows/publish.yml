@@ -8,15 +8,17 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    # IMPORTANT: This 'permissions' block MUST be placed directly under 'runs-on'.
-    # The 'id-token: write' permission is absolutely required for OIDC trusted publishing.
+    
     permissions:
       id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          # Fetch all history for all branches and tags.
+          # This ensures the workflow can find the specific tag/commit that triggered it.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
