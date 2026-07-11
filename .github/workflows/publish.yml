@@ -1,28 +1,48 @@
+# .github/workflows/publish.yml
+# This workflow publishes the opun8 package to PyPI using Trusted Publishing (OIDC).
+# It triggers automatically when a new GitHub Release is published.
+
 name: Publish to PyPI
 
 on:
   release:
-    types: [published]
+    types: [published]  # Triggered when a release is published
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
+    # The id-token: write permission is REQUIRED for OIDC-based Trusted Publishing.
+    # This allows the action to request an OIDC token from GitHub's provider.
+    permissions:
+      id-token: write
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-python@v5
+      # 1. Check out the repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Set up the Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
+
+      # 3. Install build dependencies
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
           pip install build
-      
+
+      # 4. Build the package distribution files
       - name: Build package
         run: python -m build
-      
+
+      # 5. Publish to PyPI using Trusted Publishing (OIDC)
+      # This action automatically uses the OIDC token from GitHub.
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          # skip-existing: true prevents errors if a version already exists on PyPI.
+          # This is useful for retrying failed releases.
           skip-existing: true
