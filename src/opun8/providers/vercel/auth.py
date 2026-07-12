@@ -26,11 +26,11 @@ from rich.table import Table
 console = Console()
 
 # ------------------------------------------------------------------------------
-# API Configuration - Calls your local backend
+# API Configuration - Calls your deployed backend
 # ------------------------------------------------------------------------------
 
-# Your local API URL (change to deployed URL later)
-API_BASE_URL = os.environ.get("OPUN8_API_URL", "http://localhost:8000")
+# Your deployed API URL on Render
+API_BASE_URL = os.environ.get("OPUN8_API_URL", "https://opun8-api.onrender.com")
 
 # OAuth Configuration - these are handled by your API, not stored locally
 # The CLI only needs the redirect URI for the callback server
