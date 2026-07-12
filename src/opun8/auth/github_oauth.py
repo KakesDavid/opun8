@@ -1,5 +1,6 @@
 """
 GitHub OAuth authentication for Opun8.
+Now uses the Opun8 API backend instead of local .env file.
 """
 
 import os
@@ -16,42 +17,50 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 console = Console()
 
 # ------------------------------------------------------------------------------
-# OAuth Configuration — READ FROM .env ONLY — NO HARDCODED VALUES
+# API Configuration - Calls your local backend
 # ------------------------------------------------------------------------------
 
-CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID")
-CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET")
+# Your local API URL (change to deployed URL later)
+API_BASE_URL = os.environ.get("OPUN8_API_URL", "http://localhost:8000")
 
-# Actually honor GITHUB_REDIRECT_URI from .env instead of silently ignoring it.
-REDIRECT_URI = os.environ.get("GITHUB_REDIRECT_URI", "http://localhost:8080/callback")
+# OAuth Configuration - these are handled by your API, not stored locally
+# The CLI only needs the redirect URI for the callback server
+REDIRECT_URI = "http://localhost:8080/callback"
 
 _parsed_redirect = urllib.parse.urlparse(REDIRECT_URI)
 CALLBACK_HOST = _parsed_redirect.hostname or "localhost"
 CALLBACK_PORT = _parsed_redirect.port or 8080
 CALLBACK_PATH = _parsed_redirect.path or "/callback"
 
-SCOPES = "repo,workflow"  # GitHub accepts comma-delimited scopes.
-
+SCOPES = "repo,workflow"
 AUTHORIZATION_ENDPOINT = "https://github.com/login/oauth/authorize"
-TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
-
-if not CLIENT_ID or not CLIENT_SECRET:
-    console.print("[red]❌ GitHub credentials not found in .env file.[/red]")
-    console.print("[dim]Please ensure GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are set in .env[/dim]")
 
 TOKEN_FILE = Path.home() / ".opun8" / "github_token.json"
 
 
 def _build_authorize_url(state: str) -> str:
+    """Build GitHub OAuth URL - client_id comes from your API"""
+    # Get client_id from your API
+    try:
+        response = requests.get(f"{API_BASE_URL}/github/config", timeout=5)
+        if response.status_code == 200:
+            client_id = response.json().get("client_id")
+        else:
+            console.print("[red]❌ Could not fetch GitHub client ID from API[/red]")
+            return None
+    except Exception:
+        console.print("[red]❌ Could not connect to Opun8 API[/red]")
+        return None
+
+    if not client_id:
+        console.print("[red]❌ GitHub client ID not configured on API server[/red]")
+        return None
+
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
         "scope": SCOPES,
         "state": state,
@@ -60,8 +69,7 @@ def _build_authorize_url(state: str) -> str:
 
 
 # ------------------------------------------------------------------------------
-# Local callback server — catches the redirect instead of asking the user
-# to copy/paste a code out of a dead browser tab.
+# Local callback server - catches the redirect
 # ------------------------------------------------------------------------------
 
 class _CallbackResult:
@@ -100,7 +108,7 @@ def _make_handler(result: _CallbackResult, done_event: threading.Event):
             done_event.set()
 
         def log_message(self, format, *args):
-            pass  # silence default HTTP server logging
+            pass
 
     return Handler
 
@@ -126,7 +134,7 @@ def _wait_for_callback(timeout: int = 180) -> _CallbackResult:
 
 
 # ------------------------------------------------------------------------------
-# Token Storage
+# Token Storage (local cache for user's access token)
 # ------------------------------------------------------------------------------
 
 def get_github_token() -> Optional[str]:
@@ -156,7 +164,7 @@ def save_github_token(token: str, user_info: Dict) -> None:
 
 
 # ------------------------------------------------------------------------------
-# Login Flow
+# Login Flow - Uses your API for token exchange
 # ------------------------------------------------------------------------------
 
 def login_to_github() -> Optional[str]:
@@ -188,12 +196,11 @@ def login_to_github() -> Optional[str]:
         console.print("\n[yellow]Skipping GitHub authentication.[/yellow]")
         return None
 
-    if not CLIENT_ID or not CLIENT_SECRET:
-        console.print("[red]❌ Missing GitHub credentials in .env file.[/red]")
-        return None
-
     state = secrets.token_urlsafe(32)
     authorize_url = _build_authorize_url(state)
+
+    if not authorize_url:
+        return None
 
     console.print()
     console.print("[dim]🌐 Opening browser for GitHub authorization...[/dim]")
@@ -223,34 +230,37 @@ def login_to_github() -> Optional[str]:
 
 
 def exchange_github_code_for_token(code: str) -> Optional[str]:
+    """Exchange code for token using your API (not .env)"""
     try:
         if not code:
             console.print("[red]❌ No authorization code received.[/red]")
             return None
 
-        if not CLIENT_SECRET:
-            console.print("[red]❌ GITHUB_CLIENT_SECRET not found in .env file.[/red]")
-            return None
-
+        # Call your API to exchange the code
         response = requests.post(
-            TOKEN_ENDPOINT,
-            headers={"Accept": "application/json"},
-            data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-            },
+            f"{API_BASE_URL}/github/exchange",
+            params={"code": code},
             timeout=30,
         )
 
+        if response.status_code != 200:
+            error_msg = response.json().get("detail", "Unknown error")
+            console.print(f"[red]❌ Token exchange failed: {error_msg}[/red]")
+            return None
+
         data = response.json()
+        token = data.get("access_token")
 
-        if "access_token" in data:
-            token = data["access_token"]
+        if token:
+            # Get user info from your API
+            user_response = requests.get(
+                f"{API_BASE_URL}/github/user",
+                params={"access_token": token},
+                timeout=10,
+            )
 
-            user = get_github_user_info(token)
-            if user:
+            if user_response.status_code == 200:
+                user = user_response.json()
                 save_github_token(token, user)
                 console.print()
                 console.print(f"[bold green]✅ Connected as: {user.get('login', 'Unknown')}[/bold green]")
@@ -260,20 +270,24 @@ def exchange_github_code_for_token(code: str) -> Optional[str]:
 
             return token
         else:
-            error_msg = data.get("error_description", data.get("error", "Unknown error"))
-            console.print(f"[red]Failed to get token: {error_msg}[/red]")
+            console.print(f"[red]❌ No access token in response: {data}[/red]")
             return None
 
+    except requests.exceptions.ConnectionError:
+        console.print(f"[red]❌ Could not connect to Opun8 API at {API_BASE_URL}[/red]")
+        console.print("[dim]Make sure the API is running or check OPUN8_API_URL[/dim]")
+        return None
     except Exception as e:
-        console.print(f"[red]Error exchanging code: {e}[/red]")
+        console.print(f"[red]❌ Error exchanging code: {e}[/red]")
         return None
 
 
 def get_github_user_info(token: str) -> Optional[Dict]:
+    """Get GitHub user info - uses your API"""
     try:
         response = requests.get(
-            "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {token}"},
+            f"{API_BASE_URL}/github/user",
+            params={"access_token": token},
             timeout=10,
         )
         return response.json() if response.status_code == 200 else None

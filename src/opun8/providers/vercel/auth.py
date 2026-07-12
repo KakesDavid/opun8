@@ -1,19 +1,6 @@
 """
 Vercel OAuth authentication for Opun8.
-
-Error handling philosophy used throughout this file:
-  - Anything the END USER of Opun8 sees on screen is short, plain-English,
-    and either self-resolving ("try again") or points at something they can
-    actually do. It never contains raw HTTP bodies, stack traces, or env
-    var names — those aren't things a user of the CLI can fix.
-  - Anything TECHNICAL (HTTP status/response bodies, exception text,
-    missing configuration) is written to a local debug log instead
-    (~/.opun8/debug.log) via _debug_log(), so the person operating/building
-    Opun8 can diagnose it without it ever being shown as a scary error to
-    an end user. Set OPUN8_DEBUG=1 to also echo these to the terminal live.
-  - No code path here should be able to crash the process. Every network
-    call and every bit of file I/O is wrapped so failures degrade to a
-    friendly message instead of a traceback.
+Now uses the Opun8 API backend instead of local .env file.
 """
 
 import os
@@ -36,24 +23,17 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 console = Console()
 
 # ------------------------------------------------------------------------------
-# OAuth Configuration — READ FROM .env ONLY — NO HARDCODED VALUES
+# API Configuration - Calls your local backend
 # ------------------------------------------------------------------------------
 
-CLIENT_ID = os.environ.get("VERCEL_CLIENT_ID")
-# No VERCEL_CLIENT_SECRET: this app is registered with Vercel as a
-# public client using PKCE. Public clients authenticate the token
-# exchange with a code_verifier, not a client secret — sending one
-# (even a real, valid one) makes Vercel reject the request with
-# "invalid_client: Unsupported client authentication method", because
-# it looks like an attempt to authenticate as a confidential client.
+# Your local API URL (change to deployed URL later)
+API_BASE_URL = os.environ.get("OPUN8_API_URL", "http://localhost:8000")
 
+# OAuth Configuration - these are handled by your API, not stored locally
+# The CLI only needs the redirect URI for the callback server
 CALLBACK_HOST = "localhost"
 CALLBACK_PORT = 8080
 CALLBACK_PATH = "/vercel/callback"
@@ -66,8 +46,6 @@ USERINFO_ENDPOINT = "https://api.vercel.com/login/oauth/userinfo"
 SCOPES = "openid email profile offline_access"
 
 # How long before an access token's real expiry we proactively refresh it.
-# Vercel access tokens last exactly 1 hour; refreshing a couple of minutes
-# early avoids racing a live request against the token dying mid-flight.
 TOKEN_REFRESH_SKEW_SECONDS = 120
 
 TOKEN_FILE = Path.home() / ".opun8" / "vercel_token.json"
@@ -76,26 +54,9 @@ DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
 _DIR_MODE = stat.S_IRWXU
 _FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 
-# NOTE: CLIENT_ID is intentionally NOT validated here at
-# import time. This module gets imported by every Opun8 command, including
-# ones that never touch Vercel login at all (e.g. reusing an already-saved
-# token) — printing a warning on every single command regardless of what
-# the user is doing is exactly the kind of noisy, irrelevant error this
-# file is trying to avoid. The check happens once, right where it matters:
-# inside login_to_vercel(), the moment someone actually starts a fresh login.
-
-
-# ------------------------------------------------------------------------------
-# DEBUG LOGGING — technical detail for the developer, never for the end user
-# ------------------------------------------------------------------------------
 
 def _debug_log(message: str) -> None:
-    """
-    Record technical detail (raw HTTP bodies, exception text, missing
-    config, etc.) for later troubleshooting. Never shown in normal command
-    output. Best-effort only — logging must never be able to crash a
-    command in its own right.
-    """
+    """Record technical detail for later troubleshooting."""
     try:
         DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -108,16 +69,29 @@ def _debug_log(message: str) -> None:
 
 
 def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
-    """
-    The single place that prints an error to the terminal UI. Keeps what
-    the user sees short, plain-English, and actionable; routes anything
-    technical to the debug log instead of the screen.
-    """
+    """Show user-friendly error message."""
     console.print(f"[red]❌ {message}[/red]")
     if hint:
         console.print(f"[dim]{hint}[/dim]")
     if debug_detail:
         _debug_log(debug_detail)
+
+
+def _fetch_vercel_config() -> Optional[str]:
+    """Fetch Vercel client ID from the API."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/vercel/config", timeout=5)
+        if response.status_code == 200:
+            return response.json().get("client_id")
+        else:
+            _debug_log(f"Failed to fetch Vercel config: {response.status_code}")
+            return None
+    except requests.exceptions.ConnectionError:
+        _debug_log(f"Could not connect to Opun8 API at {API_BASE_URL}")
+        return None
+    except Exception as e:
+        _debug_log(f"Error fetching Vercel config: {e}")
+        return None
 
 
 _DEPLOY_CALLBACK: Optional[Callable] = None
@@ -142,9 +116,9 @@ def _generate_pkce_pair():
     return code_verifier, code_challenge
 
 
-def _build_authorize_url(state: str, nonce: str, code_challenge: str) -> str:
+def _build_authorize_url(state: str, nonce: str, code_challenge: str, client_id: str) -> str:
     params = {
-        "client_id": CLIENT_ID,
+        "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
         "scope": SCOPES,
@@ -157,20 +131,6 @@ def _build_authorize_url(state: str, nonce: str, code_challenge: str) -> str:
 
 
 def _decode_jwt_payload(token: str) -> Optional[Dict]:
-    """
-    Decode (NOT cryptographically verify) the payload segment of a JWT.
-    Used only to read the 'nonce' claim off the id_token as a
-    defense-in-depth replay check.
-
-    This is deliberately not full signature verification — doing that
-    properly means fetching and caching Vercel's JWKS and pulling in a JWT
-    library, which is a meaningfully bigger dependency and surface area.
-    We trust the id_token's origin because it comes back directly from
-    Vercel's token endpoint over the same authenticated HTTPS backchannel
-    request that just exchanged our authorization code — not because we've
-    verified its signature. The nonce check below still catches replay of
-    a stale/mismatched id_token, which is the main thing nonce is for.
-    """
     try:
         parts = token.split(".")
         if len(parts) != 3:
@@ -234,10 +194,7 @@ def _wait_for_callback(timeout: int = 180) -> _CallbackResult:
         server = HTTPServer((CALLBACK_HOST, CALLBACK_PORT), handler)
     except OSError as e:
         result.error = f"port {CALLBACK_PORT} unavailable"
-        _debug_log(
-            f"Couldn't bind local OAuth callback server on "
-            f"{CALLBACK_HOST}:{CALLBACK_PORT}: {e}"
-        )
+        _debug_log(f"Couldn't bind local OAuth callback server on {CALLBACK_HOST}:{CALLBACK_PORT}: {e}")
         return result
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -263,12 +220,6 @@ def _read_token_file() -> Dict:
 
 
 def _write_token_file(data: Dict) -> bool:
-    """
-    Persist the token file. Crash-proof by design: if this fails for any
-    reason (disk full, permissions, locked file, etc.) the detail goes to
-    the debug log and the caller gets a friendly message instead of the
-    whole command dying.
-    """
     token_dir = TOKEN_FILE.parent
     try:
         token_dir.mkdir(parents=True, exist_ok=True)
@@ -301,23 +252,6 @@ def _write_token_file(data: Dict) -> bool:
 
 
 def get_vercel_token() -> Optional[str]:
-    """
-    Return a usable Vercel access token, transparently refreshing it first
-    if needed.
-
-    - A saved PAT always wins and is returned as-is (PATs are long-lived
-      and managed manually on vercel.com/account/tokens — they aren't
-      part of this expiry/refresh cycle).
-    - An OAuth access token is checked against its stored `expires_at`.
-      Vercel access tokens are only valid for 1 hour, so without this a
-      user would have to re-run the login flow every hour. If it's
-      expired or about to expire, this automatically exchanges the saved
-      refresh token for a new access/refresh token pair before returning
-      — callers never need to know this happened.
-    - Token files saved before this existed won't have `expires_at` yet;
-      those are returned as-is (same as before) until the next login
-      populates it, after which refreshing is automatic from then on.
-    """
     data = _read_token_file()
 
     pat = data.get("pat_token")
@@ -336,57 +270,22 @@ def get_vercel_token() -> Optional[str]:
             if refreshed:
                 return refreshed
             if now >= expires_at:
-                # Definitely expired (not just "about to") and refreshing
-                # didn't work — most likely the 30-day-old refresh token
-                # itself is gone too. Return None so callers show a clear
-                # "reconnect to Vercel" message instead of trying this
-                # access token and getting a confusing failure from
-                # whatever Vercel API they actually wanted to call.
                 return None
-            # Still technically valid for a few more seconds and the
-            # refresh attempt just failed early (e.g. a transient network
-            # blip) — use it rather than forcing a reconnect for nothing.
 
     return access_token
 
 
 def refresh_vercel_token() -> Optional[str]:
-    """
-    Exchange the saved refresh token for a new access/refresh token pair.
-
-    Per Vercel's OAuth docs, Refresh Tokens are single-use and rotate on
-    every exchange — the token used here is invalidated the moment this
-    call succeeds, so the new refresh token from the response is always
-    saved too. Reusing an old refresh token after this runs would just
-    fail on the next attempt.
-
-    Returns the new access token on success. Returns None if there's no
-    refresh token on file, the app isn't configured (no CLIENT_ID), or
-    the refresh itself fails (offline, or the refresh token has expired/
-    been revoked — e.g. after Vercel's 30-day refresh token lifetime).
-    In every None case, the caller should fall back to a fresh
-    interactive login rather than retrying with a token we know is dead.
-    """
-    if not CLIENT_ID:
-        return None
-
     data = _read_token_file()
     refresh_token = data.get("refresh_token")
     if not refresh_token:
         return None
 
+    # Call your API to refresh the token
     try:
         response = requests.post(
-            TOKEN_ENDPOINT,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": CLIENT_ID,
-                # No client_secret — same public/PKCE client used for the
-                # authorization_code exchange (see the note next to
-                # CLIENT_ID above).
-                "refresh_token": refresh_token,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            f"{API_BASE_URL}/vercel/refresh",
+            json={"refresh_token": refresh_token},
             timeout=30,
         )
     except requests.RequestException as e:
@@ -427,19 +326,6 @@ def save_vercel_token(
     refresh_token: Optional[str] = None,
     expires_in: Optional[int] = None,
 ) -> None:
-    """
-    Persist an OAuth access token.
-
-    `expires_in` (seconds, straight from Vercel's token endpoint response)
-    is converted to an absolute `expires_at` timestamp so get_vercel_token()
-    can tell later whether the token needs refreshing without having to
-    know when it was originally saved.
-
-    `refresh_token` only overwrites the stored value when a new one is
-    actually provided. Vercel rotates refresh tokens on every use, but if
-    a caller ever saves an access token without one, we don't want to
-    silently wipe out the last good refresh token.
-    """
     data = _read_token_file()
     data["access_token"] = token
     data["user"] = user_info
@@ -451,14 +337,9 @@ def save_vercel_token(
 
 
 def get_vercel_scope() -> Dict:
-    """
-    Returns the current scope.
-    For personal accounts, team_id is always None.
-    """
     data = _read_token_file()
     scope = data.get("scope", {})
 
-    # Ensure personal account always has team_id: None
     if scope.get("team_name") == "Personal Account" or not scope.get("team_id"):
         return {"team_id": None, "team_name": "Personal Account"}
 
@@ -482,7 +363,6 @@ def get_pat_token() -> Optional[str]:
 
 
 def clear_pat_token() -> None:
-    """Remove a saved PAT so get_vercel_token() falls back to the OAuth token."""
     data = _read_token_file()
     if "pat_token" in data:
         del data["pat_token"]
@@ -509,20 +389,21 @@ def login_to_vercel() -> Optional[str]:
         console.print("\n[yellow]Skipping Vercel authentication.[/yellow]")
         return None
 
-    if not CLIENT_ID:
-        # This is an app configuration problem, not something an end user
-        # of Opun8 can do anything about — never show them env var names.
+    # Get client_id from API
+    client_id = _fetch_vercel_config()
+    if not client_id:
         _show_error(
             "Vercel login isn't available right now.",
-            hint="This is a setup issue on our end, not something you need to fix — please contact support if it keeps happening.",
-            debug_detail="Vercel OAuth misconfigured: missing VERCEL_CLIENT_ID in .env",
+            hint="This is a setup issue on our end, not something you need to fix.",
+            debug_detail="Vercel OAuth misconfigured: could not fetch client_id from API",
         )
         return None
 
     code_verifier, code_challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
-    authorize_url = _build_authorize_url(state, nonce, code_challenge)
+    authorize_url = _build_authorize_url(state, nonce, code_challenge, client_id)
+
     console.print()
     console.print("[dim]🌐 Opening browser for Vercel authorization...[/dim]")
     webbrowser.open(authorize_url)
@@ -539,9 +420,6 @@ def login_to_vercel() -> Optional[str]:
         )
         return None
 
-    # Constant-time comparison: the CSRF risk here is low either way (this
-    # runs locally against a value we generated), but there's no reason not
-    # to use the safer comparison when it's this cheap.
     if not secrets.compare_digest(result.state or "", state):
         _show_error(
             "Something looked wrong with the login response, so we stopped here for your safety.",
@@ -568,58 +446,40 @@ def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] 
             _show_error("We didn't receive an authorization code from Vercel.", hint="Please try logging in again.")
             return None
 
+        # Call your API to exchange the code
         response = requests.post(
-            TOKEN_ENDPOINT,
-            data={
-                "grant_type": "authorization_code",
-                "client_id": CLIENT_ID,
-                # No client_secret — see the note next to CLIENT_ID above.
-                # PKCE proves who we are via code_verifier instead.
+            f"{API_BASE_URL}/vercel/exchange",
+            json={
                 "code": code,
                 "code_verifier": code_verifier,
                 "redirect_uri": REDIRECT_URI,
             },
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
             timeout=30,
         )
 
         if response.status_code != 200:
+            error_msg = response.json().get("detail", "Unknown error")
             _show_error(
                 "Vercel didn't accept the login request.",
                 hint="Please try again in a moment.",
-                debug_detail=f"Token exchange HTTP {response.status_code}: {response.text}",
+                debug_detail=f"Token exchange API error: {error_msg}",
             )
             return None
 
         data = response.json()
         if "access_token" not in data:
-            error = data.get("error_description", data.get("error", "Unknown error"))
             _show_error(
                 "We couldn't finish connecting your Vercel account.",
                 hint="Please try again.",
-                debug_detail=f"Token exchange response missing access_token: {error}",
+                debug_detail=f"Token exchange response missing access_token: {data}",
             )
             return None
-
-        # Defense-in-depth: if Vercel returned an id_token, make sure the
-        # nonce we sent on the original authorize request comes back
-        # unchanged before we trust anything else in this response.
-        id_token = data.get("id_token")
-        if id_token and nonce:
-            claims = _decode_jwt_payload(id_token)
-            returned_nonce = (claims or {}).get("nonce")
-            if returned_nonce is not None and not secrets.compare_digest(str(returned_nonce), nonce):
-                _show_error(
-                    "Something looked wrong with the login response, so we didn't save it.",
-                    hint="Please try logging in again.",
-                    debug_detail="id_token nonce mismatch during token exchange — rejecting token.",
-                )
-                return None
 
         token = data["access_token"]
         refresh_token = data.get("refresh_token")
         expires_in = data.get("expires_in")
         user = get_vercel_user_info(token)
+
         if user:
             save_vercel_token(token, user, refresh_token, expires_in)
             console.print()
@@ -627,11 +487,19 @@ def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] 
         else:
             save_vercel_token(token, {"name": "Unknown"}, refresh_token, expires_in)
             console.print("[yellow]Connected, but couldn't load your profile details.[/yellow]")
+
         return token
 
+    except requests.exceptions.ConnectionError:
+        _show_error(
+            "Could not connect to Opun8 API.",
+            hint="Make sure the API server is running.",
+            debug_detail=f"Connection error to {API_BASE_URL}",
+        )
+        return None
     except requests.RequestException as e:
         _show_error(
-            "We couldn't reach Vercel to finish logging in.",
+            "We couldn't reach the Opun8 API to finish logging in.",
             hint="Check your internet connection and try again.",
             debug_detail=f"Token exchange network error: {e}",
         )
@@ -646,8 +514,13 @@ def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] 
 
 
 def get_vercel_user_info(token: str) -> Optional[Dict]:
+    """Get Vercel user info - uses your API"""
     try:
-        response = requests.post(USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        response = requests.get(
+            f"{API_BASE_URL}/vercel/user",
+            params={"access_token": token},
+            timeout=10,
+        )
         if response.status_code != 200:
             _debug_log(f"get_vercel_user_info HTTP {response.status_code}: {response.text}")
             return None
@@ -718,7 +591,6 @@ def list_vercel_teams(token: str, silent: bool = False) -> Optional[list]:
 def prompt_team_selection(token: str) -> None:
     teams = list_vercel_teams(token)
 
-    # Always default to Personal Account if no teams or error
     if teams is None or not teams:
         save_vercel_scope(None, "Personal Account")
         console.print("[green]✅ Using Personal Account.[/green]")
@@ -739,11 +611,6 @@ def prompt_team_selection(token: str) -> None:
     )
 
     if selection == "0":
-        # A saved PAT is always scoped to a specific team (Vercel doesn't
-        # issue "Personal Account" PATs — see the instructions above), so if
-        # one is still saved it will keep authenticating as that team even
-        # though the scope now says "Personal Account". Drop it and fall
-        # back to the OAuth token, which does have personal-account access.
         if get_pat_token():
             if _read_token_file().get("access_token"):
                 clear_pat_token()
