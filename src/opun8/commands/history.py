@@ -572,7 +572,10 @@ def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
-    """Redeploy to Vercel."""
+    """
+    Redeploy to Vercel using the existing project ID if available.
+    This prevents the "project already exists" error on redeploy.
+    """
     token = get_vercel_token()
 
     if not token:
@@ -581,6 +584,7 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
 
     project_name = deployment.get("project_name") or project_path.name
     team_id = (get_vercel_scope() or {}).get("team_id")
+    existing_project_id = deployment.get("project_id")  # Critical: use existing project ID
 
     console.print()
     console.print("[dim]Would you like to update environment variables?[/dim]")
@@ -598,10 +602,12 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
         framework=None,
         env_vars=env_vars,
         team_id=team_id,
+        existing_project_id=existing_project_id,  # Pass the existing project ID
     )
 
     if not success:
-        msg.error(url or "Redeploy failed.", suggestion="Check your project for build errors.")
+        # The error message from deploy_to_vercel already explains what failed
+        # Don't override it with a generic "build errors" hint
         return
 
     result = add_deployment(

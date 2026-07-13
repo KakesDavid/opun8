@@ -319,6 +319,29 @@ def _list_all_projects(
     return projects
 
 
+def _find_project_by_name(
+    session: requests.Session,
+    project_name: str,
+    team_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Direct name lookup — GET /v9/projects/{idOrName} also accepts a name.
+    Used as a fallback when the paginated project list misses a project
+    that (per Vercel) already exists under this name/scope.
+    """
+    try:
+        params = {}
+        if team_id:
+            params["teamId"] = team_id
+        response = session.get(f"{PROJECTS_ENDPOINT}/{project_name}", params=params, timeout=15)
+        if response.status_code == 200:
+            return response.json().get("id")
+        _debug_log(f"_find_project_by_name HTTP {response.status_code}: {response.text}")
+    except Exception as e:
+        _debug_log(f"_find_project_by_name error: {e}")
+    return None
+
+
 # ──────────────────────────────────────────────────────────────
 # RESOLVE THE CLEAN PRODUCTION DOMAIN
 # ──────────────────────────────────────────────────────────────
@@ -817,7 +840,7 @@ def _upload_single_file(
 
 
 # ──────────────────────────────────────────────────────────────
-# GET OR CREATE PROJECT
+# GET OR CREATE PROJECT (with direct name lookup fallback)
 # ──────────────────────────────────────────────────────────────
 
 def _get_or_create_project(
@@ -827,10 +850,12 @@ def _get_or_create_project(
     team_id: Optional[str] = None,
 ) -> Optional[str]:
     try:
+        # First: try to find it via paginated list
         for project in _list_all_projects(session, team_id):
             if project.get("name") == project_name:
                 return project.get("id")
 
+        # Second: try to create it
         payload = {"name": project_name, "framework": _map_framework(framework)}
         create_params = {}
         if team_id:
@@ -846,6 +871,19 @@ def _get_or_create_project(
 
         if response.status_code in (200, 201):
             return response.json().get("id")
+
+        # Third: if create failed with 400/409 (project exists but list missed it),
+        # try direct name lookup as fallback
+        if response.status_code in (400, 409):
+            existing_id = _find_project_by_name(session, project_name, team_id)
+            if existing_id:
+                _debug_log(
+                    f"_get_or_create_project: create conflicted "
+                    f"(HTTP {response.status_code}) but direct lookup found "
+                    f"existing project '{project_name}' -> {existing_id}; using it."
+                )
+                return existing_id
+
         _show_error(
             "We couldn't set up the Vercel project.",
             hint="Please try again in a moment.",
