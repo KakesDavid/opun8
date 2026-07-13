@@ -6,6 +6,8 @@ All user-facing messages in one place.
 import os
 import shutil
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -64,6 +66,106 @@ def _sym(key: str) -> str:
 def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
     term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
     return max(minimum, min(preferred, term_width - 4))
+
+
+# ──────────────────────────────────────────────────────────────
+# FOLDER DIALOG
+# ──────────────────────────────────────────────────────────────
+
+def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]:
+    """
+    Open a native folder browser dialog for the user to select a folder.
+    
+    Returns:
+        Path of the selected folder, or None if cancelled.
+    """
+    # Try tkinter first (built-in on Windows/macOS/Linux)
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        # Create a minimal root window and hide it
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes('-topmost', True)
+        
+        # Open folder dialog
+        folder_path = filedialog.askdirectory(
+            title=title,
+            mustexist=True
+        )
+        
+        root.destroy()
+        
+        if folder_path:
+            return Path(folder_path)
+        return None
+        
+    except ImportError:
+        # Fallback: try PyQt5
+        try:
+            from PyQt5.QtWidgets import QApplication, QFileDialog
+            from PyQt5.QtCore import QCoreApplication
+            
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication([])
+            
+            folder_path = QFileDialog.getExistingDirectory(
+                None,
+                title,
+                os.path.expanduser("~"),
+                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+            )
+            
+            if folder_path:
+                return Path(folder_path)
+            return None
+            
+        except ImportError:
+            # Fallback: try easygui
+            try:
+                import easygui
+                folder_path = easygui.diropenbox(
+                    title=title,
+                    default=os.path.expanduser("~")
+                )
+                if folder_path:
+                    return Path(folder_path)
+                return None
+                
+            except ImportError:
+                # Last resort: use input prompt
+                console.print("[yellow]⚠️ Could not open folder dialog. Please enter path manually.[/yellow]")
+                folder_path = Prompt.ask(
+                    f"[bold cyan]{_sym('arrow')}[/] Project folder path (leave blank to cancel)"
+                )
+                if folder_path:
+                    path = Path(folder_path).expanduser().resolve()
+                    if path.exists():
+                        return path
+                    console.print(f"[red]❌ Path does not exist: {folder_path}[/red]")
+                    return None
+                return None
+
+
+def prompt_select_folder_with_dialog(title: str = "Select a project folder") -> Optional[Path]:
+    """
+    Wrapper for open_folder_dialog with user-friendly messages.
+    """
+    console.print()
+    console.print(f"[bold cyan]{_sym('browse')} {title}[/bold cyan]")
+    console.print("[dim]A file browser will open. Select the folder containing your project.[/dim]")
+    console.print()
+    
+    folder = open_folder_dialog(title)
+    
+    if folder:
+        console.print(f"[green]{_sym('success')} Selected: {folder}[/green]")
+        return folder
+    else:
+        console.print("[yellow]Folder selection cancelled.[/yellow]")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -339,3 +441,15 @@ def show_details(result: dict):
 
     console.print(table)
     console.print()
+
+
+# ──────────────────────────────────────────────────────────────
+# HISTORY UI
+# ──────────────────────────────────────────────────────────────
+
+def prompt_select_folder(title: str = "Select a project folder") -> Optional[Path]:
+    """
+    Prompt the user to select a folder using the native file browser.
+    This is the main function called from history.py and other commands.
+    """
+    return prompt_select_folder_with_dialog(title)

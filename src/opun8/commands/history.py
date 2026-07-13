@@ -491,25 +491,31 @@ def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
 
 
 def _prompt_for_project_path() -> Optional[Path]:
-    """Prompt for a project folder path, validating it before returning it."""
+    """
+    Prompt the user to select a project folder using the native folder dialog.
+    This replaces the manual text input with a file browser.
+    """
     console.print()
-    while True:
-        raw = _safe_prompt(
-            "[bold cyan]➜[/] Project folder path [dim](leave blank to cancel)[/dim]",
-            default="",
-            show_choices=False,
-        )
-        if raw is None or not raw.strip():
-            return None
+    console.print("[dim]A file browser will open for you to select the folder.[/dim]")
+    console.print()
 
-        candidate = Path(raw).expanduser().resolve()
-        if not candidate.exists():
-            console.print(f"[red]❌ Path does not exist: {candidate}[/red]")
-            continue
-        if not candidate.is_dir():
-            console.print(f"[red]❌ Not a directory: {candidate}[/red]")
-            continue
-        return candidate
+    # Use the folder dialog from messages.py
+    selected = msg.prompt_select_folder("Select project folder for this deployment")
+
+    if selected is None:
+        console.print("[dim]Folder selection cancelled.[/dim]")
+        return None
+
+    # Verify the selected path
+    if not selected.exists():
+        console.print(f"[red]❌ Path does not exist: {selected}[/red]")
+        return None
+
+    if not selected.is_dir():
+        console.print(f"[red]❌ Not a directory: {selected}[/red]")
+        return None
+
+    return selected
 
 
 # ──────────────────────────────────────────────────────────────
@@ -536,8 +542,13 @@ def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     console.print("[bold cyan]📁 Project Folder[/bold cyan]")
     current = deployment.get("project_path")
     console.print(f"[dim]Current: [cyan]{current or 'Not tracked'}[/cyan][/dim]")
+    console.print()
 
-    path = _prompt_for_project_path()
+    console.print("[dim]A file browser will open for you to select the folder.[/dim]")
+    console.print()
+
+    path = msg.prompt_select_folder("Select project folder for this deployment")
+
     if path is None:
         console.print("[dim]Cancelled.[/dim]")
         return None

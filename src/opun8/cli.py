@@ -149,7 +149,7 @@ def github(
         )
 
         if choice == "1":
-            console.print("[yellow]🚀 Deploy repository coming soon![/yellow]")
+            _deploy_repository_from_github()
         elif choice == "2":
             from opun8.commands.detect import detect as detect_cmd
             detect_cmd()
@@ -169,6 +169,87 @@ def github(
         console.print("[dim]Run [cyan]opun8 github[/cyan] again to see your repositories.[/dim]")
     else:
         console.print("[red]❌ Connection failed.[/red]")
+
+
+def _deploy_repository_from_github() -> None:
+    """
+    Handle the "Deploy a repository" flow from the GitHub menu.
+    Allows user to select a repo and deploy it.
+    """
+    console.print()
+    console.print("[bold cyan]🚀 Deploy a GitHub Repository[/bold cyan]")
+    console.print("[dim]Select a repository to clone and deploy.[/dim]")
+    console.print()
+
+    repos = list_github_repos()
+    if not repos:
+        console.print("[yellow]No repositories found.[/yellow]")
+        return
+
+    # Show repository list with numbers
+    console.print("[bold]Select a repository:[/bold]")
+    console.print()
+    for i, repo in enumerate(repos[:20], 1):
+        private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
+        console.print(f"  [bold cyan]{i}[/]  [white]{repo['name']}[/white] {private_tag}")
+    if len(repos) > 20:
+        console.print(f"  [dim]... and {len(repos) - 20} more[/dim]")
+
+    console.print()
+    console.print("  [bold cyan]0[/] 🔙  [white]Go back[/white]")
+    console.print()
+
+    choice = Prompt.ask(
+        "[bold cyan]➜[/] Select a repository",
+        default="0",
+        show_choices=False,
+    )
+
+    try:
+        idx = int(choice) - 1
+        if idx < 0:
+            return
+        if idx >= len(repos):
+            console.print("[red]Invalid selection.[/red]")
+            return
+        
+        selected_repo = repos[idx]
+        repo_name = selected_repo.get("name")
+        clone_url = selected_repo.get("url", f"https://github.com/{get_authenticated_user()}/{repo_name}")
+        
+        console.print()
+        console.print(f"[bold]Selected: [cyan]{repo_name}[/cyan][/bold]")
+        console.print()
+        
+        # Ask for deployment platform
+        console.print("[bold]Which platform would you like to deploy to?[/bold]")
+        console.print()
+        console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended)[/dim]")
+        console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Coming soon)[/dim]")
+        console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Coming soon)[/dim]")
+        console.print()
+        
+        platform_choice = Prompt.ask(
+            "[bold cyan]➜[/] Select a platform",
+            choices=["1", "2", "3"],
+            default="1",
+            show_choices=False,
+        )
+        
+        if platform_choice == "1":
+            # Deploy to Vercel using the repo
+            from opun8.commands.repo import deploy_repository
+            deploy_repository(clone_url, repo_name)
+        elif platform_choice in ("2", "3"):
+            console.print(f"[yellow]⚠️  {['Netlify', 'Render'][int(platform_choice)-2]} support coming soon![/yellow]")
+        else:
+            console.print("[yellow]Invalid platform selection.[/yellow]")
+            
+    except ValueError:
+        console.print("[red]Please enter a valid number.[/red]")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
+        raise typer.Exit()
 
 
 # ──────────────────────────────────────────────────────────────

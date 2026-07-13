@@ -5,7 +5,7 @@ Detect command - Detect project type and guide user.
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import typer
 from rich.console import Console
@@ -51,24 +51,41 @@ def _safe_prompt(
         return None
 
 
-def detect():
-    """Detect project type and guide user."""
+def detect(silent: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Detect project type and guide user.
     
-    msg.detection_start()
+    Args:
+        silent: If True, suppress UI output and just return the detection result.
+                Used when called from deploy command to avoid duplicate UI.
     
+    Returns:
+        Detection result dict if silent=True, None otherwise.
+    """
     detector = ProjectDetector()
+    
+    if not silent:
+        msg.detection_start()
+    
     with msg.scanning_spinner():
         result = detector.detect()
     
     if not result["is_detected"]:
-        show_no_project_menu()
-        return
+        if not silent:
+            msg.no_project_detected()
+            show_no_project_menu()
+        return None
     
     # Add to recent projects
     add_recent_project(str(Path.cwd()))
     
-    msg.detection_complete(result)
-    return _post_detection_menu(result)
+    if not silent:
+        msg.detection_complete(result)
+        _post_detection_menu(result)
+        return None
+    
+    # Silent mode: just return the result
+    return result
 
 
 def _post_detection_menu(result: dict) -> None:
@@ -112,13 +129,15 @@ def _post_detection_menu(result: dict) -> None:
 def _deploy_with_github(result: dict) -> None:
     """Deploy with GitHub push."""
     from opun8.commands.deploy import deploy as deploy_cmd
-    deploy_cmd(platform_arg=None, skip_github=False)
+    # Pass the already detected result so deploy doesn't re-detect
+    deploy_cmd(platform_arg=None, skip_github=False, detected_project=result)
 
 
 def _deploy_without_github(result: dict) -> None:
     """Deploy without GitHub push."""
     from opun8.commands.deploy import deploy as deploy_cmd
-    deploy_cmd(platform_arg=None, skip_github=True)
+    # Pass the already detected result so deploy doesn't re-detect
+    deploy_cmd(platform_arg=None, skip_github=True, detected_project=result)
 
 
 def show_no_project_menu():
@@ -261,9 +280,9 @@ def create_new_project():
         console.print("[dim]⚠️ Close the folder window to continue.[/dim]")
         console.print()
         
-        selected_path = open_folder_picker()
+        selected_path = msg.prompt_select_folder("Select folder for new project")
         if selected_path:
-            target_path = Path(selected_path)
+            target_path = selected_path
             console.print(f"[green]Selected: {target_path}[/green]")
         else:
             console.print("[yellow]No folder selected. Using current folder.[/yellow]")
@@ -328,67 +347,6 @@ def create_new_project():
             create_new_project()
         else:
             detect()
-
-
-def open_folder_picker():
-    """Open Windows folder picker dialog using tkinter."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        
-        folder_path = filedialog.askdirectory(
-            title="Select a folder for your project",
-            mustexist=True
-        )
-        
-        root.destroy()
-        
-        if folder_path:
-            return folder_path
-        return None
-        
-    except ImportError:
-        try:
-            import tempfile
-            import subprocess
-            
-            ps_script = '''
-            Add-Type -AssemblyName System.Windows.Forms
-            $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
-            $folderDialog.Description = "Select a folder for your project"
-            $folderDialog.ShowNewFolderButton = $true
-            $result = $folderDialog.ShowDialog()
-            if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-                Write-Output $folderDialog.SelectedPath
-            }
-            '''
-            
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False) as f:
-                f.write(ps_script)
-                script_path = f.name
-            
-            result = subprocess.run(
-                ['powershell', '-ExecutionPolicy', 'Bypass', '-File', script_path],
-                capture_output=True,
-                text=True
-            )
-            
-            os.unlink(script_path)
-            
-            path = result.stdout.strip()
-            if path:
-                return path
-            return None
-            
-        except Exception:
-            return None
-        
-    except Exception:
-        return None
 
 
 def go_to_folder():
@@ -477,7 +435,7 @@ def go_to_folder():
             console.print("[dim]Select a folder and close the window to continue.[/dim]")
             console.print()
             
-            selected = open_folder_picker()
+            selected = msg.prompt_select_folder("Select a project folder")
             if selected:
                 new_path = Path(selected)
                 if new_path.exists() and new_path.is_dir():

@@ -77,21 +77,78 @@ def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional
         _debug_log(debug_detail)
 
 
-def _fetch_vercel_config() -> Optional[str]:
-    """Fetch Vercel client ID from the API."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/vercel/config", timeout=5)
-        if response.status_code == 200:
-            return response.json().get("client_id")
-        else:
-            _debug_log(f"Failed to fetch Vercel config: {response.status_code}")
-            return None
-    except requests.exceptions.ConnectionError:
-        _debug_log(f"Could not connect to Opun8 API at {API_BASE_URL}")
-        return None
-    except Exception as e:
-        _debug_log(f"Error fetching Vercel config: {e}")
-        return None
+def _fetch_vercel_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
+    """
+    Fetch Vercel client ID from the API with retry logic.
+    
+    Args:
+        retries: Number of retry attempts (default: 3)
+        timeout: Timeout per attempt in seconds (default: 15)
+    
+    Returns:
+        client_id string, or None if all attempts fail
+    """
+    last_error = None
+    
+    for attempt in range(retries):
+        try:
+            if attempt > 0:
+                # Show a subtle message that we're retrying
+                console.print(f"[dim]⏳ Connecting to API (attempt {attempt + 1}/{retries})...[/dim]")
+                time.sleep(1.5 * attempt)  # Increasing backoff
+            
+            response = requests.get(
+                f"{API_BASE_URL}/vercel/config",
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                client_id = response.json().get("client_id")
+                if client_id:
+                    if attempt > 0:
+                        console.print("[green]✅ Connected to API successfully![/green]")
+                    return client_id
+                else:
+                    last_error = "Response missing client_id"
+                    _debug_log(f"Vercel config response missing client_id: {response.text}")
+                    continue
+            
+            # If we got a 404 or 5xx, the API might be waking up
+            if response.status_code >= 500 or response.status_code == 404:
+                last_error = f"API returned {response.status_code}"
+                _debug_log(f"Vercel config failed: {response.status_code} - {response.text}")
+                continue
+            
+            # 4xx errors other than 404 are likely permanent
+            if response.status_code >= 400:
+                last_error = f"API returned {response.status_code}"
+                _debug_log(f"Vercel config failed: {response.status_code} - {response.text}")
+                break
+                
+        except requests.exceptions.ConnectionError as e:
+            last_error = str(e)
+            _debug_log(f"Connection error to API: {e}")
+            if attempt < retries - 1:
+                # Render free tier might be waking up
+                if "ConnectionError" in str(e) or "timeout" in str(e).lower():
+                    console.print("[dim]⏳ API is waking up (Render free tier sleep)...[/dim]")
+            continue
+            
+        except requests.exceptions.Timeout as e:
+            last_error = str(e)
+            _debug_log(f"Timeout connecting to API: {e}")
+            if attempt < retries - 1:
+                console.print("[dim]⏳ API taking longer than expected (waking up)...[/dim]")
+            continue
+            
+        except Exception as e:
+            last_error = str(e)
+            _debug_log(f"Error fetching Vercel config: {e}")
+            break
+    
+    # If we got here, all attempts failed
+    _debug_log(f"Failed to fetch Vercel config after {retries} attempts: {last_error}")
+    return None
 
 
 _DEPLOY_CALLBACK: Optional[Callable] = None
@@ -389,7 +446,8 @@ def login_to_vercel() -> Optional[str]:
         console.print("\n[yellow]Skipping Vercel authentication.[/yellow]")
         return None
 
-    # Get client_id from API
+    # Get client_id from API with retry logic
+    console.print("[dim]⏳ Connecting to Opun8 API...[/dim]")
     client_id = _fetch_vercel_config()
     if not client_id:
         _show_error(

@@ -509,6 +509,40 @@ def rename_vercel_project(
 
 
 # ──────────────────────────────────────────────────────────────
+# VERIFY PROJECT EXISTS
+# ──────────────────────────────────────────────────────────────
+
+def _verify_project_exists(
+    session: requests.Session,
+    project_id: str,
+    team_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Verify that a project exists on Vercel.
+    Returns the project ID if it exists, None otherwise.
+    """
+    try:
+        params = {}
+        if team_id:
+            params["teamId"] = team_id
+        response = session.get(
+            f"{PROJECTS_ENDPOINT}/{project_id}",
+            params=params,
+            timeout=30,
+        )
+        if response.status_code == 200:
+            return response.json().get("id")
+        if response.status_code == 404:
+            _debug_log(f"_verify_project_exists: project {project_id} not found (404)")
+            return None
+        _debug_log(f"_verify_project_exists HTTP {response.status_code}: {response.text}")
+        return None
+    except Exception as e:
+        _debug_log(f"_verify_project_exists error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
 # MAIN DEPLOY FUNCTION
 # ──────────────────────────────────────────────────────────────
 
@@ -519,6 +553,7 @@ def deploy_to_vercel(
     framework: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
     team_id: Optional[str] = None,
+    existing_project_id: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Deploy a project to Vercel.
@@ -528,8 +563,17 @@ def deploy_to_vercel(
     variables (if any) to upload. Pass env_vars={} explicitly to skip
     detection entirely (e.g. non-interactive/CI use).
 
-    Returns: (success, url_or_message, project_id) — the message is
-    always plain-English and safe to show directly to the user.
+    Args:
+        token: Vercel API token
+        project_name: Name of the project
+        project_path: Local project path
+        framework: Optional framework name
+        env_vars: Optional environment variables dict
+        team_id: Optional team ID
+        existing_project_id: Optional existing project ID for redeploys
+
+    Returns:
+        (success, url_or_message, project_id)
     """
     project_path = Path(project_path)
     if not project_path.exists() or not project_path.is_dir():
@@ -552,7 +596,7 @@ def deploy_to_vercel(
     console.print()
 
     session = _build_session(token)
-    project_id: Optional[str] = None
+    project_id: Optional[str] = existing_project_id
 
     try:
         with Progress(
@@ -573,7 +617,22 @@ def deploy_to_vercel(
             progress.update(task, description=f"[green]✅ {len(files_to_upload)} file(s) found.")
 
             task = progress.add_task("[cyan]▲ Getting/creating project...", total=None)
-            project_id = _get_or_create_project(session, project_name, framework, team_id)
+            
+            # If we have an existing project ID, use it directly
+            if existing_project_id:
+                # Verify the project exists
+                verified_id = _verify_project_exists(session, existing_project_id, team_id)
+                if verified_id:
+                    project_id = verified_id
+                    progress.update(task, description=f"[green]✅ Using existing project: {project_name}")
+                else:
+                    # If project doesn't exist, fall back to creating it
+                    console.print("[yellow]⚠️ Existing project not found. Creating new project...[/yellow]")
+                    project_id = _get_or_create_project(session, project_name, framework, team_id)
+            else:
+                # Normal flow: get or create
+                project_id = _get_or_create_project(session, project_name, framework, team_id)
+            
             if not project_id:
                 return False, "Couldn't set up the project on Vercel. Please try again.", None
             progress.update(task, description="[green]✅ Project ready.")
@@ -628,7 +687,6 @@ def deploy_to_vercel(
         return False, "Something went wrong during the deployment. Please try again.", project_id
 
     finally:
-        # Always release the connection pool, even on early returns/errors.
         session.close()
 
 

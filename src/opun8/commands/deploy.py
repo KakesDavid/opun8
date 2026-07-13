@@ -164,7 +164,11 @@ def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────
 
-def deploy(platform_arg: Optional[str] = None, skip_github: bool = False) -> None:
+def deploy(
+    platform_arg: Optional[str] = None,
+    skip_github: bool = False,
+    detected_project: Optional[Dict[str, Any]] = None,
+) -> None:
     """
     Run the interactive deploy flow.
 
@@ -176,13 +180,36 @@ def deploy(platform_arg: Optional[str] = None, skip_github: bool = False) -> Non
             already chosen "Deploy without GitHub" from its own
             post-detection menu — without this flag, deploy() would ask
             the same GitHub question a second time.
+        detected_project: If provided, use this pre-detected project info
+            instead of running detection again. This prevents duplicate
+            detection UI when called from detect command.
     """
     try:
         _print_welcome_banner()
 
-        project_info = _detect_project()
-        if project_info is None:
-            return
+        # Use pre-detected project if provided, otherwise detect
+        if detected_project:
+            project_info = detected_project
+            console.print()
+            console.print("[bold green]✅ Using previously detected project![/bold green]")
+            console.print()
+            # Show a brief summary
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column(style="bold white")
+            table.add_column(style="white")
+            fields = (
+                ("Name", "name", "Unknown"),
+                ("Type", "type", "Unknown"),
+                ("Framework", "framework", "Unknown"),
+            )
+            for label, key, default in fields:
+                table.add_row(label, project_info.get(key, default))
+            console.print(table)
+            console.print()
+        else:
+            project_info = _detect_project()
+            if project_info is None:
+                return
 
         _show_project_summary(project_info)
 
