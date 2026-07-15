@@ -52,6 +52,8 @@ _SYMBOLS = {
     "browse": "📂" if not _NO_EMOJI else "",
     "history": "📜" if not _NO_EMOJI else "",
     "badge": "🏅" if not _NO_EMOJI else "",
+    "cloud": "☁️" if not _NO_EMOJI else "",
+    "triangle": "▲" if not _NO_EMOJI else "",
 }
 
 
@@ -312,8 +314,8 @@ def _render_help_and_get_next() -> str:
     console.print()
 
     table = Table(show_header=True, header_style="bold cyan", box=None)
-    table.add_column("Command", style="bold green", width=16)
-    table.add_column("Description", style="white", width=40)
+    table.add_column("Command", style="bold green", width=18)
+    table.add_column("Description", style="white", width=42)
 
     table.add_row("opun8", "Show welcome screen")
     table.add_row("opun8 --version", "Show version")
@@ -321,7 +323,9 @@ def _render_help_and_get_next() -> str:
     table.add_row("opun8 detect", "Detect project type")
     table.add_row("opun8 deploy", "Deploy your project")
     table.add_row("opun8 github", "Connect to GitHub")
-    table.add_row("opun8 logout", "Logout from GitHub")
+    table.add_row("opun8 vercel", "Connect to Vercel")
+    table.add_row("opun8 render", "Connect to Render")
+    table.add_row("opun8 logout", "Logout from all services")
     table.add_row("opun8 history", "View deployment history")
     table.add_row("opun8 badges", "View badge progress")
     table.add_row("opun8 help", "Show this help")
@@ -453,3 +457,119 @@ def prompt_select_folder(title: str = "Select a project folder") -> Optional[Pat
     This is the main function called from history.py and other commands.
     """
     return prompt_select_folder_with_dialog(title)
+
+
+# ──────────────────────────────────────────────────────────────
+# RENDER-SPECIFIC MESSAGES
+# ──────────────────────────────────────────────────────────────
+
+def render_auth_start() -> None:
+    """Show Render authentication start message."""
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('cloud')} Render Authentication[/bold cyan]\n\n"
+        "Opun8 needs access to Render to:\n"
+        "  • Create services\n"
+        "  • Deploy your code\n"
+        "  • Get deployment URLs\n\n"
+        "[dim]Your browser will open for authorization if using OAuth.[/dim]"
+        "\n[dim]Or paste your Render API key as an alternative.[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+
+
+def render_auth_success(username: str) -> None:
+    """Show Render authentication success message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Connected to Render as: [white]{username}[/white][/bold green]")
+    console.print("[dim]Token saved securely for future use.[/dim]")
+
+
+def render_auth_failed() -> None:
+    """Show Render authentication failure message."""
+    error(
+        "Render authentication failed.",
+        suggestion="Run `opun8 render` to try again, or use an API key.",
+    )
+
+
+def render_deploy_start(project_name: str, region: str) -> None:
+    """Show Render deployment start message."""
+    console.print()
+    console.print(f"[bold cyan]{_sym('cloud')} Deploying to Render[/bold cyan]")
+    console.print(f"[dim]Project: {project_name}[/dim]")
+    console.print(f"[dim]Region: {region}[/dim]")
+    console.print()
+
+
+def render_deploy_success(url: str) -> None:
+    """Show Render deployment success message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Deployment successful![/bold green]")
+    console.print(f"[dim]🌐 {url}[/dim]")
+
+
+def render_deploy_failed(message: str) -> None:
+    """Show Render deployment failure message."""
+    error(
+        f"Deployment failed: {message}",
+        suggestion="Check your project for build errors and try again.",
+    )
+
+
+def render_services_list(services: list) -> None:
+    """Show Render services list."""
+    if not services:
+        console.print("[yellow]No services found on Render.[/yellow]")
+        console.print("[dim]Run [cyan]opun8 deploy[/cyan] to create your first service.[/dim]")
+        return
+
+    from rich.table import Table
+    
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('cloud')} Render Services[/bold cyan]\n"
+        f"[dim]{len(services)} service(s) found[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+
+    table = Table(border_style="cyan")
+    table.add_column("#", style="bold white", width=4)
+    table.add_column("Name", style="bold white", width=20)
+    table.add_column("Type", style="dim", width=12)
+    table.add_column("Status", style="dim", width=12)
+    table.add_column("URL", style="cyan", width=25)
+
+    for idx, service in enumerate(services, 1):
+        name = service.get("name", "Unknown")[:20]
+        service_type = service.get("type", "unknown")[:12]
+        status = service.get("status", "unknown")[:12]
+        url = service.get("url", "N/A")[:25]
+
+        table.add_row(str(idx), name, service_type, status, url)
+
+    console.print(table)
+    console.print()
+
+
+def render_api_key_prompt() -> None:
+    """Show Render API key prompt message."""
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('key')} Render API Key[/bold cyan]\n\n"
+        "You can get your API key from:\n"
+        "[dim]https://dashboard.render.com/settings/keys[/dim]\n\n"
+        "Create a new key with 'read' and 'write' permissions.\n"
+        "This is useful for CI/CD and team deployments.",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+    console.print("[dim]🌐 Opening Render API keys page in your browser...[/dim]")

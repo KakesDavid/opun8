@@ -1,6 +1,6 @@
 """
 Git service for Opun8.
-Handles all Git operations: init, add, commit, push, and branch management.
+Handles all Git operations: init, add, commit, push, clone, and branch management.
 
 This version fixes three root-cause bugs found in production:
 
@@ -19,13 +19,15 @@ This version fixes three root-cause bugs found in production:
    garbled menus). All prompts now happen with the progress display stopped.
 
 Additional hardening: recursion depth guard against infinite retry loops,
-network retry/backoff for GitHub API calls, and defensive validation
-throughout so a single failure mode can't crash the whole flow.
+network retry/backoff for GitHub API calls, defensive validation throughout
+so a single failure mode can't crash the whole flow, and robust clone
+functionality for repository deployment.
 """
 
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -39,6 +41,7 @@ console = Console()
 
 # Prevents runaway recursion if e.g. every candidate repo name collides.
 MAX_PUSH_RETRIES = 5
+CLONE_TIMEOUT = 120  # seconds
 
 
 # ──────────────────────────────────────────────────────────────
@@ -264,6 +267,102 @@ class GitService:
         except Exception as e:
             console.print(f"[yellow]Pull error: {e}[/yellow]")
             return False, False
+
+    # ──────────────────────────────────────────────────────────────
+    # CLONE REPOSITORY
+    # ──────────────────────────────────────────────────────────────
+
+    def clone_repository(
+        self,
+        repo_url: str,
+        target_path: str,
+        token: Optional[str] = None,
+        branch: Optional[str] = None,
+        depth: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Clone a GitHub repository to a local directory.
+
+        Args:
+            repo_url: The GitHub repository URL (e.g., https://github.com/user/repo)
+            target_path: The local path to clone into
+            token: Optional GitHub token for private repositories
+            branch: Optional branch to clone (defaults to default branch)
+            depth: Optional shallow clone depth (e.g., 1 for latest only)
+
+        Returns:
+            (success, message) tuple
+
+        Note on token handling: authenticating by embedding the token in
+        the clone URL means it's briefly visible in this process's argument
+        list (e.g. to `ps`) while the clone runs — the same residual
+        exposure any tool has without a dedicated credential helper. What
+        we *do* control is persistence: git writes whatever URL it's given
+        into `origin` in the resulting `.git/config`, so immediately after
+        a successful clone the remote is reset to the credential-free
+        `repo_url`, ensuring the token doesn't linger on disk in the
+        checked-out project.
+        """
+        target = Path(target_path)
+
+        # Ensure parent directory exists
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build the clone URL with token if provided
+        clone_url = repo_url
+        if token:
+            # Convert https://github.com/user/repo to https://token@github.com/user/repo
+            if repo_url.startswith("https://"):
+                clone_url = repo_url.replace("https://", f"https://{token}@")
+            elif repo_url.startswith("http://"):
+                clone_url = repo_url.replace("http://", f"http://{token}@")
+
+        try:
+            # Remove existing directory if it exists
+            if target.exists():
+                shutil.rmtree(target)
+
+            # Build the clone command
+            cmd = ["git", "clone", clone_url, str(target)]
+            if branch:
+                cmd.extend(["-b", branch])
+            if depth is not None and depth > 0:
+                cmd.extend(["--depth", str(depth)])
+
+            # Clone the repository
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=CLONE_TIMEOUT,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                # Clean up sensitive token from error message if present
+                if token and token in stderr:
+                    stderr = stderr.replace(token, "[REDACTED]")
+                return False, f"Git clone failed: {stderr}"
+
+            # Strip the credential-bearing URL out of .git/config right away
+            if token:
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", repo_url],
+                    cwd=target,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+            return True, f"Successfully cloned to {target}"
+
+        except subprocess.TimeoutExpired:
+            return False, f"Clone timed out after {CLONE_TIMEOUT} seconds"
+        except shutil.Error as e:
+            return False, f"Failed to remove existing directory: {e}"
+        except Exception as e:
+            return False, f"Clone error: {str(e)}"
 
     # ──────────────────────────────────────────────────────────────
     # BRANCH MANAGEMENT

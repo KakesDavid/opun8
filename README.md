@@ -1,3 +1,4 @@
+```
 # 🦉 Opun8
 
 <div align="center">
@@ -19,14 +20,15 @@ Deploy to **Vercel**, **Netlify**, **Render**, and **GitHub** with a single comm
 
 ## ✨ Why Opun8?
 
-Stop wrestling with different deployment workflows for every hosting provider. Opun8 brings Vercel, Netlify, Render, and GitHub into a single, unified CLI experience.
+Stop wrestling with different deployment workflows for every hosting provider. Opun8 brings Vercel, Render, Netlify, and GitHub into a single, unified CLI experience.
 
-- 🚀 **One command** — Deploy to any platform with `opun8 deploy vercel`
+- 🚀 **One command** — Deploy to any platform with `opun8 deploy vercel` or `opun8 deploy render`
 - 🧠 **Smart detection** — Auto-detects React, Next.js, Vue, Node.js, Python, and static HTML
 - 🔐 **Secure auth** — OAuth 2.0 + PKCE with PAT fallback
 - 📱 **Works anywhere** — Windows, macOS, Linux, and Termux on Android
 - 🏆 **History & badges** — Track every deployment and earn achievements
 - 📂 **Native folder picker** — No more typing paths manually
+- ☁️ **Render support** — Deploy to Render directly from GitHub repositories
 
 ---
 
@@ -67,15 +69,23 @@ opun8 detect
 
 ### 3. Authenticate with your provider
 ```bash
+# For Vercel
 opun8 vercel
+
+# For Render
+opun8 render
 ```
 
 ### 4. Deploy!
 ```bash
+# Deploy to Vercel
 opun8 deploy vercel
+
+# Deploy to Render
+opun8 deploy render
 ```
 ```
-🚀 Deploying to Vercel...
+🚀 Deploying...
 ✅ Deployment complete!
 🌐 Live at: https://my-project.vercel.app
 ```
@@ -91,10 +101,11 @@ opun8 deploy vercel
 | `opun8 doctor` | Check environment |
 | `opun8 detect` | Detect project type |
 | `opun8 deploy vercel` | Deploy to Vercel |
+| `opun8 deploy render` | Deploy to Render |
 | `opun8 deploy netlify` | Deploy to Netlify *(Coming soon)* |
-| `opun8 deploy render` | Deploy to Render *(Coming soon)* |
 | `opun8 github` | Connect to GitHub |
 | `opun8 vercel` | Connect to Vercel |
+| `opun8 render` | Connect to Render |
 | `opun8 history` | View deployment history |
 | `opun8 badges` | View badge progress |
 | `opun8 logout` | Logout from all services |
@@ -113,6 +124,26 @@ opun8 deploy vercel
 | 5 | 🥇 | Deployment Master | 25 |
 | 6 | 🥇 | Shipping Machine | 50 |
 | 7 | 🏆 | Opun8 Legend | 100 |
+
+---
+
+## ☁️ Render Support
+
+Opun8 now supports deploying to Render directly from GitHub repositories.
+
+```bash
+# Connect to Render
+opun8 render
+
+# Deploy current project to Render
+opun8 deploy render
+
+# Deploy a GitHub repository to Render
+opun8 github
+# Select a repository → Choose Render
+```
+
+> **Note:** Render requires a connected GitHub repository. Local file uploads are not supported.
 
 ---
 
@@ -153,7 +184,7 @@ We welcome contributions! Here's how you can help:
 5. Open a Pull Request
 
 ### Areas we need help with:
-- Adding Render, Netlify, and Railway providers
+- Adding Netlify provider
 - Improving documentation
 - Writing tests
 - Bug fixes
@@ -186,3 +217,4 @@ Built with ❤️ by [Kakes David](https://github.com/KakesDavid) and the Opun8 
 [![GitHub stars](https://img.shields.io/github/stars/KakesDavid/opun8.svg?style=social)](https://github.com/KakesDavid/opun8/stargazers)
 
 </div>
+```

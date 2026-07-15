@@ -20,13 +20,12 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Dict, Tuple, List, Callable
+from typing import Optional, Dict, Tuple, List, Callable, Union
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from rich.console import Console
-from rich.prompt import Confirm
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -35,6 +34,8 @@ from rich.progress import (
     TaskProgressColumn,
     MofNCompleteColumn,
 )
+
+from opun8.services.env_service import prompt_env_files_selection
 
 console = Console()
 _console_lock = threading.Lock()
@@ -71,9 +72,10 @@ def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional
     Short, plain-English, actionable; technical detail goes to the debug
     log instead of the screen.
     """
-    console.print(f"[red]❌ {message}[/red]")
-    if hint:
-        console.print(f"[dim]{hint}[/dim]")
+    with _console_lock:
+        console.print(f"[red]❌ {message}[/red]")
+        if hint:
+            console.print(f"[dim]{hint}[/dim]")
     if debug_detail:
         _debug_log(debug_detail)
 
@@ -116,97 +118,39 @@ def _is_env_file(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
-_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$")
-
-
-def _parse_env_file(path: Path) -> Dict[str, str]:
-    """
-    Parse a .env-style file into {key: value}. Supports 'KEY=VALUE',
-    optional 'export KEY=VALUE', single/double-quoted values, '#' comments
-    (full-line or trailing on unquoted values), and blank lines.
-    """
-    values: Dict[str, str] = {}
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
-        _debug_log(f"_parse_env_file couldn't read {path}: {e}")
-        return values
-
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        match = _ENV_LINE_RE.match(line)
-        if not match:
-            continue
-        key, value = match.group(1), match.group(2)
-        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
-            value = value[1:-1]
-        elif "#" in value:
-            value = value.split("#", 1)[0].rstrip()
-        values[key] = value
-    return values
-
-
-def detect_env_files(project_path: Path) -> List[Path]:
-    """
-    Find .env-style files sitting directly in the project root. Root-only
-    (not recursive) so files under node_modules/nested example apps/etc.
-    are never picked up as "the" project's env vars.
-    """
-    if not project_path.exists() or not project_path.is_dir():
-        return []
-    try:
-        return sorted(
-            entry for entry in project_path.iterdir()
-            if entry.is_file() and _is_env_file(entry.name)
-        )
-    except Exception as e:
-        _debug_log(f"detect_env_files couldn't scan {project_path}: {e}")
-        return []
-
-
-def prompt_for_env_vars(project_path: Path) -> Dict[str, str]:
+def prompt_for_env_vars(
+    project_path: Path,
+    env_targets: Optional[List[str]] = None,
+) -> Tuple[Dict[str, str], List[str]]:
     """
     Scan the project for .env files and interactively ask the user which
     variables, if any, should be uploaded to Vercel as encrypted
-    environment variables. Returns {} if there's nothing to offer or the
-    user declines — never raises, so a bad .env file can't break a deploy.
+    environment variables.
+
+    Uses the centralized env_service for detection and prompting.
+
+    Args:
+        project_path: Path to the project root
+        env_targets: Optional list of target environments to use.
+                     If not provided, user will be prompted.
+
+    Returns:
+        Tuple of (selected_env_vars, target_environments)
     """
-    env_files = detect_env_files(project_path)
-    if not env_files:
-        return {}
-
-    all_vars: Dict[str, str] = {}
-    for env_file in env_files:
-        all_vars.update(_parse_env_file(env_file))
-
-    if not all_vars:
-        return {}
-
-    console.print()
-    names = ", ".join(f.name for f in env_files)
-    console.print(f"[cyan]🔐 Found local env file(s): {names}[/cyan]")
-    console.print(f"[dim]Detected {len(all_vars)} variable(s): {', '.join(all_vars.keys())}[/dim]")
-
-    if not Confirm.ask(
-        "[bold cyan]➜[/] Upload these as encrypted environment variables on Vercel?",
-        default=True,
-    ):
-        console.print("[yellow]Skipping environment variables.[/yellow]")
-        return {}
-
-    include_all = Confirm.ask("[bold cyan]➜[/] Include all of them?", default=True)
-    if include_all:
-        selected = dict(all_vars)
+    if env_targets is None:
+        return prompt_env_files_selection(project_path)
     else:
-        selected = {
-            key: value for key, value in all_vars.items()
-            if Confirm.ask(f"  [bold cyan]➜[/] Include [white]{key}[/white]?", default=True)
-        }
+        # Use the provided targets, but still detect env vars
+        from opun8.services.env_service import detect_env_files, parse_env_file, merge_env_vars
 
-    console.print(f"[green]✅ {len(selected)} environment variable(s) will be uploaded.[/green]")
-    return selected
+        env_files = detect_env_files(project_path)
+        all_vars: Dict[str, str] = {}
+        for env_file in env_files:
+            vars_from_file = parse_env_file(env_file)
+            if vars_from_file:
+                all_vars = merge_env_vars(all_vars, vars_from_file, prefer="new")
+
+        return all_vars, env_targets
 
 
 # ──────────────────────────────────────────────────────────────
@@ -442,10 +386,6 @@ def _add_vercel_app_domain(
         except Exception:
             verified = True
         if not verified:
-            # Shouldn't happen for *.vercel.app (Vercel owns that whole
-            # zone, so there's no external DNS challenge to complete) —
-            # log it, but the domain IS attached to the project at this
-            # point, which is the state that matters here.
             _debug_log(f"_add_vercel_app_domain: {domain_name} added but verified=False")
         return True, domain_name
 
@@ -503,9 +443,7 @@ def rename_vercel_project(
             return False, domain_message
 
         # The domain is live. Now update the project's own name to
-        # match, so the dashboard and the URL agree. This part is
-        # cosmetic at this point — if it fails, the new URL still
-        # works, so don't undo the domain claim over it.
+        # match, so the dashboard and the URL agree.
         rename_params: Dict[str, str] = {}
         if team_id:
             rename_params["teamId"] = team_id
@@ -517,9 +455,22 @@ def rename_vercel_project(
             timeout=30,
         )
         if response.status_code != 200:
+            # The domain was claimed but the PATCH failed. This leaves the
+            # project's stored name out of sync with the new domain. On a
+            # future deploy, name-based lookup won't find this project
+            # under the intended name, so it'll try to create a new project
+            # with that name — which will fail to claim the domain since
+            # the old project already has it. Log it so the user knows.
             _debug_log(
                 f"rename_vercel_project: domain claimed but project name PATCH failed "
                 f"HTTP {response.status_code}: {response.text}"
+            )
+            # Return True anyway since the URL works, but warn the user.
+            _show_error(
+                "Domain claimed but project name update failed.",
+                hint="The new URL works, but the dashboard may show the old name. "
+                     "You can rename it manually in the Vercel dashboard.",
+                debug_detail=f"PATCH failed with {response.status_code}: {response.text}",
             )
 
         return True, new_domain
@@ -577,6 +528,7 @@ def deploy_to_vercel(
     env_vars: Optional[Dict[str, str]] = None,
     team_id: Optional[str] = None,
     existing_project_id: Optional[str] = None,
+    env_targets: Optional[List[str]] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Deploy a project to Vercel.
@@ -594,6 +546,8 @@ def deploy_to_vercel(
         env_vars: Optional environment variables dict
         team_id: Optional team ID
         existing_project_id: Optional existing project ID for redeploys
+        env_targets: Optional list of target environments for env vars.
+                     Only used if env_vars is provided.
 
     Returns:
         (success, url_or_message, project_id)
@@ -603,7 +557,12 @@ def deploy_to_vercel(
         _debug_log(f"deploy_to_vercel: project path not found or not a directory: {project_path}")
         return False, f"We couldn't find the project folder: {project_path}", None
 
-    env_vars = prompt_for_env_vars(project_path) if env_vars is None else env_vars
+    # Detect env vars using the centralized service
+    if env_vars is None:
+        env_vars, env_targets = prompt_for_env_vars(project_path)
+    else:
+        if env_targets is None:
+            env_targets = ["production", "preview", "development"]
 
     original_name = project_name
     project_name = _sanitize_project_name(project_name)
@@ -662,7 +621,7 @@ def deploy_to_vercel(
 
             if env_vars:
                 task = progress.add_task("[cyan]🔐 Setting environment variables...", total=None)
-                _set_env_vars(session, project_id, env_vars, team_id)
+                _set_env_vars(session, project_id, env_vars, team_id, env_targets)
                 progress.update(task, description="[green]✅ Environment variables set.")
 
             upload_task = progress.add_task(
@@ -790,6 +749,8 @@ def _upload_project_files(
                 entry = None
             if entry is None:
                 failed.set()
+                # Cancel pending futures (already-running ones will complete,
+                # but their results will be ignored since failed is set)
                 for f in futures:
                     f.cancel()
                 continue
@@ -856,7 +817,12 @@ def _get_or_create_project(
                 return project.get("id")
 
         # Second: try to create it
-        payload = {"name": project_name, "framework": _map_framework(framework)}
+        payload: Dict[str, Union[str, Dict]] = {"name": project_name}
+        if framework is not None:
+            mapped = _map_framework(framework)
+            if mapped:
+                payload["framework"] = mapped
+
         create_params = {}
         if team_id:
             create_params["teamId"] = team_id
@@ -966,12 +932,26 @@ def _set_env_vars(
     project_id: str,
     env_vars: Dict[str, str],
     team_id: Optional[str] = None,
+    targets: Optional[List[str]] = None,
 ) -> None:
     """
     Create or update each environment variable. A plain POST fails with a
     conflict if the key already exists (e.g. on redeploy), so existing keys
     are looked up first and updated in place via PATCH.
+
+    Args:
+        session: Requests session
+        project_id: Vercel project ID
+        env_vars: Environment variables to set
+        team_id: Optional team ID
+        targets: Target environments (production, preview, development)
     """
+    if not env_vars:
+        return
+
+    if targets is None:
+        targets = ["production", "preview", "development"]
+
     params = {}
     if team_id:
         params["teamId"] = team_id
@@ -983,7 +963,7 @@ def _set_env_vars(
         payload = {
             "key": key,
             "value": value,
-            "target": ["production", "preview", "development"],
+            "target": targets,
             "type": "encrypted",
         }
         try:
@@ -992,7 +972,7 @@ def _set_env_vars(
                     f"{base_url}/{existing[key]}",
                     headers={"Content-Type": "application/json"},
                     params=params,
-                    json={"value": value, "target": payload["target"]},
+                    json={"value": value, "target": targets},
                     timeout=30,
                 )
             else:
@@ -1004,6 +984,22 @@ def _set_env_vars(
                     timeout=30,
                 )
             if response.status_code not in (200, 201):
+                # If we got a 409, the key might have been created by a
+                # previous retry. Try to look it up again.
+                if response.status_code == 409:
+                    _debug_log(f"_set_env_vars: key '{key}' returned 409, checking if it exists...")
+                    existing = _get_existing_env_vars(session, project_id, team_id)
+                    if key in existing:
+                        _debug_log(f"_set_env_vars: key '{key}' found after 409, updating instead.")
+                        response = session.patch(
+                            f"{base_url}/{existing[key]}",
+                            headers={"Content-Type": "application/json"},
+                            params=params,
+                            json={"value": value, "target": targets},
+                            timeout=30,
+                        )
+                        if response.status_code in (200, 201):
+                            continue
                 failed_keys.append(key)
                 _debug_log(f"_set_env_vars HTTP {response.status_code} for key={key}: {response.text}")
         except Exception as e:
@@ -1030,13 +1026,17 @@ def _create_deployment(
     team_id: Optional[str] = None,
 ) -> Optional[str]:
     try:
-        payload = {
+        payload: Dict[str, Union[str, Dict]] = {
             "name": project_name,
             "project": project_id,
             "target": "production",
             "files": files_manifest,
-            "projectSettings": {"framework": _map_framework(framework)},
         }
+        if framework is not None:
+            mapped = _map_framework(framework)
+            if mapped:
+                payload["projectSettings"] = {"framework": mapped}
+
         params = {"skipAutoDetectionConfirmation": "1"}
         if team_id:
             params["teamId"] = team_id

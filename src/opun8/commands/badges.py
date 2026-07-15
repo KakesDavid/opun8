@@ -21,7 +21,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from opun8.services.deployment_history import get_deployment_count, get_badge_info
+from opun8.services.deployment_history import (
+    get_deployment_count,
+    get_badge_info,
+    get_platform_stats,
+    get_platform_icon,
+)
 from opun8.ui import messages as msg
 
 console = Console()
@@ -41,6 +46,17 @@ BADGE_LEVELS = [
     {"level": 6, "emoji": "🥇", "name": "Shipping Machine", "deployments": 50},
     {"level": 7, "emoji": "🏆", "name": "Opun8 Legend", "deployments": 100},
 ]
+
+
+# ──────────────────────────────────────────────────────────────
+# PLATFORM ICONS
+# ──────────────────────────────────────────────────────────────
+
+PLATFORM_ICONS = {
+    "vercel": "▲",
+    "netlify": "📦",
+    "render": "☁️",
+}
 
 
 def badges() -> None:
@@ -75,6 +91,7 @@ def _show_badges_screen() -> None:
     """Display the main badges screen."""
     count = get_deployment_count()
     unlocked = _get_unlocked_badge_names(count)
+    platform_stats = get_platform_stats()
 
     console.print()
     console.print(Panel(
@@ -91,9 +108,6 @@ def _show_badges_screen() -> None:
 
     if badge["next"]:
         next_badge = get_badge_info(badge["next"])
-        # Progress within the current bracket (previous threshold -> next
-        # threshold), not raw count/next, so the bar starts at 0% right
-        # after unlocking a badge instead of already being partway full.
         prev_threshold = _previous_threshold(badge["level"])
         span = badge["next"] - prev_threshold
         progress_pct = min(100, int(((count - prev_threshold) / span) * 100)) if span > 0 else 100
@@ -111,6 +125,19 @@ def _show_badges_screen() -> None:
         console.print()
         console.print("[bold yellow]🏆 MAX LEVEL REACHED![/bold yellow]")
         console.print("[dim]You've unlocked all badges. You're a true Opun8 Legend![/dim]")
+
+    # ──────────────────────────────────────────────────────────────
+    # DEPLOYMENT STATS BY PLATFORM
+    # ──────────────────────────────────────────────────────────────
+
+    if platform_stats:
+        console.print()
+        console.print("[bold]📊 Deployments by Platform:[/bold]")
+        console.print()
+        for platform, count in sorted(platform_stats.items(), key=lambda x: x[1], reverse=True):
+            icon = PLATFORM_ICONS.get(platform.lower(), "●")
+            console.print(f"  {icon} [dim]{platform.capitalize()}:[/dim] [white]{count}[/white]")
+        console.print()
 
     console.print()
     _display_badge_table(count)

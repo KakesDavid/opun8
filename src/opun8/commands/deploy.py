@@ -32,6 +32,12 @@ from opun8.auth import (
     login_to_github,
 )
 from opun8.core.detector import ProjectDetector
+from opun8.services.git_service import GitService
+from opun8.ui import messages as msg
+from opun8.commands.badges import show_badge_notification
+from opun8.services.deployment_history import add_deployment
+
+# Vercel imports
 from opun8.providers.vercel.auth import (
     get_vercel_scope,
     get_vercel_token,
@@ -42,10 +48,16 @@ from opun8.providers.vercel.deploy import (
     deploy_to_vercel,
     rename_vercel_project,
 )
-from opun8.services.git_service import GitService
-from opun8.ui import messages as msg
-from opun8.commands.badges import show_badge_notification
-from opun8.services.deployment_history import add_deployment
+
+# Render imports
+from opun8.providers.render.auth import (
+    get_render_token,
+    get_render_owner_id,
+    is_render_authenticated,
+    login_to_render,
+    prompt_owner_selection,
+)
+from opun8.providers.render.deploy import deploy_to_render
 
 try:
     import pyperclip
@@ -107,7 +119,8 @@ PLATFORM_CHOICES: Dict[str, Platform] = {
     "3": Platform.RENDER,
 }
 
-IMPLEMENTED_PLATFORMS = {Platform.VERCEL}
+# Platforms with full implementation
+IMPLEMENTED_PLATFORMS = {Platform.VERCEL, Platform.RENDER}
 
 
 @dataclass
@@ -302,7 +315,12 @@ def _continue_deploy(project_info: Dict[str, Any], repo_url: Optional[str], plat
         msg.info(f"{platform.value.capitalize()} support is coming soon!")
         return
 
-    _handle_vercel_deploy(project_info, repo_url)
+    if platform == Platform.VERCEL:
+        _handle_vercel_deploy(project_info, repo_url)
+    elif platform == Platform.RENDER:
+        _handle_render_deploy(project_info, repo_url)
+    else:
+        msg.error(f"Unknown platform: {platform.value}")
 
 
 def _print_welcome_banner() -> None:
@@ -490,7 +508,7 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
     console.print()
     console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
     console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Coming soon)[/dim]")
-    console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Coming soon)[/dim]")
+    console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
     console.print()
 
     # Determine default choice based on provided platform
@@ -544,7 +562,6 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
 
         team_id = (get_vercel_scope() or {}).get("team_id")
         project_path = Path.cwd()
-        env_vars = _load_env_vars(project_path)
 
         console.print()
         console.print("[bold cyan]☁️  Deploying to Vercel...[/bold cyan]")
@@ -556,23 +573,18 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
             project_name=project_info.get("name", project_path.name),
             project_path=project_path,
             framework=project_info.get("framework"),
-            env_vars=env_vars,
             team_id=team_id,
         )
 
         if success:
             project_name = project_info.get("name", project_path.name)
 
-            # Record it in local history and show a badge notification if
-            # one was unlocked. Isolated in its own try/except (see
-            # _record_deployment_history) so a history-file problem can
-            # never get reported as a failed deployment below.
             _record_deployment_history(
                 project_name=project_name,
                 url=url,
                 project_id=project_id,
                 team_id=team_id,
-                env_vars=env_vars,
+                platform="vercel",
             )
 
             _show_success(SuccessResult(
@@ -594,9 +606,6 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
             suggestion="Your project may be large or complex. Try again later.",
         )
     except typer.Exit:
-        # _show_success()/_rename_url_flow() raise this for an intentional
-        # "Exit" choice — possibly after a deployment that already
-        # succeeded. Never let it get reported as "Deployment failed".
         raise
     except Exception as exc:
         _log_debug_exception("_handle_vercel_deploy() unexpected error", exc)
@@ -604,47 +613,6 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
             f"Deployment failed: {exc}",
             suggestion="Check your internet connection and try again.",
         )
-
-
-def _record_deployment_history(
-    project_name: str,
-    url: str,
-    project_id: Optional[str],
-    team_id: Optional[str],
-    env_vars: Dict[str, str],
-) -> None:
-    """
-    Save a successful deployment to local history and show a badge
-    notification if this deployment unlocked one.
-
-    This always runs *after* the deployment has already succeeded, so a
-    problem here (corrupt history file, disk full, no write permission on
-    ~/.opun8, etc.) must never be allowed to reach the user as a failed
-    deployment — their site is live either way. Any failure is reported as
-    a quiet warning and swallowed here, not re-raised.
-
-    Only environment variable *names* are recorded, never values, so no
-    secrets from the deployed project ever end up in the history file.
-    """
-    try:
-        deployment_record = add_deployment(
-            project_name=project_name,
-            url=url,
-            platform="vercel",
-            project_id=project_id,
-            team_id=team_id,
-            env_vars=list(env_vars.keys()) if env_vars else [],
-        )
-    except Exception as exc:
-        console.print(
-            f"[yellow]⚠️  Deployment succeeded, but couldn't be saved to history: {exc}[/yellow]"
-        )
-        return
-
-    try:
-        show_badge_notification(deployment_record.get("badge_unlocked"))
-    except Exception as exc:
-        console.print(f"[yellow]⚠️  Couldn't check badge progress: {exc}[/yellow]")
 
 
 def _ensure_vercel_auth() -> bool:
@@ -664,29 +632,158 @@ def _ensure_vercel_auth() -> bool:
     return False
 
 
-def _load_env_vars(project_path: Path) -> Dict[str, str]:
-    """Load key/value pairs from a `.env` file, if present."""
-    env_file = project_path / ".env"
-    if not env_file.exists():
-        return {}
+# ──────────────────────────────────────────────────────────────
+# RENDER DEPLOYMENT
+# ──────────────────────────────────────────────────────────────
 
-    env_vars: Dict[str, str] = {}
+def _handle_render_deploy(project_info: Dict[str, Any], repo_url: Optional[str]) -> None:
+    """Authenticate with Render and deploy the project."""
     try:
-        for raw_line in env_file.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            env_vars[key.strip()] = value.strip().strip('"').strip("'")
-    except OSError as exc:
-        console.print(f"[yellow]⚠️  Could not read .env file: {exc}[/yellow]")
-        return {}
+        console.print()
+        console.print("[bold cyan]☁️ Render Deployment[/bold cyan]")
+        console.print("[dim]I'll deploy your project to Render.[/dim]")
+        console.print()
 
-    if env_vars:
-        keys = ", ".join(env_vars.keys())
-        console.print(f"[dim]📄 Loaded {len(env_vars)} environment variable(s): {keys}[/dim]")
+        if repo_url:
+            console.print(f"[dim]ℹ️  GitHub repo: {repo_url}[/dim]")
+            console.print("[dim]   Render will deploy directly from GitHub.[/dim]")
+            console.print()
 
-    return env_vars
+        if not _ensure_render_auth():
+            return
+
+        token = get_render_token()
+        if not token:
+            msg.error(
+                "No Render token found.",
+                suggestion="Run `opun8 render` to connect.",
+            )
+            return
+
+        # Get owner/workspace
+        owner_id = get_render_owner_id()
+        if not owner_id:
+            # Prompt user to select a workspace
+            owner_id = prompt_owner_selection(token)
+            if owner_id is None:
+                console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
+
+        project_path = Path.cwd()
+
+        console.print()
+        console.print("[bold cyan]☁️  Deploying to Render...[/bold cyan]")
+        console.print("[dim]This may take a few minutes.[/dim]")
+        console.print()
+
+        success, url, service_id = deploy_to_render(
+            token=token,
+            project_name=project_info.get("name", project_path.name),
+            project_path=project_path,
+            framework=project_info.get("framework"),
+            owner_id=owner_id,
+            repo_url=repo_url,
+            region="oregon",
+        )
+
+        if success:
+            project_name = project_info.get("name", project_path.name)
+
+            _record_deployment_history(
+                project_name=project_name,
+                url=url,
+                project_id=service_id,
+                team_id=owner_id,
+                platform="render",
+            )
+
+            _show_success(SuccessResult(
+                url=url,
+                project_name=project_name,
+                project_id=service_id
+            ))
+        else:
+            msg.error(
+                url or "Deployment failed.",
+                suggestion="Check your project for build errors and try again.",
+            )
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️  Render deployment cancelled.[/yellow]")
+    except TimeoutError:
+        msg.error(
+            "Deployment timed out.",
+            suggestion="Your project may be large or complex. Try again later.",
+        )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _log_debug_exception("_handle_render_deploy() unexpected error", exc)
+        msg.error(
+            f"Deployment failed: {exc}",
+            suggestion="Check your internet connection and try again.",
+        )
+
+
+def _ensure_render_auth() -> bool:
+    if is_render_authenticated():
+        return True
+
+    console.print("[yellow]You're not connected to Render yet.[/yellow]")
+    login_to_render()
+
+    if is_render_authenticated():
+        return True
+
+    msg.error(
+        "Render authentication failed.",
+        suggestion="Run `opun8 render` to connect manually.",
+    )
+    return False
+
+
+# ──────────────────────────────────────────────────────────────
+# DEPLOYMENT HISTORY
+# ──────────────────────────────────────────────────────────────
+
+def _record_deployment_history(
+    project_name: str,
+    url: str,
+    project_id: Optional[str],
+    team_id: Optional[str],
+    platform: str,
+) -> None:
+    """
+    Save a successful deployment to local history and show a badge
+    notification if this deployment unlocked one.
+
+    This always runs *after* the deployment has already succeeded, so a
+    problem here (corrupt history file, disk full, no write permission on
+    ~/.opun8, etc.) must never be allowed to reach the user as a failed
+    deployment — their site is live either way. Any failure is reported as
+    a quiet warning and swallowed here, not re-raised.
+
+    Only environment variable *names* are recorded, never values, so no
+    secrets from the deployed project ever end up in the history file.
+    """
+    try:
+        deployment_record = add_deployment(
+            project_name=project_name,
+            url=url,
+            platform=platform,
+            project_id=project_id,
+            team_id=team_id,
+            env_vars=[],
+        )
+    except Exception as exc:
+        console.print(
+            f"[yellow]⚠️  Deployment succeeded, but couldn't be saved to history: {exc}[/yellow]"
+        )
+        return
+
+    try:
+        show_badge_notification(deployment_record.get("badge_unlocked"))
+    except Exception as exc:
+        console.print(f"[yellow]⚠️  Couldn't check badge progress: {exc}[/yellow]")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -751,7 +848,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
 
     if not result.project_id:
         console.print("[red]❌ Cannot rename: No project ID available.[/red]")
-        console.print("[dim]Please rename manually in the Vercel dashboard.[/dim]")
+        console.print("[dim]Please rename manually in the platform dashboard.[/dim]")
         return
 
     current_name = result.url.split('.')[0] if '.' in result.url else result.url

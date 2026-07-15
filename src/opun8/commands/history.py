@@ -38,6 +38,7 @@ from opun8.services.deployment_history import (
     get_deployment_count,
     get_badge_info,
     add_deployment,
+    get_platform_icon,
 )
 from opun8.commands.badges import show_badge_notification
 from opun8.ui import messages as msg
@@ -49,23 +50,31 @@ from opun8.providers.vercel.deploy import (
     _sanitize_project_name,
 )
 
+# Render imports
+from opun8.providers.render.auth import (
+    get_render_token,
+    is_render_authenticated,
+    login_to_render,
+    get_render_owner_id,
+)
+from opun8.providers.render.deploy import deploy_to_render
+
 console = Console()
 
 PANEL_WIDTH = 60
 HISTORY_TABLE_DISPLAY_LIMIT = 30
 
+# Platform icons mapping
+PLATFORM_ICONS = {
+    "vercel": "▲",
+    "netlify": "📦",
+    "render": "☁️",
+}
+
 
 # ──────────────────────────────────────────────────────────────
 # HELPER: Safe prompt that handles Ctrl+C / Ctrl+Z (EOF)
 # ──────────────────────────────────────────────────────────────
-#
-# Plain Prompt.ask()/Confirm.ask() raise EOFError on Ctrl+Z (Windows) or
-# Ctrl+D (Unix) at the input stream. Every screen in this module used to
-# call them directly, so an EOF at any prompt — not just the top-level
-# one — fell all the way through to history()'s generic `except
-# Exception` handler and printed a raw traceback instead of exiting
-# cleanly. These wrappers catch both and let call sites treat it as a
-# cancellation, the same way KeyboardInterrupt is already handled.
 
 def _safe_prompt(
     message: str,
@@ -201,9 +210,7 @@ def _display_history_table(deployments: List[Dict[str, Any]]) -> None:
         platform = (deployment.get("platform") or "unknown").capitalize()
         url = deployment.get("url", "N/A")[:25]
         date_str = _format_relative_date(deployment.get("timestamp"))
-        platform_icon = {"vercel": "▲", "netlify": "📦", "render": "☁️"}.get(
-            deployment.get("platform") or "", "●"
-        )
+        platform_icon = PLATFORM_ICONS.get(deployment.get("platform") or "", "●")
 
         table.add_row(str(idx), project_name, platform_icon + platform, url, date_str)
 
@@ -215,10 +222,6 @@ def _format_relative_date(timestamp: Optional[str]) -> str:
         return "Unknown"
     try:
         dt = datetime.fromisoformat(timestamp)
-        # Timestamps are always written as naive local time (see
-        # add_deployment()'s datetime.now().isoformat()), but guard against
-        # a stray tz-aware value (e.g. from a manually edited history file)
-        # so this can't raise instead of just falling back to "Unknown".
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
         time_diff = datetime.now() - dt
@@ -227,8 +230,6 @@ def _format_relative_date(timestamp: Optional[str]) -> str:
 
     total_seconds = time_diff.total_seconds()
     if total_seconds < 0:
-        # Clock skew or a manually edited future timestamp: don't show a
-        # negative/garbage duration, just treat it as "now".
         return "Just now"
 
     if total_seconds < 60:
@@ -258,7 +259,6 @@ def _show_deployment_details(deployment: Dict[str, Any]) -> None:
     current = deployment
 
     while True:
-        # Re-fetch so a rename from a previous iteration is reflected.
         deployment_id = current.get("id")
         if deployment_id:
             refreshed = get_deployment(deployment_id)
@@ -289,21 +289,18 @@ def _show_deployment_details(deployment: Dict[str, Any]) -> None:
             return
         elif choice == "1":
             _redeploy(current)
-            return  # a new deployment was (maybe) added; show the refreshed list
+            return
         elif choice == "2":
             renamed = _rename_in_history(current)
             if renamed:
                 current = renamed
-            # loop again either way, to show the (possibly unchanged) details
         elif choice == "3":
             updated = _set_project_folder(current)
             if updated:
                 current = updated
-            # loop again either way, to show the (possibly unchanged) details
         elif choice == "4":
             if _delete_deployment(current):
-                return  # deployment is gone; nothing left to show here
-            # cancelled or failed: loop again with the same deployment
+                return
 
 
 def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
@@ -316,6 +313,7 @@ def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
     deployment_id = deployment.get("id", "N/A")
     env_vars = deployment.get("env_vars", [])
     status = deployment.get("status", "unknown")
+    platform_icon = PLATFORM_ICONS.get(deployment.get("platform") or "", "●")
 
     timestamp = deployment.get("timestamp")
     date_display = "Unknown"
@@ -328,7 +326,7 @@ def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
     project_path = deployment.get("project_path") or "Not tracked"
 
     console.print(Panel(
-        f"[bold cyan]📦 {project_name}[/bold cyan]\n\n"
+        f"[bold cyan]{platform_icon} {project_name}[/bold cyan]\n\n"
         f"[bold]Platform:[/bold] {platform}\n"
         f"[bold]URL:[/bold] [cyan]{url}[/cyan]\n"
         f"[bold]Deployment ID:[/bold] [dim]{deployment_id}[/dim]\n"
@@ -419,12 +417,11 @@ def _redeploy(deployment: Dict[str, Any]) -> None:
 
     if platform == "vercel":
         _redeploy_vercel(deployment, project_path)
+    elif platform == "render":
+        _redeploy_render(deployment, project_path)
     elif platform == "netlify":
         console.print("[yellow]📦 Netlify redeploy coming soon![/yellow]")
         console.print("[dim]Please redeploy manually from the Netlify dashboard.[/dim]")
-    elif platform == "render":
-        console.print("[yellow]☁️ Render redeploy coming soon![/yellow]")
-        console.print("[dim]Please redeploy manually from the Render dashboard.[/dim]")
     else:
         console.print(f"[red]Unknown platform: {platform}[/red]")
         console.print("[dim]Please redeploy manually from the platform dashboard.[/dim]")
@@ -433,16 +430,6 @@ def _redeploy(deployment: Dict[str, Any]) -> None:
 def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
     """
     Ask which local project folder this redeploy should use.
-
-    Redeploying used to always deploy whatever the current working
-    directory happened to be, silently, even if that had nothing to do
-    with the project being redeployed. This offers the folder the
-    deployment was originally created from (if we tracked one and it
-    still exists) as the default, alongside the option to pick a
-    different folder instead.
-
-    Returns:
-        The chosen project directory, or None if the user cancelled.
     """
     tracked_raw = deployment.get("project_path")
     tracked_path = Path(tracked_raw).expanduser() if tracked_raw else None
@@ -491,22 +478,17 @@ def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
 
 
 def _prompt_for_project_path() -> Optional[Path]:
-    """
-    Prompt the user to select a project folder using the native folder dialog.
-    This replaces the manual text input with a file browser.
-    """
+    """Prompt the user to select a project folder using the native folder dialog."""
     console.print()
     console.print("[dim]A file browser will open for you to select the folder.[/dim]")
     console.print()
 
-    # Use the folder dialog from messages.py
     selected = msg.prompt_select_folder("Select project folder for this deployment")
 
     if selected is None:
         console.print("[dim]Folder selection cancelled.[/dim]")
         return None
 
-    # Verify the selected path
     if not selected.exists():
         console.print(f"[red]❌ Path does not exist: {selected}[/red]")
         return None
@@ -523,21 +505,7 @@ def _prompt_for_project_path() -> Optional[Path]:
 # ──────────────────────────────────────────────────────────────
 
 def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Manually set (or change) the local project folder recorded for a
-    deployment.
-
-    Deployments made before Opun8 started tracking project_path show
-    "Not tracked" permanently otherwise — there's no way to derive the
-    right folder after the fact from just a URL and a deployment ID, so
-    this lets the user point it at the correct folder once. That then
-    sticks for both the history panel display and future Redeploys
-    (which otherwise have to ask again every single time).
-
-    Returns:
-        The updated deployment record if changed, else None (cancelled
-        or the update failed).
-    """
+    """Manually set (or change) the local project folder recorded for a deployment."""
     console.print()
     console.print("[bold cyan]📁 Project Folder[/bold cyan]")
     current = deployment.get("project_path")
@@ -571,11 +539,12 @@ def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return updated
 
 
+# ──────────────────────────────────────────────────────────────
+# REDEPLOY: VERCEL
+# ──────────────────────────────────────────────────────────────
+
 def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
-    """
-    Redeploy to Vercel using the existing project ID if available.
-    This prevents the "project already exists" error on redeploy.
-    """
+    """Redeploy to Vercel using the existing project ID if available."""
     token = get_vercel_token()
 
     if not token:
@@ -584,7 +553,7 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
 
     project_name = deployment.get("project_name") or project_path.name
     team_id = (get_vercel_scope() or {}).get("team_id")
-    existing_project_id = deployment.get("project_id")  # Critical: use existing project ID
+    existing_project_id = deployment.get("project_id")
 
     console.print()
     console.print("[dim]Would you like to update environment variables?[/dim]")
@@ -593,7 +562,7 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
     env_vars = _load_env_vars(project_path) if update_env else {}
 
     console.print()
-    console.print("[dim]Deploying...[/dim]")
+    console.print("[dim]Deploying to Vercel...[/dim]")
 
     success, url, project_id = deploy_to_vercel(
         token=token,
@@ -602,12 +571,10 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
         framework=None,
         env_vars=env_vars,
         team_id=team_id,
-        existing_project_id=existing_project_id,  # Pass the existing project ID
+        existing_project_id=existing_project_id,
     )
 
     if not success:
-        # The error message from deploy_to_vercel already explains what failed
-        # Don't override it with a generic "build errors" hint
         return
 
     result = add_deployment(
@@ -632,28 +599,83 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# REDEPLOY: RENDER
+# ──────────────────────────────────────────────────────────────
+
+def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
+    """Redeploy to Render using the existing service ID if available."""
+    token = get_render_token()
+
+    if not token:
+        msg.error("Not connected to Render.", suggestion="Run `opun8 render` to connect.")
+        return
+
+    project_name = deployment.get("project_name") or project_path.name
+    owner_id = get_render_owner_id()
+    existing_service_id = deployment.get("project_id")
+
+    console.print()
+    console.print("[dim]Would you like to update environment variables?[/dim]")
+    update_env = bool(_safe_confirm("[bold cyan]➜[/] Update env vars?", default=False))
+
+    env_vars = _load_env_vars(project_path) if update_env else {}
+
+    console.print()
+    console.print("[dim]Deploying to Render...[/dim]")
+    console.print("[dim]This may take a few minutes.[/dim]")
+
+    success, url, service_id = deploy_to_render(
+        token=token,
+        project_name=project_name,
+        project_path=project_path,
+        framework=None,
+        env_vars=env_vars,
+        owner_id=owner_id,
+        repo_url=None,
+        region="oregon",
+    )
+
+    if not success:
+        return
+
+    # Update the existing deployment record with the new URL
+    deployment_id = deployment.get("id")
+    if deployment_id:
+        update_deployment(deployment_id, {
+            "url": url,
+            "project_id": service_id,
+            "timestamp": datetime.now().isoformat(),
+            "status": "success",
+        })
+
+    result = add_deployment(
+        project_name=project_name,
+        url=url,
+        platform="render",
+        project_id=service_id,
+        team_id=owner_id,
+        env_vars=list(env_vars.keys()) if env_vars else [],
+        project_path=str(project_path),
+    )
+
+    console.print()
+    console.print("[bold green]✅ Redeploy successful![/bold green]")
+    console.print(f"[dim]🌐 https://{url}[/dim]")
+
+    show_badge_notification(result.get("badge_unlocked"))
+
+    console.print()
+    if _safe_confirm("[bold]Open the new deployment?[/bold]", default=True):
+        webbrowser.open(f"https://{url}")
+
+
+# ──────────────────────────────────────────────────────────────
 # RENAME
 # ──────────────────────────────────────────────────────────────
 
 def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Rename a deployment.
-
-    For Vercel deployments this renames the actual project on Vercel first
-    (via the existing `rename_vercel_project()` helper, which already
-    handles name sanitization, checking for name collisions across every
-    project in the scope, and resolving the real post-rename domain), and
-    only then updates local history with the new name *and* the new URL
-    Vercel assigned. Previously this only relabelled the local history
-    record — `rename_vercel_project()` existed in the codebase but was
-    never called from here, so the project on Vercel kept its old name
-    and old URL and the panel looked "renamed" while the real site never
-    changed.
-
-    Returns:
-        The updated deployment record if the rename succeeded, else None
-        (cancelled, empty/invalid name, name conflict, or the update
-        failed).
     """
     console.print()
     console.print("[bold cyan]✏️ Rename Deployment[/bold cyan]")
@@ -669,9 +691,6 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     platform = deployment.get("platform") or "vercel"
 
     if platform == "vercel":
-        # Preview the exact name rename_vercel_project() will apply (same
-        # sanitizer it uses internally) so the confirmation prompt below
-        # never shows a different name than what actually gets sent.
         new_name = _sanitize_project_name(raw_name)
         if not new_name:
             console.print("[red]Invalid name. Use letters, numbers, dots, hyphens, or underscores.[/red]")
@@ -715,13 +734,12 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             console.print("[dim]Renaming on Vercel...[/dim]")
             success, result = rename_vercel_project(token, project_id, new_name, team_id)
             if not success:
-                # result is already a plain-English message here.
                 console.print(f"[red]❌ {result}[/red]")
                 console.print("[dim]Local history was left unchanged so it doesn't disagree with the live project.[/dim]")
                 return None
 
             console.print("[green]✅ Renamed on Vercel.[/green]")
-            updates["url"] = result  # result is the new URL on success
+            updates["url"] = result
 
     updated = update_deployment(deployment_id, updates)
     if not updated:
@@ -741,10 +759,6 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _delete_deployment(deployment: Dict[str, Any]) -> bool:
     """
     Delete a deployment from history and optionally from its platform.
-
-    Returns:
-        True if the deployment was removed from history, else False
-        (the caller uses this to decide whether to keep showing details).
     """
     console.print()
     console.print("[bold cyan]🗑️ Delete Deployment[/bold cyan]")
@@ -783,18 +797,12 @@ def _delete_deployment(deployment: Dict[str, Any]) -> bool:
         console.print("[red]Failed to remove from history: this entry has no deployment ID.[/red]")
         return False
 
-    # Delete from the platform FIRST, before touching local history. If the
-    # platform deletion fails and we'd already wiped the history entry,
-    # the project would still be live on Vercel with no record of it left
-    # anywhere in Opun8 — no way to find it again to retry. Confirming the
-    # platform side first (or getting explicit consent to proceed without
-    # it) keeps history and reality in sync.
     if delete_from_platform:
         platform_deleted = _delete_from_platform(deployment)
         if not platform_deleted:
             proceed_anyway = _safe_confirm(
-                "[bold]Vercel deletion did not succeed. Remove this entry from local "
-                "history anyway?[/bold] [dim](the project will still exist on Vercel)[/dim]",
+                "[bold]Platform deletion did not succeed. Remove this entry from local "
+                "history anyway?[/bold] [dim](the project will still exist on the platform)[/dim]",
                 default=False,
             )
             if not proceed_anyway:
@@ -815,20 +823,21 @@ def _delete_deployment(deployment: Dict[str, Any]) -> bool:
 def _delete_from_platform(deployment: Dict[str, Any]) -> bool:
     """
     Best-effort deletion of the underlying platform project.
-
-    Returns:
-        True if the project is confirmed gone from the platform (deleted
-        just now, or already gone), False if deletion could not be
-        confirmed — callers should treat False as "the project may still
-        exist" and not silently drop the local history record.
     """
     platform = deployment.get("platform") or "vercel"
 
-    if platform != "vercel":
+    if platform == "vercel":
+        return _delete_from_vercel(deployment)
+    elif platform == "render":
+        return _delete_from_render(deployment)
+    else:
         console.print("[yellow]⚠️  Automatic platform deletion not available for this platform.[/yellow]")
         console.print("[dim]Please delete manually from the platform dashboard.[/dim]")
         return False
 
+
+def _delete_from_vercel(deployment: Dict[str, Any]) -> bool:
+    """Delete a project from Vercel."""
     token = get_vercel_token()
     if not token:
         console.print("[yellow]⚠️  Not connected to Vercel — can't delete the project there.[/yellow]")
@@ -870,3 +879,22 @@ def _delete_from_platform(deployment: Dict[str, Any]) -> bool:
     except requests.RequestException as e:
         console.print(f"[yellow]⚠️  Platform deletion error: {e}[/yellow]")
         return False
+
+
+def _delete_from_render(deployment: Dict[str, Any]) -> bool:
+    """Delete a service from Render."""
+    token = get_render_token()
+    if not token:
+        console.print("[yellow]⚠️  Not connected to Render — can't delete the service there.[/yellow]")
+        console.print("[dim]Run `opun8 render` to connect, then try again.[/dim]")
+        return False
+
+    service_id = deployment.get("project_id")
+    if not service_id:
+        console.print("[yellow]⚠️  No Render service ID on record for this deployment — can't delete it automatically.[/yellow]")
+        console.print("[dim]Please delete it manually from the Render dashboard.[/dim]")
+        return False
+
+    from opun8.providers.render.deploy import delete_render_service
+
+    return delete_render_service(token, service_id)

@@ -294,6 +294,9 @@ def add_deployment(
     if not platform or not platform.strip():
         raise ValueError("platform must be a non-empty string")
 
+    # Normalize platform to lowercase
+    platform = platform.lower()
+
     with _locked():
         data = _read_history()
         existing_ids = {d.get("id") for d in data["deployments"]}
@@ -438,7 +441,22 @@ def get_deployments_by_platform(platform: str) -> List[Dict[str, Any]]:
     Returns:
         List of deployments on that platform.
     """
+    platform = platform.lower()
     return [d for d in get_deployment_history() if d.get("platform") == platform]
+
+
+def get_platform_stats() -> Dict[str, int]:
+    """
+    Get deployment statistics by platform.
+
+    Returns:
+        Dictionary mapping platform names to deployment counts.
+    """
+    stats: Dict[str, int] = {}
+    for deployment in get_deployment_history():
+        platform = deployment.get("platform", "unknown")
+        stats[platform] = stats.get(platform, 0) + 1
+    return stats
 
 
 def clear_history() -> None:
@@ -531,3 +549,21 @@ def check_badge_progress(old_count: int, new_count: int) -> Optional[Dict[str, A
     if new_level > old_level:
         return get_badge_info(new_count)
     return None
+
+
+def get_platform_icon(platform: str) -> str:
+    """
+    Get the icon for a platform.
+
+    Args:
+        platform: Platform name (vercel, netlify, render)
+
+    Returns:
+        Platform icon (▲, 📦, ☁️, or ● for unknown)
+    """
+    icons = {
+        "vercel": "▲",
+        "netlify": "📦",
+        "render": "☁️",
+    }
+    return icons.get(platform.lower(), "●")
