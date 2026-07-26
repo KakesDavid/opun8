@@ -1,5 +1,16 @@
 """
 Opun8 CLI - Command Line Interface for the Universal Deployment Platform.
+
+This is the main entry point for the OPUN8 CLI. It provides commands for:
+    - Authentication (register, login, verify, logout)
+    - Website cloning (clone, clone with options)
+    - Deployment (deploy to Vercel, Render, Netlify)
+    - Account management (upgrade, status, history)
+    - GitHub integration (connect, list repos, deploy from repo)
+    - Provider management (Vercel, Render)
+
+Author: OPUN8 Team
+Version: 0.1.4
 """
 
 import typer
@@ -28,13 +39,19 @@ from opun8.providers.render.auth import (
     login_to_render,
     is_render_authenticated,
     logout_render,
-    show_render_auth_status,
     switch_render_owner,
     list_render_owners,
     get_render_token,
-    get_render_owner_id,  # ← Fixed: Added missing import
+    get_render_owner_id,
+    prompt_owner_selection,
 )
 from opun8.providers.render.deploy import list_render_services
+
+# =============================================================================
+# NEW IMPORTS FOR AUTHENTICATION & UPGRADE
+# =============================================================================
+from opun8.commands.clone import clone as clone_cmd
+from opun8.commands.upgrade import upgrade as upgrade_cmd
 
 app = typer.Typer(
     name="opun8",
@@ -43,7 +60,8 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 
-console = Console()
+# ✅ FIX: Use legacy_windows=True for better CMD compatibility
+console = Console(legacy_windows=True)
 
 
 @app.callback(invoke_without_command=True)
@@ -56,6 +74,7 @@ def main(
         help="Show Opun8 version.",
     ),
 ):
+    """Main entry point for the CLI."""
     if version:
         console.print(f"Opun8 v{__version__}")
         raise typer.Exit()
@@ -65,12 +84,131 @@ def main(
 
 
 # ──────────────────────────────────────────────────────────────
-# COMMANDS
+# AUTHENTICATION COMMANDS
+# ──────────────────────────────────────────────────────────────
+
+@app.command()
+def register(
+    email: Optional[str] = typer.Option(None, "--email", "-e", help="Your email address"),
+    username: Optional[str] = typer.Option(None, "--username", "-u", help="Desired username"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", help="Your password"),
+):
+    """
+    Create a new OPUN8 account.
+
+    You'll receive a verification code via email after registration.
+    Use `opun8 verify` to confirm your email.
+    """
+    from opun8.commands.auth import register as register_cmd
+    register_cmd(email=email, username=username, password=password)
+
+
+@app.command()
+def login(
+    email: Optional[str] = typer.Option(None, "--email", "-e", help="Your email address"),
+    password: Optional[str] = typer.Option(None, "--password", "-p", help="Your password"),
+):
+    """
+    Log in to your OPUN8 account.
+
+    Your session token will be saved locally for future commands.
+    """
+    from opun8.commands.auth import login as login_cmd
+    login_cmd(email=email, password=password)
+
+
+@app.command()
+def verify(
+    code: Optional[str] = typer.Option(None, "--code", "-c", help="6-digit verification code"),
+):
+    """
+    Verify your email with the OTP code sent during registration.
+
+    You'll receive the code via email after running `opun8 register`.
+    """
+    from opun8.commands.auth import verify as verify_cmd
+    verify_cmd(code=code)
+
+
+@app.command(name="resend-otp")
+def resend_otp():
+    """
+    Resend the OTP verification code to your email.
+
+    Use this if you didn't receive the code or it expired.
+    """
+    from opun8.commands.auth import resend_otp as resend_otp_cmd
+    resend_otp_cmd()
+
+
+@app.command()
+def status():
+    """
+    Check your OPUN8 account status.
+
+    Shows your plan, clone limits, and account information.
+    """
+    from opun8.commands.auth import status as status_cmd
+    status_cmd()
+
+
+# ──────────────────────────────────────────────────────────────
+# CLONE COMMAND
+# ──────────────────────────────────────────────────────────────
+
+@app.command()
+def clone(
+    url: str = typer.Argument(..., help="URL of the website to clone"),
+    clean: bool = typer.Option(False, "--clean", help="Clean up messy code"),
+    single_page: bool = typer.Option(False, "--single-page", "-s", help="Clone only the current page"),
+    output: str = typer.Option("./cloned-site", "--output", "-o", help="Output directory"),
+):
+    """
+    Clone any website to your local machine.
+
+    Examples:
+        opun8 clone https://example.com
+        opun8 clone https://example.com --clean
+        opun8 clone https://example.com --single-page
+        opun8 clone https://example.com -o ./my-clone
+    """
+    clone_cmd(url=url, clean=clean, single_page=single_page, output=output)
+
+
+# ──────────────────────────────────────────────────────────────
+# UPGRADE COMMAND
+# ──────────────────────────────────────────────────────────────
+
+@app.command()
+def upgrade(
+    plan: Optional[str] = typer.Argument(
+        None,
+        help="Plan to upgrade to (starter, pro).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Skip confirmation prompt.",
+    ),
+):
+    """
+    Upgrade your OPUN8 subscription plan.
+
+    Plans:
+        starter: 20 clones/month, React/Vue support ($5/month)
+        pro: 100 clones/month, full backend support ($15/month)
+    """
+    upgrade_cmd(plan_arg=plan, force=force)
+
+
+# ──────────────────────────────────────────────────────────────
+# EXISTING COMMANDS
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
 def doctor():
-    """Check your environment and project."""
+    """Check your environment and project setup."""
     from opun8.commands.doctor import doctor as doctor_cmd
     doctor_cmd()
 
@@ -122,7 +260,6 @@ def github(
     ),
 ):
     """Connect to GitHub account."""
-
     if logout_flag:
         logout_github()
         return
@@ -183,10 +320,7 @@ def github(
 
 
 def _deploy_repository_from_github() -> None:
-    """
-    Handle the "Deploy a repository" flow from the GitHub menu.
-    Allows user to select a repo and deploy it.
-    """
+    """Handle the 'Deploy a repository' flow from the GitHub menu."""
     console.print()
     console.print("[bold cyan]🚀 Deploy a GitHub Repository[/bold cyan]")
     console.print("[dim]Select a repository to clone and deploy.[/dim]")
@@ -197,9 +331,6 @@ def _deploy_repository_from_github() -> None:
         console.print("[yellow]No repositories found.[/yellow]")
         return
 
-    # Show repository list with numbers
-    console.print("[bold]Select a repository:[/bold]")
-    console.print()
     for i, repo in enumerate(repos[:20], 1):
         private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
         console.print(f"  [bold cyan]{i}[/]  [white]{repo['name']}[/white] {private_tag}")
@@ -226,13 +357,12 @@ def _deploy_repository_from_github() -> None:
         
         selected_repo = repos[idx]
         repo_name = selected_repo.get("name")
-        clone_url = selected_repo.get("url", f"https://github.com/{get_authenticated_user()}/{repo_name}")
+        clone_url = selected_repo.get("url") or f"https://github.com/{get_authenticated_user()}/{repo_name}"
         
         console.print()
         console.print(f"[bold]Selected: [cyan]{repo_name}[/cyan][/bold]")
         console.print()
         
-        # Ask for deployment platform
         console.print("[bold]Which platform would you like to deploy to?[/bold]")
         console.print()
         console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
@@ -254,7 +384,7 @@ def _deploy_repository_from_github() -> None:
             from opun8.commands.repo import deploy_repository
             deploy_repository(clone_url, repo_name, platform="render")
         elif platform_choice == "2":
-            console.print(f"[yellow]⚠️ Netlify support coming soon![/yellow]")
+            console.print("[yellow]⚠️ Netlify support coming soon![/yellow]")
         else:
             console.print("[yellow]Invalid platform selection.[/yellow]")
             
@@ -290,7 +420,6 @@ def vercel(
     ),
 ):
     """Connect to Vercel account."""
-
     if logout_flag:
         logout_vercel()
         return
@@ -356,7 +485,6 @@ def render(
     ),
 ):
     """Connect to Render account."""
-
     if logout_flag:
         logout_render()
         return
@@ -398,8 +526,6 @@ def _switch_render_owner() -> None:
         console.print("[yellow]Not connected to Render. Run `opun8 render` first.[/yellow]")
         return
 
-    from opun8.providers.render.auth import list_render_owners, prompt_owner_selection
-
     owners = list_render_owners(token)
     if not owners:
         console.print("[yellow]No workspaces found.[/yellow]")
@@ -407,7 +533,6 @@ def _switch_render_owner() -> None:
 
     selected = prompt_owner_selection(token)
     if selected:
-        from opun8.providers.render.auth import switch_render_owner
         switch_render_owner(selected)
 
 
@@ -446,21 +571,30 @@ def _show_render_services() -> None:
 
     table = Table(border_style="cyan")
     table.add_column("#", style="bold white", width=4)
-    table.add_column("Name", style="bold white", width=20)
-    table.add_column("Type", style="dim", width=12)
+    table.add_column("Name", style="bold white", width=20, no_wrap=False)
+    table.add_column("Type", style="dim", width=14)
     table.add_column("Status", style="dim", width=12)
-    table.add_column("URL", style="cyan", width=25)
+    table.add_column("URL", style="cyan", width=30, no_wrap=False)
 
     for idx, service in enumerate(services, 1):
-        name = service.get("name", "Unknown")[:20]
-        service_type = service.get("type", "unknown")[:12]
-        status = service.get("status", "unknown")[:12]
-        url = service.get("url", "N/A")[:25]
+        name = service.get("name", "Unknown")[:20] if service.get("name") else "Unknown"
+        service_type = service.get("type", "unknown")[:14] if service.get("type") else "unknown"
+        status = service.get("status", "unknown")[:12] if service.get("status") else "unknown"
+        url = service.get("url", "N/A")[:30] if service.get("url") else "N/A"
 
-        table.add_row(str(idx), name, service_type, status, url)
+        table.add_row(
+            str(idx),
+            name,
+            service_type,
+            status,
+            url
+        )
 
     console.print(table)
     console.print()
+
+    console.print("[dim]Run [cyan]opun8 deploy[/cyan] to create a new service.[/dim]")
+    console.print("[dim]Or visit [cyan]https://dashboard.render.com[/cyan] to manage your services.[/dim]")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -485,3 +619,11 @@ def help():
     """Show all available commands."""
     from opun8.ui.messages import show_help
     show_help()
+
+
+# ──────────────────────────────────────────────────────────────
+# RUN THE APP
+# ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app()

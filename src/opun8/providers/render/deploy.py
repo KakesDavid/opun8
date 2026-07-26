@@ -895,16 +895,9 @@ def _wait_for_deployment(
             if deploy_status == "live":
                 service_data = _api_get(f"{RENDER_SERVICES_ENDPOINT}/{service_id}", token)
                 
-                # Debug: Log the full service data to understand the URL structure
                 if service_data:
                     _debug_log(f"Service data for {service_id}: {service_data}")
                 
-                # Render nests the live site's URL inside "serviceDetails.url"
-                # -- there is no top-level "url" field on the service object
-                # (that's a field we send, not one Render returns). Checking
-                # service_data.get("url") directly always came back None,
-                # which is why this always fell through to the constructed
-                # fallback below.
                 url = None
                 if service_data:
                     service_details = service_data.get("serviceDetails") or {}
@@ -913,15 +906,9 @@ def _wait_for_deployment(
                     deploy_details = deploy_data.get("serviceDetails") or {}
                     url = deploy_details.get("url") or deploy_data.get("url")
                 if not url and service_data and service_data.get("slug"):
-                    # "slug" is the actual hostname segment Render assigns and
-                    # can differ from the raw project name -- e.g. Render
-                    # normalizes underscores to hyphens ("opun8_web" ->
-                    # "opun8-web"), so this is more reliable than guessing
-                    # from service_name.
                     url = f"https://{service_data['slug']}.onrender.com"
                     _debug_log(f"Using slug-based URL: {url}")
                 if not url:
-                    # Last-resort fallback if nothing above worked.
                     url = f"https://{service_name}.onrender.com"
                     _debug_log(
                         f"Couldn't find URL in serviceDetails/slug for {service_id}; "
@@ -1004,7 +991,60 @@ def list_render_services(
     if owner_id:
         url = f"{url}?ownerId={owner_id}"
 
-    return _api_get(url, token)
+    raw = _api_get(url, token)
+    if raw is None:
+        return None
+
+    # Handle different response formats
+    services = []
+    
+    if isinstance(raw, list):
+        services = raw
+    elif isinstance(raw, dict):
+        # Try different keys where the service list might be
+        for key in ["items", "services", "data", "results"]:
+            if key in raw and isinstance(raw[key], list):
+                for item in raw[key]:
+                    if isinstance(item, dict):
+                        # Check if the service is wrapped inside a "service" key
+                        if "service" in item:
+                            services.append(item["service"])
+                        else:
+                            services.append(item)
+                break
+        
+        # If no list found in known keys, look for any list value
+        if not services:
+            for key, value in raw.items():
+                if isinstance(value, list) and value:
+                    services = value
+                    break
+    
+    # If still no services, try checking if raw itself is a service object
+    if not services and isinstance(raw, dict) and "id" in raw:
+        services = [raw]
+
+    # Normalize each service to have consistent fields
+    normalized_services = []
+    for service in services:
+        if not isinstance(service, dict):
+            continue
+        normalized = {
+            "id": service.get("id", "Unknown"),
+            "name": service.get("name", "Unknown"),
+            "type": service.get("type", "unknown"),
+            "status": service.get("status", "unknown"),
+            "url": service.get("url", None),
+            "repo": service.get("repo", None),
+            "env": service.get("env", None),
+            "region": service.get("region", None),
+            "created_at": service.get("created_at", None),
+            "updated_at": service.get("updated_at", None),
+            "owner_id": service.get("owner_id", None),
+        }
+        normalized_services.append(normalized)
+
+    return normalized_services
 
 
 def get_render_deployment_logs(
