@@ -54,6 +54,9 @@ _SYMBOLS = {
     "badge": "🏅" if not _NO_EMOJI else "",
     "cloud": "☁️" if not _NO_EMOJI else "",
     "triangle": "▲" if not _NO_EMOJI else "",
+    "clone": "📦" if not _NO_EMOJI else "",
+    "upgrade": "⬆️" if not _NO_EMOJI else "",
+    "verify": "🔑" if not _NO_EMOJI else "",
 }
 
 
@@ -314,18 +317,32 @@ def _render_help_and_get_next() -> str:
     console.print()
 
     table = Table(show_header=True, header_style="bold cyan", box=None)
-    table.add_column("Command", style="bold green", width=18)
+    table.add_column("Command", style="bold green", width=22)
     table.add_column("Description", style="white", width=42)
 
+    # Core Commands
     table.add_row("opun8", "Show welcome screen")
     table.add_row("opun8 --version", "Show version")
     table.add_row("opun8 doctor", "Check environment")
     table.add_row("opun8 detect", "Detect project type")
     table.add_row("opun8 deploy", "Deploy your project")
+
+    # Authentication Commands
+    table.add_row("opun8 register", "Create an OPUN8 account")
+    table.add_row("opun8 login", "Log in to your account")
+    table.add_row("opun8 verify", "Verify email with OTP")
+    table.add_row("opun8 resend-otp", "Resend verification code")
+    table.add_row("opun8 status", "Check account status")
+    table.add_row("opun8 logout", "Logout from all services")
+
+    # Platform Commands
     table.add_row("opun8 github", "Connect to GitHub")
     table.add_row("opun8 vercel", "Connect to Vercel")
     table.add_row("opun8 render", "Connect to Render")
-    table.add_row("opun8 logout", "Logout from all services")
+
+    # Advanced Commands
+    table.add_row("opun8 clone", "Clone any website")
+    table.add_row("opun8 upgrade", "Upgrade subscription plan")
     table.add_row("opun8 history", "View deployment history")
     table.add_row("opun8 badges", "View badge progress")
     table.add_row("opun8 help", "Show this help")

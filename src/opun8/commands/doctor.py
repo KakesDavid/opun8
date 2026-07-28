@@ -63,11 +63,7 @@ def doctor():
             width=60,
         ))
 
-    project_info = results.get("project", {})
-    if project_info.get("passed"):
-        console.print()
-        console.print("[bold cyan]📁 Project Information:[/bold cyan]")
-        console.print(f"  Type: {project_info['project_type'] or 'Unknown'}")
-        console.print(f"  Path: {Path.cwd()}")
+    # Project info is already included in the environment checker
+    # No need to duplicate it here
 
     console.print()

@@ -27,7 +27,7 @@ from rich.table import Table
 
 from opun8.auth import get_github_token
 from opun8.commands.badges import show_badge_notification
-from opun8.core.detector import ProjectDetector
+from opun8.core.detector import detect_project, ProjectInfo
 from opun8.services.deployment_history import add_deployment
 from opun8.services.git_service import GitService
 from opun8.ui import messages as msg
@@ -159,7 +159,7 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
 
 def _run_deployment(
     platform: str,
-    project_info: Dict[str, Any],
+    project_info: ProjectInfo,
     project_path: Path,
     repo_name: str,
 ) -> DeployStatus:
@@ -185,7 +185,7 @@ def _run_deployment(
 def _run_render_deployment_from_github(
     repo_url: str,
     repo_name: str,
-    project_info: Dict[str, Any],
+    project_info: ProjectInfo,
 ) -> DeployStatus:
     """Deploy a GitHub repository directly to Render (no local files)."""
     try:
@@ -218,7 +218,7 @@ def _run_render_deployment_from_github(
             token=token,
             project_name=repo_name,
             project_path=Path.cwd(),
-            framework=project_info.get("framework"),
+            framework=project_info.framework,
             owner_id=owner_id,
             repo_url=repo_url,
             region="oregon",
@@ -234,7 +234,7 @@ def _run_render_deployment_from_github(
                 url=url,
                 project_id=service_id,
                 team_id=owner_id,
-                env_vars={},
+                env_vars=[],
                 platform="render",
             )
 
@@ -309,15 +309,14 @@ def _clone_repository(repo_url: str, repo_name: str) -> Optional[Path]:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _detect_project(project_path: Path) -> Optional[Dict[str, Any]]:
+def _detect_project(project_path: Path) -> Optional[ProjectInfo]:
     """Detect the project type in the cloned repository."""
     original_cwd = os.getcwd()
 
     try:
         os.chdir(project_path)
-        detector = ProjectDetector()
         with msg.scanning_spinner():
-            result = detector.detect()
+            result = detect_project(".")
     except Exception as exc:
         logger.exception("Error detecting project type at %s", project_path)
         error_msg = str(exc).replace("[", "(").replace("]", ")")
@@ -326,26 +325,27 @@ def _detect_project(project_path: Path) -> Optional[Dict[str, Any]]:
     finally:
         os.chdir(original_cwd)
 
-    if not result.get("is_detected"):
+    # Check if detection was successful
+    if result.framework == "unknown" and not result.is_static:
         return None
 
     return result
 
 
-def _show_project_summary(project_info: Dict[str, Any]) -> None:
+def _show_project_summary(project_info: ProjectInfo) -> None:
     """Print a summary of the detected project."""
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column(style="bold white")
     table.add_column(style="white")
 
     fields = (
-        ("Type", "type", "Unknown"),
-        ("Framework", "framework", "Unknown"),
-        ("Package Manager", "package_manager", "Unknown"),
-        ("Build Command", "build_command", "Not found"),
+        ("Framework", project_info.framework or "Unknown"),
+        ("Package Manager", project_info.package_manager or "Unknown"),
+        ("Build Command", project_info.build_command or "Not found"),
+        ("Output Directory", project_info.output_dir or "."),
     )
-    for label, key, default in fields:
-        table.add_row(label, project_info.get(key, default))
+    for label, value in fields:
+        table.add_row(label, str(value))
 
     console.print(table)
 
@@ -354,7 +354,7 @@ def _show_project_summary(project_info: Dict[str, Any]) -> None:
 # VERCEL DEPLOYMENT
 # ──────────────────────────────────────────────────────────────
 
-def _deploy_to_vercel(project_info: Dict[str, Any], project_path: Path, repo_name: str) -> bool:
+def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
     """Deploy the project to Vercel and record the result in deployment history."""
     try:
         if not is_vercel_authenticated():
@@ -382,9 +382,10 @@ def _deploy_to_vercel(project_info: Dict[str, Any], project_path: Path, repo_nam
             token=token,
             project_name=repo_name,
             project_path=project_path,
-            framework=project_info.get("framework"),
+            framework=project_info.framework,
             env_vars=env_vars,
             team_id=team_id,
+            output_dir=project_info.output_dir,
         )
 
         if not success:
@@ -398,7 +399,7 @@ def _deploy_to_vercel(project_info: Dict[str, Any], project_path: Path, repo_nam
             url=url,
             project_id=project_id,
             team_id=team_id,
-            env_vars=env_vars,
+            env_vars=list(env_vars.keys()),
             platform="vercel",
         )
 
@@ -469,7 +470,7 @@ def _record_deployment_history(
     url: str,
     project_id: Optional[str],
     team_id: Optional[str],
-    env_vars: Dict[str, str],
+    env_vars: list[str],
     platform: str,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -485,7 +486,7 @@ def _record_deployment_history(
             platform=platform,
             project_id=project_id,
             team_id=team_id,
-            env_vars=list(env_vars.keys()) if env_vars else [],
+            env_vars=env_vars,
         )
         badge_info = deployment_record.get("badge_unlocked")
         if badge_info:
@@ -513,3 +514,8 @@ def _cleanup_temp_dir(project_path: Path) -> None:
         logger.exception("Error cleaning up temp directory for %s", project_path)
         error_msg = str(exc).replace("[", "(").replace("]", ")")
         console.print(f"[yellow]⚠️ Could not clean up: {error_msg}[/yellow]")
+
+
+def _debug_log(message: str) -> None:
+    """Log a debug message to the console."""
+    console.print(f"[dim]🐛 {message}[/dim]")
