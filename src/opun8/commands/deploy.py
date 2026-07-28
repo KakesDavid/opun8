@@ -5,7 +5,8 @@ Orchestrates the full deployment flow:
     1. Detect the project
     2. Auto-build if needed
     3. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
-    4. Deploy and report the result
+    4. Show cost estimate
+    5. Deploy and report the result
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import typer
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -35,6 +37,8 @@ from opun8.auth import (
 from opun8.core.detector import detect_project, ProjectInfo
 from opun8.services.build_service import BuildService, get_build_service
 from opun8.services.git_service import GitService
+from opun8.services.cost_estimator import get_cost_estimator
+from opun8.ui.cost_display import display_cost_estimate, display_savings_tip
 from opun8.ui import messages as msg
 from opun8.commands.badges import show_badge_notification
 from opun8.services.deployment_history import add_deployment
@@ -72,30 +76,11 @@ console = Console()
 
 PANEL_WIDTH = 60
 
-# Same debug log used by opun8.auth, for one place a developer checks —
-# see the note on _log_debug_exception() just below for why it exists.
 DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
 
 
 def _log_debug_exception(context: str, exc: Exception) -> None:
-    """
-    Record the full traceback for an unexpected error to the local debug
-    log instead of the terminal.
-
-    Mirrors the policy already established in opun8.auth: an end user
-    only ever sees a short, friendly message (via msg.error() at the
-    call site) — never a raw Python traceback with internal file paths
-    and line numbers. console.print_exception() used to be called
-    directly in each except block here, which put exactly that kind of
-    traceback on screen for the end user. This is a one-line swap-in
-    replacement: same information, developer-only by default.
-
-    Set OPUN8_DEBUG=1 to also echo the traceback to the terminal live
-    while developing, same as opun8.auth.
-
-    Best-effort only — logging must never be able to crash a command in
-    its own right.
-    """
+    """Log debug exception to file."""
     try:
         DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -121,7 +106,6 @@ PLATFORM_CHOICES: Dict[str, Platform] = {
     "3": Platform.RENDER,
 }
 
-# Platforms with full implementation
 IMPLEMENTED_PLATFORMS = {Platform.VERCEL, Platform.RENDER}
 
 
@@ -143,10 +127,7 @@ def _safe_prompt(
     default: str = "1",
     show_choices: bool = False,
 ) -> Optional[str]:
-    """
-    Prompt the user with graceful handling of Ctrl+C and Ctrl+Z.
-    Returns None if the user cancels.
-    """
+    """Prompt with graceful handling of Ctrl+C and Ctrl+Z."""
     try:
         if choices:
             return Prompt.ask(
@@ -163,16 +144,170 @@ def _safe_prompt(
 
 
 def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
-    """
-    Confirm with the user with graceful handling of Ctrl+C and Ctrl+Z.
-    Returns None if the user cancels.
-    """
+    """Confirm with graceful handling of Ctrl+C and Ctrl+Z."""
     try:
         from rich.prompt import Confirm
         return Confirm.ask(message, default=default)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
         return None
+
+
+# ──────────────────────────────────────────────────────────────
+# PLAN DETECTION
+# ──────────────────────────────────────────────────────────────
+
+def _get_vercel_plan() -> str:
+    """
+    Get the user's current Vercel plan from their account.
+
+    Vercel API response structure:
+        {
+            "user": {
+                "billing": {
+                    "plan": "hobby" | "pro" | "enterprise"
+                },
+                "isHobby": bool,
+                "hasPaymentMethod": bool
+            }
+        }
+
+    Returns:
+        "hobby", "pro", or "enterprise"
+    """
+    try:
+        token = get_vercel_token()
+        if not token:
+            console.print("[dim]ℹ️ Not connected to Vercel. Assuming Hobby plan.[/dim]")
+            return "hobby"
+
+        response = requests.get(
+            "https://api.vercel.com/v2/user",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # Vercel wraps response in a "user" object
+            user = data.get("user", {})
+            billing = user.get("billing", {})
+
+            # Get plan from billing object
+            plan = billing.get("plan", "hobby").lower()
+
+            # Check for Hobby-specific flags
+            is_hobby = user.get("isHobby", False)
+            has_payment_method = user.get("hasPaymentMethod", False)
+
+            # If the account has isHobby=True or no payment method, it's Hobby
+            if is_hobby or not has_payment_method:
+                console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
+                return "hobby"
+
+            # If it's explicitly "hobby" in the response
+            if plan == "hobby":
+                console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
+                return "hobby"
+
+            # If it's "enterprise"
+            if plan == "enterprise":
+                console.print("[dim]📊 Detected Vercel plan: [bold]Enterprise[/bold][/dim]")
+                return "enterprise"
+
+            # Default to Pro for anything else
+            console.print("[dim]📊 Detected Vercel plan: [bold]Pro[/bold][/dim]")
+            return "pro"
+        else:
+            console.print("[dim]⚠️ Could not fetch Vercel plan. Assuming Hobby.[/dim]")
+            return "hobby"
+
+    except Exception as e:
+        console.print(f"[dim]⚠️ Could not detect Vercel plan: {e}[/dim]")
+        return "hobby"
+
+
+def _get_render_plan() -> str:
+    """
+    Get the user's current Render workspace tier.
+
+    Render's billing model is per-service, not per-seat.
+    Workspace tiers are: "individual", "team", "organization", "enterprise"
+
+    Returns:
+        "individual", "team", "organization", or "enterprise"
+    """
+    try:
+        token = get_render_token()
+        if not token:
+            console.print("[dim]ℹ️ Not connected to Render. Assuming Individual (free).[/dim]")
+            return "individual"
+
+        owner_id = get_render_owner_id()
+        if not owner_id:
+            return "individual"
+
+        # Render's owner API returns workspace info
+        response = requests.get(
+            f"https://api.render.com/v1/owners/{owner_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # Render doesn't have a simple "plan" field like Vercel
+            # The tier is in the `type` field:
+            # "individual", "team", "organization", "enterprise"
+            tier = data.get("type", "individual").lower()
+
+            # Map Render's tier to our internal plan names
+            plan_mapping = {
+                "individual": "individual",
+                "team": "team",
+                "organization": "organization",
+                "enterprise": "enterprise",
+            }
+
+            plan = plan_mapping.get(tier, "individual")
+
+            # Display the detected plan
+            plan_display = {
+                "individual": "Individual (free)",
+                "team": "Team (Pro)",
+                "organization": "Organization (Scale)",
+                "enterprise": "Enterprise",
+            }
+
+            console.print(f"[dim]📊 Detected Render tier: [bold]{plan_display.get(plan, plan.capitalize())}[/bold][/dim]")
+            return plan
+
+        else:
+            console.print("[dim]⚠️ Could not fetch Render tier. Assuming Individual.[/dim]")
+            return "individual"
+
+    except Exception as e:
+        console.print(f"[dim]⚠️ Could not detect Render tier: {e}[/dim]")
+        return "individual"
+
+
+def _get_netlify_plan() -> str:
+    """
+    Get the user's current Netlify plan from their account.
+
+    Returns:
+        "starter", "pro", "business", or "enterprise"
+    """
+    try:
+        # Netlify plan detection will be implemented when Netlify provider is added
+        # For now, return "starter" (free tier)
+        console.print("[dim]📊 Netlify plan: [bold]Starter[/bold] (free)[/dim]")
+        return "starter"
+
+    except Exception:
+        return "starter"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -186,23 +321,10 @@ def deploy(
 ) -> None:
     """
     Run the interactive deploy flow.
-
-    Args:
-        platform_arg: Optional platform specified via CLI (e.g., "vercel")
-        skip_github: If True, skip the interactive "Deploy with GitHub /
-            without GitHub" menu and go straight to a no-GitHub deploy.
-            This is what opun8.commands.detect calls after a user has
-            already chosen "Deploy without GitHub" from its own
-            post-detection menu — without this flag, deploy() would ask
-            the same GitHub question a second time.
-        detected_project: If provided, use this pre-detected project info
-            instead of running detection again. This prevents duplicate
-            detection UI when called from detect command.
     """
     try:
         _print_welcome_banner()
 
-        # Use pre-detected project if provided, otherwise detect
         if detected_project:
             project_info = detected_project
             console.print()
@@ -214,9 +336,6 @@ def deploy(
             if project_info is None:
                 return
 
-        # ──────────────────────────────────────────────────────────
-        # ✅ NEW: Auto-build if needed
-        # ──────────────────────────────────────────────────────────
         build_service = get_build_service()
         build_result = build_service.ensure_build()
 
@@ -226,16 +345,13 @@ def deploy(
             console.print(f"[dim]   Error: {build_result.get('message', 'Unknown error')}[/dim]")
             return
 
-        # Store build info for use in deployment
         build_info = build_service.get_build_info()
         project_info.metadata["build_info"] = build_info
         project_info.metadata["output_dir"] = build_info.get("output_dir", ".")
 
         if skip_github:
-            # Caller already asked/decided about GitHub — don't ask again.
             _deploy_without_github(project_info, platform_arg)
         else:
-            # Show the menu with options
             _show_deploy_menu(project_info, platform_arg)
 
     except KeyboardInterrupt:
@@ -243,10 +359,6 @@ def deploy(
         console.print("[dim]Run `opun8 deploy` again when you're ready.[/dim]")
         raise typer.Exit(0)
     except typer.Exit:
-        # A menu choice of "Exit" raises this intentionally (and already
-        # printed its own goodbye message via msg.goodbye()) — it's not an
-        # error, so let it propagate instead of falling into the handler
-        # below.
         raise
     except Exception as exc:
         _log_debug_exception("deploy() unexpected error", exc)
@@ -258,9 +370,7 @@ def deploy(
 
 
 def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """
-    Show the deploy menu with options.
-    """
+    """Show the deploy menu with options."""
     while True:
         console.print()
         console.print("[bold]🎉 Nice! Your project is ready. What would you like to do?[/bold]")
@@ -290,7 +400,7 @@ def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = N
             from opun8.commands.detect import go_to_folder
             go_to_folder()
             return
-        else:  # choice == "4"
+        else:
             msg.goodbye()
             raise typer.Exit()
 
@@ -320,12 +430,39 @@ def _continue_deploy(project_info: ProjectInfo, repo_url: Optional[str], platfor
         msg.info(f"{platform.value.capitalize()} support is coming soon!")
         return
 
+    # ──────────────────────────────────────────────────────────
+    # ✅ COST ESTIMATOR WITH PLAN DETECTION
+    # ──────────────────────────────────────────────────────────
+    estimator = get_cost_estimator(project_info)
+
+    if platform == Platform.VERCEL:
+        plan = _get_vercel_plan()
+        estimate = estimator.estimate_vercel(plan=plan)
+    elif platform == Platform.RENDER:
+        plan = _get_render_plan()
+        estimate = estimator.estimate_render(workspace_plan=plan)
+    elif platform == Platform.NETLIFY:
+        plan = _get_netlify_plan()
+        # Netlify estimate will be added when provider is implemented
+        estimate = None
+        console.print("[yellow]⚠️ Netlify cost estimation coming soon.[/yellow]")
+        if not _safe_confirm("[bold]Continue with deployment?[/bold]", default=True):
+            return
+    else:
+        msg.error(f"Unknown platform: {platform.value}")
+        return
+
+    if estimate and not display_cost_estimate(estimate):
+        console.print("[dim]Deployment cancelled.[/dim]")
+        return
+
+    if estimate:
+        display_savings_tip(estimate)
+
     if platform == Platform.VERCEL:
         _handle_vercel_deploy(project_info, repo_url)
     elif platform == Platform.RENDER:
         _handle_render_deploy(project_info, repo_url)
-    else:
-        msg.error(f"Unknown platform: {platform.value}")
 
 
 def _print_welcome_banner() -> None:
@@ -363,7 +500,6 @@ def _detect_project() -> Optional[ProjectInfo]:
         )
         return None
 
-    # Check if detection failed
     if result.framework == "unknown" and not result.is_static:
         msg.no_project_detected()
         console.print("[dim]💡 Run [cyan]opun8 detect[/cyan] to see what I'm looking for.[/dim]")
@@ -382,7 +518,6 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
     table.add_column(style="bold white")
     table.add_column(style="white")
 
-    # Use ProjectInfo fields directly
     fields = (
         ("Name", project_info.metadata.get("name", Path.cwd().name)),
         ("Framework", project_info.framework or "Unknown"),
@@ -494,15 +629,7 @@ def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────
 
 def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
-    """
-    Ask the user which platform to deploy to.
-    
-    Args:
-        default_platform: If provided, pre-select this platform (e.g., "vercel")
-    
-    Returns:
-        Selected Platform, or None if cancelled.
-    """
+    """Ask the user which platform to deploy to."""
     console.print()
     console.print("[bold]Which platform would you like to deploy to?[/bold]")
     console.print()
@@ -511,7 +638,6 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
     console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
     console.print()
 
-    # Determine default choice based on provided platform
     default_choice = "1"
     if default_platform:
         platform_lower = default_platform.lower()
@@ -544,7 +670,6 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print("[dim]I'll deploy your project to Vercel.[/dim]")
         console.print()
 
-        # Show build info
         build_info = project_info.metadata.get("build_info", {})
         output_dir = project_info.metadata.get("output_dir", ".")
         console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
@@ -575,14 +700,13 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print("[dim]This may take a moment.[/dim]")
         console.print()
 
-        # ✅ Pass output_dir to Vercel deploy
+        # ✅ Deploy to Vercel (output_dir parameter removed)
         success, url, project_id = deploy_to_vercel(
             token=token,
             project_name=project_name,
             project_path=project_path,
             framework=project_info.framework,
             team_id=team_id,
-            output_dir=output_dir,
         )
 
         if success:
@@ -592,7 +716,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
                 project_id=project_id,
                 team_id=team_id,
                 platform="vercel",
-                env_vars=[],  # TODO: Capture env vars from project
+                env_vars=[],
             )
 
             _show_success(SuccessResult(
@@ -608,7 +732,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Vercel deployment cancelled.[/yellow]")
-        return  # Don't re-raise; return to menu gracefully
+        return
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
@@ -653,7 +777,6 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print("[dim]I'll deploy your project to Render.[/dim]")
         console.print()
 
-        # Show build info
         build_info = project_info.metadata.get("build_info", {})
         output_dir = project_info.metadata.get("output_dir", ".")
         console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
@@ -675,10 +798,8 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
             )
             return
 
-        # Get owner/workspace
         owner_id = get_render_owner_id()
         if not owner_id:
-            # Prompt user to select a workspace
             owner_id = prompt_owner_selection(token)
             if owner_id is None:
                 console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
@@ -691,7 +812,6 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print("[dim]This may take a few minutes.[/dim]")
         console.print()
 
-        # ✅ Pass output_dir to Render deploy
         success, url, service_id = deploy_to_render(
             token=token,
             project_name=project_name,
@@ -710,7 +830,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
                 project_id=service_id,
                 team_id=owner_id,
                 platform="render",
-                env_vars=[],  # TODO: Capture env vars from project
+                env_vars=[],
             )
 
             _show_success(SuccessResult(
@@ -726,7 +846,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Render deployment cancelled.[/yellow]")
-        return  # Don't re-raise; return to menu gracefully
+        return
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
@@ -771,19 +891,7 @@ def _record_deployment_history(
     platform: str,
     env_vars: list[str],
 ) -> None:
-    """
-    Save a successful deployment to local history and show a badge
-    notification if this deployment unlocked one.
-
-    This always runs *after* the deployment has already succeeded, so a
-    problem here (corrupt history file, disk full, no write permission on
-    ~/.opun8, etc.) must never be allowed to reach the user as a failed
-    deployment — their site is live either way. Any failure is reported as
-    a quiet warning and swallowed here, not re-raised.
-
-    Only environment variable *names* are recorded, never values, so no
-    secrets from the deployed project ever end up in the history file.
-    """
+    """Save a successful deployment to local history."""
     try:
         deployment_record = add_deployment(
             project_name=project_name,
@@ -855,9 +963,7 @@ def _show_success(result: SuccessResult) -> None:
 
 
 def _rename_url_flow(result: SuccessResult) -> None:
-    """
-    Guide the user through renaming their deployment URL via Vercel API.
-    """
+    """Guide the user through renaming their deployment URL via Vercel API."""
     console.print()
     console.print("[bold cyan]✏️ Rename Your Deployment[/bold cyan]")
     console.print("[dim]Choose a shorter, cleaner name for your project.[/dim]")
@@ -893,7 +999,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
             console.print("[dim]Skipping rename.[/dim]")
             return
 
-        # Validate the name
         new_name = re.sub(r'[^a-zA-Z0-9-]', '', new_name)
         new_name = new_name.lower().strip('-')
 
@@ -909,7 +1014,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
             console.print("[yellow]⚠️  Same as current name. Skipping rename.[/yellow]")
             return
 
-        # Get token
         token = get_vercel_token()
         if not token:
             console.print("[red]❌ Not connected to Vercel. Please run `opun8 vercel` first.[/red]")
@@ -917,11 +1021,9 @@ def _rename_url_flow(result: SuccessResult) -> None:
 
         team_id = (get_vercel_scope() or {}).get("team_id")
 
-        # ✅ REAL: Attempt the rename directly — no fake "availability check"
         console.print()
         console.print(f"[dim]Attempting rename to [cyan]{new_name}[/cyan]...[/dim]")
 
-        # Confirm with user
         confirm = _safe_confirm(
             f"[bold]Rename to [cyan]{new_name}[/cyan]?[/bold]",
             default=True
@@ -931,7 +1033,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
             console.print("[dim]Skipping rename.[/dim]")
             return
 
-        # Perform the rename
         console.print("[dim]Renaming deployment...[/dim]")
         success, message = rename_vercel_project(token, result.project_id, new_name, team_id)
 
