@@ -3,8 +3,9 @@ Deploy command - Deploy your project to the cloud.
 
 Orchestrates the full deployment flow:
     1. Detect the project
-    2. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
-    3. Deploy and report the result
+    2. Auto-build if needed
+    3. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
+    4. Deploy and report the result
 """
 
 from __future__ import annotations
@@ -31,7 +32,8 @@ from opun8.auth import (
     is_authenticated,
     login_to_github,
 )
-from opun8.core.detector import ProjectDetector
+from opun8.core.detector import detect_project, ProjectInfo
+from opun8.services.build_service import BuildService, get_build_service
 from opun8.services.git_service import GitService
 from opun8.ui import messages as msg
 from opun8.commands.badges import show_badge_notification
@@ -180,7 +182,7 @@ def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
 def deploy(
     platform_arg: Optional[str] = None,
     skip_github: bool = False,
-    detected_project: Optional[Dict[str, Any]] = None,
+    detected_project: Optional[ProjectInfo] = None,
 ) -> None:
     """
     Run the interactive deploy flow.
@@ -206,25 +208,28 @@ def deploy(
             console.print()
             console.print("[bold green]✅ Using previously detected project![/bold green]")
             console.print()
-            # Show a brief summary
-            table = Table(show_header=False, box=None, padding=(0, 2))
-            table.add_column(style="bold white")
-            table.add_column(style="white")
-            fields = (
-                ("Name", "name", "Unknown"),
-                ("Type", "type", "Unknown"),
-                ("Framework", "framework", "Unknown"),
-            )
-            for label, key, default in fields:
-                table.add_row(label, project_info.get(key, default))
-            console.print(table)
-            console.print()
+            _show_project_summary(project_info)
         else:
             project_info = _detect_project()
             if project_info is None:
                 return
 
-        _show_project_summary(project_info)
+        # ──────────────────────────────────────────────────────────
+        # ✅ NEW: Auto-build if needed
+        # ──────────────────────────────────────────────────────────
+        build_service = get_build_service()
+        build_result = build_service.ensure_build()
+
+        if not build_result["built"]:
+            console.print()
+            console.print("[red]❌ Build failed. Please fix build errors and try again.[/red]")
+            console.print(f"[dim]   Error: {build_result.get('message', 'Unknown error')}[/dim]")
+            return
+
+        # Store build info for use in deployment
+        build_info = build_service.get_build_info()
+        project_info.metadata["build_info"] = build_info
+        project_info.metadata["output_dir"] = build_info.get("output_dir", ".")
 
         if skip_github:
             # Caller already asked/decided about GitHub — don't ask again.
@@ -252,7 +257,7 @@ def deploy(
         raise typer.Exit(1)
 
 
-def _show_deploy_menu(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
     """
     Show the deploy menu with options.
     """
@@ -290,7 +295,7 @@ def _show_deploy_menu(project_info: Dict[str, Any], platform_arg: Optional[str] 
             raise typer.Exit()
 
 
-def _deploy_with_github(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+def _deploy_with_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
     """Deploy with GitHub push."""
     repo_url = _handle_github_push(project_info)
     if repo_url is None:
@@ -299,13 +304,13 @@ def _deploy_with_github(project_info: Dict[str, Any], platform_arg: Optional[str
     _continue_deploy(project_info, repo_url, platform_arg)
 
 
-def _deploy_without_github(project_info: Dict[str, Any], platform_arg: Optional[str] = None) -> None:
+def _deploy_without_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
     """Deploy without GitHub push."""
     console.print("[dim]⏭️  Skipping GitHub push.[/dim]")
     _continue_deploy(project_info, None, platform_arg)
 
 
-def _continue_deploy(project_info: Dict[str, Any], repo_url: Optional[str], platform_arg: Optional[str] = None) -> None:
+def _continue_deploy(project_info: ProjectInfo, repo_url: Optional[str], platform_arg: Optional[str] = None) -> None:
     """Continue with deployment after GitHub decision."""
     platform = _ask_platform(default_platform=platform_arg)
     if platform is None:
@@ -338,13 +343,12 @@ def _print_welcome_banner() -> None:
 # PROJECT DETECTION
 # ──────────────────────────────────────────────────────────────
 
-def _detect_project() -> Optional[Dict[str, Any]]:
+def _detect_project() -> Optional[ProjectInfo]:
     """Detect the project type in the current directory."""
     try:
         msg.detection_start()
-        detector = ProjectDetector()
         with msg.scanning_spinner():
-            result = detector.detect()
+            result = detect_project(".")
     except PermissionError:
         msg.error(
             "Permission denied reading this folder.",
@@ -359,14 +363,8 @@ def _detect_project() -> Optional[Dict[str, Any]]:
         )
         return None
 
-    if result.get("error"):
-        msg.error(
-            f"Found a package.json but couldn't read it: {result['error']}",
-            suggestion="Check that package.json is valid JSON.",
-        )
-        return None
-
-    if not result.get("is_detected"):
+    # Check if detection failed
+    if result.framework == "unknown" and not result.is_static:
         msg.no_project_detected()
         console.print("[dim]💡 Run [cyan]opun8 detect[/cyan] to see what I'm looking for.[/dim]")
         return None
@@ -374,7 +372,7 @@ def _detect_project() -> Optional[Dict[str, Any]]:
     return result
 
 
-def _show_project_summary(project_info: Dict[str, Any]) -> None:
+def _show_project_summary(project_info: ProjectInfo) -> None:
     """Print a summary table of the detected project."""
     console.print()
     console.print("[bold green]✅ Project detected![/bold green]")
@@ -384,15 +382,17 @@ def _show_project_summary(project_info: Dict[str, Any]) -> None:
     table.add_column(style="bold white")
     table.add_column(style="white")
 
+    # Use ProjectInfo fields directly
     fields = (
-        ("Name", "name", "Unknown"),
-        ("Type", "type", "Unknown"),
-        ("Framework", "framework", "Unknown"),
-        ("Package Manager", "package_manager", "Unknown"),
-        ("Build Command", "build_command", "Not found"),
+        ("Name", project_info.metadata.get("name", Path.cwd().name)),
+        ("Framework", project_info.framework or "Unknown"),
+        ("Package Manager", project_info.package_manager or "Unknown"),
+        ("Build Command", project_info.build_command or "Not found"),
+        ("Output Directory", project_info.output_dir or "."),
+        ("Needs Build", "✅ Yes" if project_info.needs_build else "❌ No"),
     )
-    for label, key, default in fields:
-        table.add_row(label, project_info.get(key, default))
+    for label, value in fields:
+        table.add_row(label, str(value))
 
     console.print(table)
     console.print()
@@ -410,7 +410,7 @@ def _sanitize_repo_name(name: str) -> str:
     return name
 
 
-def _handle_github_push(project_info: Dict[str, Any]) -> Optional[str]:
+def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
     """Authenticate with GitHub, create a repo, and push the project."""
     try:
         console.print()
@@ -445,7 +445,7 @@ def _handle_github_push(project_info: Dict[str, Any]) -> Optional[str]:
             )
             return None
 
-        default_name = project_info.get("name", Path.cwd().name)
+        default_name = project_info.metadata.get("name", Path.cwd().name)
         console.print()
         console.print(f"[bold]Repository name:[/bold] [cyan]{default_name}[/cyan]")
         console.print("[dim]Spaces will be replaced with hyphens for GitHub compatibility.[/dim]")
@@ -536,12 +536,18 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
 # VERCEL DEPLOYMENT
 # ──────────────────────────────────────────────────────────────
 
-def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str]) -> None:
+def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
     """Authenticate with Vercel and deploy the project."""
     try:
         console.print()
         console.print("[bold cyan]▲ Vercel Deployment[/bold cyan]")
         console.print("[dim]I'll deploy your project to Vercel.[/dim]")
+        console.print()
+
+        # Show build info
+        build_info = project_info.metadata.get("build_info", {})
+        output_dir = project_info.metadata.get("output_dir", ".")
+        console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
         console.print()
 
         if repo_url:
@@ -562,29 +568,31 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
 
         team_id = (get_vercel_scope() or {}).get("team_id")
         project_path = Path.cwd()
+        project_name = project_info.metadata.get("name", project_path.name)
 
         console.print()
         console.print("[bold cyan]☁️  Deploying to Vercel...[/bold cyan]")
         console.print("[dim]This may take a moment.[/dim]")
         console.print()
 
+        # ✅ Pass output_dir to Vercel deploy
         success, url, project_id = deploy_to_vercel(
             token=token,
-            project_name=project_info.get("name", project_path.name),
+            project_name=project_name,
             project_path=project_path,
-            framework=project_info.get("framework"),
+            framework=project_info.framework,
             team_id=team_id,
+            output_dir=output_dir,
         )
 
         if success:
-            project_name = project_info.get("name", project_path.name)
-
             _record_deployment_history(
                 project_name=project_name,
                 url=url,
                 project_id=project_id,
                 team_id=team_id,
                 platform="vercel",
+                env_vars=[],  # TODO: Capture env vars from project
             )
 
             _show_success(SuccessResult(
@@ -600,6 +608,7 @@ def _handle_vercel_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Vercel deployment cancelled.[/yellow]")
+        return  # Don't re-raise; return to menu gracefully
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
@@ -636,12 +645,18 @@ def _ensure_vercel_auth() -> bool:
 # RENDER DEPLOYMENT
 # ──────────────────────────────────────────────────────────────
 
-def _handle_render_deploy(project_info: Dict[str, Any], repo_url: Optional[str]) -> None:
+def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
     """Authenticate with Render and deploy the project."""
     try:
         console.print()
         console.print("[bold cyan]☁️ Render Deployment[/bold cyan]")
         console.print("[dim]I'll deploy your project to Render.[/dim]")
+        console.print()
+
+        # Show build info
+        build_info = project_info.metadata.get("build_info", {})
+        output_dir = project_info.metadata.get("output_dir", ".")
+        console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
         console.print()
 
         if repo_url:
@@ -669,31 +684,33 @@ def _handle_render_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
                 console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
 
         project_path = Path.cwd()
+        project_name = project_info.metadata.get("name", project_path.name)
 
         console.print()
         console.print("[bold cyan]☁️  Deploying to Render...[/bold cyan]")
         console.print("[dim]This may take a few minutes.[/dim]")
         console.print()
 
+        # ✅ Pass output_dir to Render deploy
         success, url, service_id = deploy_to_render(
             token=token,
-            project_name=project_info.get("name", project_path.name),
+            project_name=project_name,
             project_path=project_path,
-            framework=project_info.get("framework"),
+            framework=project_info.framework,
             owner_id=owner_id,
             repo_url=repo_url,
             region="oregon",
+            output_dir=output_dir,
         )
 
         if success:
-            project_name = project_info.get("name", project_path.name)
-
             _record_deployment_history(
                 project_name=project_name,
                 url=url,
                 project_id=service_id,
                 team_id=owner_id,
                 platform="render",
+                env_vars=[],  # TODO: Capture env vars from project
             )
 
             _show_success(SuccessResult(
@@ -709,6 +726,7 @@ def _handle_render_deploy(project_info: Dict[str, Any], repo_url: Optional[str])
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Render deployment cancelled.[/yellow]")
+        return  # Don't re-raise; return to menu gracefully
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
@@ -751,6 +769,7 @@ def _record_deployment_history(
     project_id: Optional[str],
     team_id: Optional[str],
     platform: str,
+    env_vars: list[str],
 ) -> None:
     """
     Save a successful deployment to local history and show a badge
@@ -772,7 +791,7 @@ def _record_deployment_history(
             platform=platform,
             project_id=project_id,
             team_id=team_id,
-            env_vars=[],
+            env_vars=env_vars,
         )
     except Exception as exc:
         console.print(
@@ -890,9 +909,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
             console.print("[yellow]⚠️  Same as current name. Skipping rename.[/yellow]")
             return
 
-        console.print()
-        console.print(f"[dim]Checking availability of [cyan]{new_name}[/cyan]...[/dim]")
-
         # Get token
         token = get_vercel_token()
         if not token:
@@ -901,9 +917,11 @@ def _rename_url_flow(result: SuccessResult) -> None:
 
         team_id = (get_vercel_scope() or {}).get("team_id")
 
-        # Confirm with user
-        console.print(f"[green]✅ Name '[cyan]{new_name}[/cyan]' is available![/green]")
+        # ✅ REAL: Attempt the rename directly — no fake "availability check"
         console.print()
+        console.print(f"[dim]Attempting rename to [cyan]{new_name}[/cyan]...[/dim]")
+
+        # Confirm with user
         confirm = _safe_confirm(
             f"[bold]Rename to [cyan]{new_name}[/cyan]?[/bold]",
             default=True
