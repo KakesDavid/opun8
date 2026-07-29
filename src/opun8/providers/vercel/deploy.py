@@ -35,7 +35,8 @@ from rich.progress import (
     MofNCompleteColumn,
 )
 
-from opun8.services.env_service import prompt_env_files_selection
+# ✅ FIX: Use the new env_service module instead of old functions
+from opun8.services import env_service
 
 console = Console()
 _console_lock = threading.Lock()
@@ -118,6 +119,10 @@ def _is_env_file(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
+# ──────────────────────────────────────────────────────────────
+# PROMPT FOR ENV VARS  ✅ FIXED
+# ──────────────────────────────────────────────────────────────
+
 def prompt_for_env_vars(
     project_path: Path,
     env_targets: Optional[List[str]] = None,
@@ -127,7 +132,11 @@ def prompt_for_env_vars(
     variables, if any, should be uploaded to Vercel as encrypted
     environment variables.
 
-    Uses the centralized env_service for detection and prompting.
+    ✅ FIX: Uses the new env_service.prompt_for_env_vars() which includes:
+        - Source code scanning for env var usage
+        - Framework-specific detection
+        - Interactive selection with checkbox UI
+        - Sensitive value redaction
 
     Args:
         project_path: Path to the project root
@@ -138,18 +147,15 @@ def prompt_for_env_vars(
         Tuple of (selected_env_vars, target_environments)
     """
     if env_targets is None:
-        return prompt_env_files_selection(project_path)
+        return env_service.prompt_for_env_vars(project_path)
     else:
         # Use the provided targets, but still detect env vars
-        from opun8.services.env_service import detect_env_files, parse_env_file, merge_env_vars
-
-        env_files = detect_env_files(project_path)
+        env_files = env_service.detect_env_files(project_path)
         all_vars: Dict[str, str] = {}
         for env_file in env_files:
-            vars_from_file = parse_env_file(env_file)
+            vars_from_file = env_service.load_env_file(env_file)
             if vars_from_file:
-                all_vars = merge_env_vars(all_vars, vars_from_file, prefer="new")
-
+                all_vars = env_service.merge_env_vars(all_vars, vars_from_file, prefer="new")
         return all_vars, env_targets
 
 
@@ -533,6 +539,8 @@ def deploy_to_vercel(
     """
     Deploy a project to Vercel.
 
+    ✅ FIX: Uses new env_service for interactive env var prompting.
+
     If env_vars is left as None, the project directory is scanned for
     .env-style files and the user is interactively prompted about which
     variables (if any) to upload. Pass env_vars={} explicitly to skip
@@ -557,7 +565,7 @@ def deploy_to_vercel(
         _debug_log(f"deploy_to_vercel: project path not found or not a directory: {project_path}")
         return False, f"We couldn't find the project folder: {project_path}", None
 
-    # Detect env vars using the centralized service
+    # ✅ FIX: Detect env vars using the new env_service
     if env_vars is None:
         env_vars, env_targets = prompt_for_env_vars(project_path)
     else:

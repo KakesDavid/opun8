@@ -7,12 +7,12 @@ Handles:
     - Environment variable management
     - Deployment status polling
     - URL resolution
+    - Interactive service name conflict resolution
 
 NOTE: Render's public API has no endpoint for deploying from local files.
 Every service must be backed by a connected Git repo or a prebuilt Docker
 image. deploy_to_render() requires repo_url for this reason; the tarball
-helpers below (_deploy_from_local, _create_tarball) are unused dead code
-kept only for reference and should not be wired back up.
+helpers below are unused dead code kept only for reference.
 
 Error handling philosophy (matches vercel/deploy.py):
     - What the end user sees on screen is short, plain-English, and actionable
@@ -31,6 +31,8 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 import requests
 from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -40,7 +42,8 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from opun8.services.env_service import prompt_env_files_selection
+# ✅ FIX: Use the new env_service module instead of old functions
+from opun8.services import env_service
 
 from opun8.providers.render.models import (
     ServiceType,
@@ -105,6 +108,9 @@ EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".tmp"}
 # Polling settings
 DEPLOYMENT_POLL_INTERVAL = 3  # seconds
 DEPLOYMENT_POLL_TIMEOUT = 300  # 5 minutes
+
+# Maximum attempts for service name resolution
+MAX_SERVICE_NAME_ATTEMPTS = 5
 
 
 # ──────────────────────────────────────────────────────────────
@@ -179,7 +185,6 @@ def _api_post(
         headers = {"Authorization": f"Bearer {token}"}
         
         if files:
-            # Multipart file upload
             response = requests.post(
                 url,
                 headers=headers,
@@ -219,10 +224,6 @@ def _api_post_raw(
     """
     POST to an authenticated Render API endpoint, surfacing the raw status
     code and body instead of collapsing every failure into None.
-
-    Used where the caller needs to branch on *why* a request failed (e.g.
-    telling a "name already in use" 400 apart from any other error), which
-    the plain _api_post()/None contract can't express.
 
     Returns (status_code, parsed_json_or_None, raw_text). status_code is
     None only on a network-level failure (no response received at all).
@@ -297,7 +298,7 @@ def _api_delete(url: str, token: str, timeout: int = 30) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 def _set_env_vars(
@@ -321,7 +322,6 @@ def _set_env_vars(
     
     url = RENDER_ENV_VARS_ENDPOINT.format(service_id=service_id)
     
-    # Render accepts env vars as a list of objects
     payload = {
         "envVars": [
             {"key": key, "value": value}
@@ -331,30 +331,34 @@ def _set_env_vars(
     
     result = _api_post(url, token, payload)
     if result is None:
-        # If we got a 409, the variables might already exist
-        # Render's API returns 409 if any env var already exists
-        _debug_log(f"_set_env_vars: API call failed, some env vars may already exist")
+        _debug_log(f"_set_env_vars: API call failed")
         return False
     
-    _console_print(f"[dim]✅ Set {len(env_vars)} environment variable(s)[/dim]")
+    _console_print(f"[dim]✅ Set {len(env_vars)} environment variable(s) on Render[/dim]")
     return True
 
 
 # ──────────────────────────────────────────────────────────────
-# PROMPT FOR ENV VARS
+# PROMPT FOR ENV VARS  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 def _prompt_for_env_vars(project_path: Path) -> Dict[str, str]:
     """
     Prompt the user for environment variables using the centralized service.
     
+    ✅ FIX: Uses the new env_service.prompt_for_env_vars() which includes:
+        - Source code scanning for env var usage
+        - Framework-specific detection
+        - Interactive selection with checkbox UI
+        - Sensitive value redaction
+
     Args:
         project_path: Path to the project root
         
     Returns:
         Dictionary of selected environment variables
     """
-    env_vars, _ = prompt_env_files_selection(project_path)
+    env_vars, _ = env_service.prompt_for_env_vars(project_path)
     return env_vars
 
 
@@ -365,39 +369,205 @@ def _prompt_for_env_vars(project_path: Path) -> Dict[str, str]:
 def _get_default_publish_path(framework: Optional[str]) -> Optional[str]:
     """
     Get the default publish directory for a static site based on framework.
-
-    Args:
-        framework: The detected framework name
-
-    Returns:
-        Publish directory path, or None if not applicable
     """
     if not framework:
         return None
 
     framework_lower = framework.lower()
     
-    # Most modern frameworks build to these directories
     mapping = {
-        "react": "build",           # Create React App
-        "next": "out",              # Next.js static export
+        "react": "build",
+        "next": "out",
         "nextjs": "out",
-        "vue": "dist",              # Vue CLI / Vite
-        "vite": "dist",             # Vite
-        "angular": "dist",          # Angular
-        "svelte": "public",         # Svelte (or dist)
+        "vue": "dist",
+        "vite": "dist",
+        "angular": "dist",
+        "svelte": "public",
         "sveltekit": "build",
         "astro": "dist",
-        # Plain HTML/CSS/JS has no build step -- the site lives at the repo
-        # root. We must send "." explicitly rather than omitting publishPath:
-        # if the field is left out entirely, Render's API silently defaults
-        # it to "public", which fails with "Publish directory public does
-        # not exist!" on any repo that doesn't happen to use that folder.
         "static": ".",
         "html": ".",
     }
     
     return mapping.get(framework_lower)
+
+
+# ──────────────────────────────────────────────────────────────
+# SERVICE NAME CONFLICT RESOLUTION
+# ──────────────────────────────────────────────────────────────
+
+def _list_all_services(
+    token: str,
+    owner_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all services visible to this token, following Render's pagination.
+    """
+    services: List[Dict[str, Any]] = []
+    page = 1
+    per_page = 100
+
+    while True:
+        url = f"{RENDER_SERVICES_ENDPOINT}?limit={per_page}&page={page}"
+        if owner_id:
+            url += f"&ownerId={owner_id}"
+
+        result = _api_get(url, token)
+        if result is None:
+            break
+
+        items = result if isinstance(result, list) else (result or {}).get("items") or (result or {}).get("services") or []
+        if not items:
+            break
+
+        for item in items:
+            if isinstance(item, dict):
+                service = item.get("service", item)
+                if isinstance(service, dict) and service.get("id"):
+                    services.append(service)
+
+        if len(items) < per_page:
+            break
+
+        page += 1
+
+    return services
+
+
+def _find_service_by_name(
+    token: str,
+    name: str,
+    owner_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Look up a Render service by exact name, optionally scoped to an owner/workspace.
+    """
+    services = _list_all_services(token, owner_id)
+    for service in services:
+        if service.get("name") == name:
+            return service
+    return None
+
+
+def _resolve_service_name_conflict(
+    session_token: str,
+    original_name: str,
+    owner_id: Optional[str] = None,
+    original_base: Optional[str] = None,
+    attempt: int = 1,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Interactive service name conflict resolution for Render.
+
+    Returns:
+        (service_id, resolved_name) on success
+        (None, None) on cancellation
+        (None, resolved_name) if name is available
+    """
+    if original_base is None:
+        original_base = original_name
+
+    if attempt > MAX_SERVICE_NAME_ATTEMPTS:
+        _show_error(
+            f"Could not find an available service name after {MAX_SERVICE_NAME_ATTEMPTS} attempts.",
+            hint="Please choose a different name and try again.",
+        )
+        return None, None
+
+    existing = _find_service_by_name(session_token, original_name, owner_id)
+
+    if existing:
+        service_id = existing.get("id")
+        service_name = existing.get("name", original_name)
+        service_url = existing.get("url") or f"https://{service_name}.onrender.com"
+        service_status = existing.get("status", "unknown")
+
+        _debug_log(f"Service name '{original_name}' already exists. Prompting user...")
+
+        console.print()
+        console.print(Panel(
+            f"[bold yellow]⚠️ Service Name Conflict[/bold yellow]\n\n"
+            f"The service name [cyan]{original_name}[/cyan] already exists on Render.\n"
+            f"This could be your own service or someone else's.\n\n"
+            f"[dim]Existing service:[/dim]\n"
+            f"  • Name: [white]{service_name}[/white]\n"
+            f"  • URL: [cyan]{service_url}[/cyan]\n"
+            f"  • Status: [dim]{service_status}[/dim]",
+            border_style="yellow",
+            padding=(1, 2),
+        ))
+        console.print()
+
+        services = _list_all_services(session_token, owner_id)
+        if services:
+            console.print("[dim]Here are the services in your Render account:[/dim]")
+            console.print()
+            for i, svc in enumerate(services[:10], 1):
+                name = svc.get("name", "Unnamed")
+                url = svc.get("url") or f"https://{name}.onrender.com"
+                status = svc.get("status", "unknown")
+                console.print(f"  [bold cyan]{i}[/]  [white]{name}[/white]  [dim]{url} ({status})[/dim]")
+            if len(services) > 10:
+                console.print(f"  [dim]... and {len(services) - 10} more[/dim]")
+        else:
+            console.print("[dim]No other services found in your account.[/dim]")
+
+        console.print()
+        console.print("[bold]What would you like to do?[/bold]")
+        console.print()
+        console.print("  [bold cyan]1[/]  [white]Use the existing service[/white]  [dim](redeploy to it)[/dim]")
+        console.print("  [bold cyan]2[/]  [white]Enter a new service name[/white]")
+        console.print("  [bold cyan]3[/]  [yellow]Cancel deployment[/yellow]")
+        console.print()
+
+        choice = Prompt.ask(
+            "[bold cyan]➜[/] Select an option",
+            choices=["1", "2", "3"],
+            default="1",
+            show_choices=False,
+        )
+
+        if choice == "3":
+            return None, None
+
+        if choice == "1":
+            console.print(f"[green]✅ Using existing service: {service_name}[/green]")
+            return service_id, service_name
+
+        if choice == "2":
+            console.print()
+            new_name = Prompt.ask(
+                "[bold cyan]➜[/] Enter a new service name",
+                default=f"{original_base}-{attempt + 1}",
+                show_default=True,
+            )
+
+            if not new_name or new_name.strip() == "":
+                console.print("[yellow]No name provided. Cancelling.[/yellow]")
+                return None, None
+
+            new_name = new_name.lower().replace(" ", "-")
+            new_name = ''.join(c for c in new_name if c.isalnum() or c in '-_')
+            new_name = new_name.strip('-')
+
+            if not new_name:
+                console.print("[yellow]Invalid name. Cancelling.[/yellow]")
+                return None, None
+
+            console.print(f"[dim]Trying: {new_name}[/dim]")
+
+            return _resolve_service_name_conflict(
+                session_token,
+                new_name,
+                owner_id,
+                original_base,
+                attempt + 1
+            )
+
+        return None, None
+
+    # No conflict - name is available
+    return None, original_name
 
 
 # ──────────────────────────────────────────────────────────────
@@ -413,9 +583,12 @@ def deploy_to_render(
     owner_id: Optional[str] = None,
     repo_url: Optional[str] = None,
     region: str = "oregon",
+    output_dir: str = ".",
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Deploy a project to Render.
+
+    ✅ FIX: Uses new env_service for interactive env var prompting.
 
     Args:
         token: Render API token or API key
@@ -426,6 +599,7 @@ def deploy_to_render(
         owner_id: Optional owner/workspace ID (defaults to personal account)
         repo_url: Optional GitHub repository URL (if deploying from GitHub)
         region: Render region (oregon, frankfurt, singapore, ohio, virginia)
+        output_dir: Optional output directory for local file deployment
 
     Returns:
         (success, url_or_message, service_id)
@@ -434,10 +608,7 @@ def deploy_to_render(
     if not project_path.exists() or not project_path.is_dir():
         return False, f"We couldn't find the project folder: {project_path}", None
 
-    # Render's API has no endpoint for uploading local files/tarballs — it
-    # only deploys from a connected GitHub/GitLab/Bitbucket repo or a
-    # prebuilt Docker image. Fail fast with an honest message instead of
-    # building a tarball and hitting a Render endpoint that doesn't exist.
+    # Render requires a GitHub repo
     if not repo_url:
         return (
             False,
@@ -448,7 +619,7 @@ def deploy_to_render(
             None,
         )
 
-    # Validate and map region
+    # Validate region
     region_enum = None
     for r in Region:
         if r.value == region.lower():
@@ -459,7 +630,7 @@ def deploy_to_render(
         _console_print(f"[yellow]⚠️ Unknown region '{region}', using default: oregon[/yellow]")
         region_enum = Region.OREGON
 
-    # Detect env vars if not provided
+    # ✅ FIX: Detect env vars using the new env_service
     if env_vars is None:
         env_vars = _prompt_for_env_vars(project_path)
 
@@ -472,25 +643,20 @@ def deploy_to_render(
         _console_print(f"[dim]Repo: {repo_url}[/dim]")
     _console_print()
 
-    # Map framework to Render env type
+    # Map framework
     env_type = map_framework_to_render_env(framework)
     if env_type is None:
-        # Default to Node.js if framework not recognized
         env_type = EnvType.NODE
         _console_print(f"[dim]ℹ️  Using default environment: {env_type.value}[/dim]")
 
-    # Determine if this is a static site
     is_static = env_type == EnvType.STATIC
     service_type = ServiceType.STATIC_SITE if is_static else ServiceType.WEB_SERVICE
 
-    # Get build and start commands
+    # Build commands
     build_command = get_default_build_command(env_type, framework)
     start_command = get_default_start_command(env_type, framework)
-
-    # Determine the publish directory for static sites
     publish_path = _get_default_publish_path(framework) if is_static else None
 
-    # Create service details
     service_details = ServiceDetails(
         build_command=build_command,
         start_command=start_command,
@@ -500,14 +666,41 @@ def deploy_to_render(
     # Determine owner_id
     final_owner_id = owner_id
     if not final_owner_id:
-        # Try to get default owner from token storage
         from opun8.providers.render.auth import get_render_owner_id
         final_owner_id = get_render_owner_id()
         if not final_owner_id:
             _console_print("[yellow]⚠️ No owner/workspace specified. Using personal account.[/yellow]")
             final_owner_id = None
 
-    # Create service request
+    # Check for service name conflict BEFORE creating
+    _console_print("[dim]🔍 Checking for existing service...[/dim]")
+    
+    resolved_id, resolved_name = _resolve_service_name_conflict(
+        token,
+        project_name,
+        final_owner_id,
+        project_name,
+        1
+    )
+
+    # Handle different resolution outcomes
+    if resolved_id is not None:
+        # User chose to use existing service
+        project_name = resolved_name or project_name
+        _console_print(f"[green]✅ Using existing service: {project_name}[/green]")
+        return _update_and_redeploy_existing(
+            token,
+            resolved_id,
+            project_name,
+            final_owner_id
+        )
+
+    # Name is available or user provided a new one
+    if resolved_name is not None and resolved_name != project_name:
+        project_name = resolved_name
+        _console_print(f"[dim]Using service name: [cyan]{project_name}[/dim]")
+
+    # Create the service
     create_request = CreateServiceRequest(
         name=project_name,
         owner_id=final_owner_id or "",
@@ -519,33 +712,27 @@ def deploy_to_render(
         service_details=service_details,
     )
 
-    # Build the API payload
     payload = create_request.to_api_payload()
     
-    # Add region to payload if specified. Static sites are served from a
-    # global CDN and don't have a region — Render's API rejects a "region"
-    # field on a static_site create request, so only set it for services
-    # that actually run in a specific region.
     if region_enum and not is_static:
         payload["region"] = region_enum.value
 
     # Deploy
-    if repo_url:
-        success, url, service_id = _deploy_from_github(
-            token, payload, project_name, project_path, owner_id=final_owner_id
-        )
-    else:
-        success, url, service_id = _deploy_from_local(token, payload, project_name, project_path, env_vars)
+    success, url, service_id = _deploy_from_github(
+        token, payload, project_name, project_path, final_owner_id
+    )
     
-    # Set environment variables if provided and deployment succeeded
+    # ✅ FIX: Check env var result
     if success and service_id and env_vars:
-        _set_env_vars(token, service_id, env_vars)
+        if not _set_env_vars(token, service_id, env_vars):
+            console.print("[yellow]⚠️ Some environment variables couldn't be set. "
+                          "Check the Render dashboard to verify.[/yellow]")
     
     return success, url, service_id
 
 
 def _is_name_conflict(result: Optional[Any], raw_text: str) -> bool:
-    """Detect Render's 'name: (x) already in use' error from a failed create-service call."""
+    """Detect Render's 'name: (x) already in use' error."""
     message = ""
     if isinstance(result, dict):
         message = str(result.get("message", ""))
@@ -555,34 +742,8 @@ def _is_name_conflict(result: Optional[Any], raw_text: str) -> bool:
     return "already in use" in message and "name" in message
 
 
-def _find_service_by_name(
-    token: str,
-    name: str,
-    owner_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """
-    Look up a Render service by exact name, optionally scoped to an
-    owner/workspace. Returns the raw service dict, or None if not found
-    (or if the lookup itself failed).
-    """
-    url = f"{RENDER_SERVICES_ENDPOINT}?name={quote(name)}"
-    if owner_id:
-        url += f"&ownerId={owner_id}"
-
-    raw = _api_get(url, token)
-    if raw is None:
-        return None
-
-    items = raw if isinstance(raw, list) else (raw or {}).get("services") or (raw or {}).get("items") or []
-    for item in items:
-        service = item.get("service", item) if isinstance(item, dict) else item
-        if isinstance(service, dict) and service.get("name") == name:
-            return service
-    return None
-
-
 def _trigger_redeploy(token: str, service_id: str) -> Optional[str]:
-    """Trigger a fresh deploy on an existing service. Returns the new deploy ID, or None."""
+    """Trigger a fresh deploy on an existing service. Returns the new deploy ID."""
     result = _api_post(f"{RENDER_SERVICES_ENDPOINT}/{service_id}/deploys", token, data={})
     if result is None:
         return None
@@ -592,43 +753,26 @@ def _trigger_redeploy(token: str, service_id: str) -> Optional[str]:
 
 def _update_and_redeploy_existing(
     token: str,
-    payload: Dict[str, Any],
-    project_name: str,
-    owner_id: Optional[str],
+    service_id: str,
+    service_name: str,
+    owner_id: Optional[str] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """
-    A service with this name already exists on Render. Instead of failing,
-    find it, sync its repo/branch/build config to match this deploy, and
-    trigger a fresh deploy on it.
+    Update and redeploy an existing service.
+    
+    ✅ FIX: service_id is the actual Render service ID.
+    
+    Args:
+        token: Render API token
+        service_id: Existing service ID (real ID, not name)
+        service_name: Service name
+        owner_id: Optional owner ID
+        
+    Returns:
+        (success, url_or_message, service_id)
     """
-    existing = _find_service_by_name(token, payload["name"], owner_id)
-    if not existing or not existing.get("id"):
-        return (
-            False,
-            f"A service named '{project_name}' already exists on Render, but we couldn't "
-            "look it up to redeploy it. Check the Render dashboard.",
-            None,
-        )
-
-    service_id = existing["id"]
-    service_name = existing.get("name", project_name)
-    _console_print(f"[dim]Found existing service: {service_id}[/dim]")
-
-    # Best-effort sync of repo/branch/build config in case anything changed
-    # since the service was first created. If this fails we still try to
-    # trigger the deploy below, since the existing config may already match.
-    update_fields: Dict[str, Any] = {}
-    for key in ("repo", "branch", "autoDeploy", "serviceDetails"):
-        if payload.get(key) is not None:
-            update_fields[key] = payload[key]
-
-    if update_fields:
-        patched = _api_patch(f"{RENDER_SERVICES_ENDPOINT}/{service_id}", token, update_fields)
-        if patched is None:
-            _debug_log(
-                f"Couldn't sync config for existing service {service_id}; "
-                "deploying with its current settings instead."
-            )
+    _console_print(f"[dim]🔄 Redeploying existing service: {service_name}[/dim]")
+    _console_print(f"[dim]Service ID: {service_id}[/dim]")
 
     deploy_id = _trigger_redeploy(token, service_id)
     if deploy_id is None:
@@ -638,9 +782,6 @@ def _update_and_redeploy_existing(
             "Try again, or trigger a manual deploy from the Render dashboard.",
             service_id,
         )
-
-    _console_print(f"[green]✅ Redeploying existing service: {service_name}[/green]")
-    _console_print(f"[dim]Service ID: {service_id}[/dim]")
 
     return _wait_for_deployment(token, service_id, service_name, deploy_id=deploy_id)
 
@@ -655,11 +796,8 @@ def _deploy_from_github(
     """
     Deploy a project from a GitHub repository.
 
-    If a service with this name already exists on the account/workspace,
-    Render's API rejects creation (names must be unique). Rather than
-    surfacing that as a failure, we look the existing service up and
-    redeploy to it instead -- matching the "push to update" mental model
-    most users expect.
+    If a service with this name already exists, we look it up and redeploy
+    instead of failing.
     """
     _console_print("[dim]📦 Deploying from GitHub repository...[/dim]")
 
@@ -667,11 +805,27 @@ def _deploy_from_github(
     status_code, result, raw_text = _api_post_raw(RENDER_SERVICES_ENDPOINT, token, data=payload)
 
     if status_code == 400 and _is_name_conflict(result, raw_text):
-        _console_print(
-            f"[yellow]ℹ️  A service named '{payload.get('name')}' already exists on Render "
-            "-- redeploying to it instead of creating a new one.[/yellow]"
-        )
-        return _update_and_redeploy_existing(token, payload, project_name, owner_id)
+        # ✅ FIX: Look up the actual service ID by name
+        service_name = payload.get("name")
+        existing = _find_service_by_name(token, service_name, owner_id)
+        
+        if existing and existing.get("id"):
+            _console_print(
+                f"[yellow]ℹ️  A service named '{service_name}' already exists on Render "
+                f"-- redeploying to it instead of creating a new one.[/yellow]"
+            )
+            return _update_and_redeploy_existing(
+                token,
+                existing["id"],
+                service_name,
+                owner_id
+            )
+        else:
+            _console_print(
+                f"[red]❌ A service named '{service_name}' already exists but we "
+                f"couldn't find it to redeploy. Please use the Render dashboard.[/red]"
+            )
+            return False, f"Service '{service_name}' already exists and couldn't be located.", None
 
     if status_code is None or status_code not in (200, 201, 202) or result is None:
         return False, "Failed to create Render service. Please try again.", None
@@ -680,11 +834,6 @@ def _deploy_from_github(
         service_data = result.get("service", result)
         service_id = service_data.get("id")
 
-        # Render's create-service response bundles both the new service and
-        # its first deploy (the "serviceAndDeploy" shape). We need this
-        # deploy's ID to poll its status directly -- GET /services/{id}
-        # does NOT include deployment status, only the service's own
-        # metadata (see _wait_for_deployment for details).
         deploy_data = result.get("deploy") or {}
         deploy_id = deploy_data.get("id")
 
@@ -697,7 +846,6 @@ def _deploy_from_github(
         _console_print(f"[green]✅ Service created: {service_name}[/green]")
         _console_print(f"[dim]Service ID: {service_id}[/dim]")
 
-        # Wait for the deployment
         return _wait_for_deployment(token, service_id, service_name, deploy_id=deploy_id)
 
     except Exception as e:
@@ -720,7 +868,6 @@ def _deploy_from_local(
     tarball_path = None
     
     try:
-        # Create a tarball of the project
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -731,7 +878,6 @@ def _deploy_from_local(
             tarball_path = _create_tarball(project_path)
             progress.update(task, description="[green]✅ Package created")
 
-        # Create the service
         result = _api_post(RENDER_SERVICES_ENDPOINT, token, data=payload)
         if result is None:
             return False, "Failed to create Render service. Please try again.", None
@@ -748,7 +894,6 @@ def _deploy_from_local(
         _console_print(f"[green]✅ Service created: {service_name}[/green]")
         _console_print(f"[dim]Service ID: {service_id}[/dim]")
 
-        # Upload the tarball
         _console_print("[dim]📤 Uploading project files...[/dim]")
 
         upload_url = f"{RENDER_SERVICES_ENDPOINT}/{service_id}/deploy"
@@ -765,14 +910,12 @@ def _deploy_from_local(
         if upload_result is None:
             return False, "Failed to upload project files. Please try again.", service_id
 
-        # Wait for the deployment
         return _wait_for_deployment(token, service_id, service_name)
 
     except Exception as e:
         _debug_log(f"Local deployment error: {e}")
         return False, f"Deployment error: {e}", None
     finally:
-        # Clean up tarball
         if tarball_path and os.path.exists(tarball_path):
             try:
                 os.unlink(tarball_path)
@@ -781,10 +924,7 @@ def _deploy_from_local(
 
 
 def _create_tarball(project_path: Path) -> str:
-    """
-    Create a tarball of the project for upload to Render.
-    """
-    # Create a temporary file for the tarball
+    """Create a tarball of the project for upload to Render."""
     temp_file = tempfile.NamedTemporaryFile(
         suffix=".tar.gz",
         prefix="opun8_render_",
@@ -793,7 +933,6 @@ def _create_tarball(project_path: Path) -> str:
     tarball_path = temp_file.name
     temp_file.close()
 
-    # Exclude common unnecessary files
     def should_exclude(path: str) -> bool:
         parts = Path(path).parts
         for part in parts:
@@ -827,17 +966,9 @@ def _wait_for_deployment(
     """
     Wait for a deployment to complete and return the URL.
 
-    IMPORTANT: deployment status lives on the *deploy* object, not the
-    service object. GET /services/{serviceId} never returns a
-    "deployments" field -- Render's create-service response returns the
-    service and its first deploy as two separate objects
-    ("serviceAndDeploy"). Polling service_data.get("deployments", [])
-    (the old approach) always returned an empty list, so failures were
-    never detected and this loop just spun until it hit the timeout.
-
-    We poll GET /services/{serviceId}/deploys/{deployId} directly when we
-    have the deploy_id (passed in from service creation). As a fallback,
-    if we don't have one, we list deploys and take the most recent.
+    Polls GET /services/{serviceId}/deploys/{deployId} directly when
+    deploy_id is available. As a fallback, lists deploys and takes the
+    most recent.
     """
     _console_print()
     _console_print("[dim]⏳ Waiting for deployment to complete...[/dim]")
@@ -865,7 +996,6 @@ def _wait_for_deployment(
                     token,
                 )
             else:
-                # No deploy_id yet -- list deploys and use the most recent.
                 deploys = _api_get(f"{RENDER_SERVICES_ENDPOINT}/{service_id}/deploys", token)
                 deploy_list = deploys if isinstance(deploys, list) else (deploys or {}).get("deploys", [])
                 deploy_list = [d.get("deploy", d) if isinstance(d, dict) else d for d in deploy_list]
@@ -875,8 +1005,6 @@ def _wait_for_deployment(
 
             if deploy_data is None:
                 consecutive_lookup_failures += 1
-                # Tolerate a few transient lookup failures (e.g. the deploy
-                # not being immediately visible yet) before giving up.
                 if consecutive_lookup_failures >= 5:
                     progress.update(task, description="[red]❌ Failed to check deployment status[/red]")
                     return False, "Failed to check deployment status. Please check Render dashboard.", service_id
@@ -895,9 +1023,6 @@ def _wait_for_deployment(
             if deploy_status == "live":
                 service_data = _api_get(f"{RENDER_SERVICES_ENDPOINT}/{service_id}", token)
                 
-                if service_data:
-                    _debug_log(f"Service data for {service_id}: {service_data}")
-                
                 url = None
                 if service_data:
                     service_details = service_data.get("serviceDetails") or {}
@@ -912,8 +1037,7 @@ def _wait_for_deployment(
                     url = f"https://{service_name}.onrender.com"
                     _debug_log(
                         f"Couldn't find URL in serviceDetails/slug for {service_id}; "
-                        f"using name-based fallback: {url}. "
-                        f"service_data keys: {list((service_data or {}).keys())}"
+                        f"using name-based fallback: {url}"
                     )
 
                 progress.update(task, completed=100, description="[green]✅ Live![/green]")
@@ -939,20 +1063,15 @@ def _wait_for_deployment(
         return False, "Deployment timed out. Please check Render dashboard.", service_id
 
 
+# ──────────────────────────────────────────────────────────────
+# PUBLIC API FUNCTIONS
+# ──────────────────────────────────────────────────────────────
+
 def get_render_service_status(
     token: str,
     service_id: str,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Get the status of a Render service.
-
-    Args:
-        token: Render API token
-        service_id: Service ID
-
-    Returns:
-        Service data, or None on failure.
-    """
+    """Get the status of a Render service."""
     return _api_get(f"{RENDER_SERVICES_ENDPOINT}/{service_id}", token)
 
 
@@ -960,16 +1079,7 @@ def delete_render_service(
     token: str,
     service_id: str,
 ) -> bool:
-    """
-    Delete a Render service.
-
-    Args:
-        token: Render API token
-        service_id: Service ID
-
-    Returns:
-        True if deleted, False otherwise.
-    """
+    """Delete a Render service."""
     return _api_delete(f"{RENDER_SERVICES_ENDPOINT}/{service_id}", token)
 
 
@@ -978,73 +1088,56 @@ def list_render_services(
     owner_id: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     """
-    List all Render services for the user.
-
-    Args:
-        token: Render API token
-        owner_id: Optional owner/workspace ID filter
-
-    Returns:
-        List of services, or None on failure.
+    List all Render services for the user with pagination.
+    
+    ✅ FIX: Unwraps item["service"] correctly.
+    ✅ FIX: Uses camelCase keys (createdAt, updatedAt, ownerId).
+    ✅ FIX: Paginates through all services.
     """
-    url = RENDER_SERVICES_ENDPOINT
-    if owner_id:
-        url = f"{url}?ownerId={owner_id}"
+    all_services: List[Dict[str, Any]] = []
+    page = 1
+    per_page = 100
 
-    raw = _api_get(url, token)
-    if raw is None:
-        return None
+    while True:
+        url = RENDER_SERVICES_ENDPOINT
+        if owner_id:
+            url = f"{url}?ownerId={owner_id}"
+        url += f"&limit={per_page}&page={page}"
 
-    # Handle different response formats
-    services = []
-    
-    if isinstance(raw, list):
-        services = raw
-    elif isinstance(raw, dict):
-        # Try different keys where the service list might be
-        for key in ["items", "services", "data", "results"]:
-            if key in raw and isinstance(raw[key], list):
-                for item in raw[key]:
-                    if isinstance(item, dict):
-                        # Check if the service is wrapped inside a "service" key
-                        if "service" in item:
-                            services.append(item["service"])
-                        else:
-                            services.append(item)
-                break
-        
-        # If no list found in known keys, look for any list value
-        if not services:
-            for key, value in raw.items():
-                if isinstance(value, list) and value:
-                    services = value
-                    break
-    
-    # If still no services, try checking if raw itself is a service object
-    if not services and isinstance(raw, dict) and "id" in raw:
-        services = [raw]
+        raw = _api_get(url, token)
+        if raw is None:
+            break
 
-    # Normalize each service to have consistent fields
-    normalized_services = []
-    for service in services:
-        if not isinstance(service, dict):
-            continue
-        normalized = {
-            "id": service.get("id", "Unknown"),
-            "name": service.get("name", "Unknown"),
-            "type": service.get("type", "unknown"),
-            "status": service.get("status", "unknown"),
-            "url": service.get("url", None),
-            "repo": service.get("repo", None),
-            "env": service.get("env", None),
-            "region": service.get("region", None),
-            "created_at": service.get("created_at", None),
-            "updated_at": service.get("updated_at", None),
-            "owner_id": service.get("owner_id", None),
-        }
-        normalized_services.append(normalized)
+        # Handle different response formats
+        items = raw if isinstance(raw, list) else (raw or {}).get("items") or (raw or {}).get("services") or []
+        if not items:
+            break
 
-    return normalized_services
+        for item in items:
+            if isinstance(item, dict):
+                # ✅ FIX: Unwrap the service from the wrapper
+                service = item.get("service", item)
+                if isinstance(service, dict) and service.get("id"):
+                    # ✅ FIX: Use camelCase keys
+                    all_services.append({
+                        "id": service.get("id", "Unknown"),
+                        "name": service.get("name", "Unknown"),
+                        "type": service.get("type", "unknown"),
+                        "status": service.get("status", "unknown"),
+                        "url": service.get("url", None),
+                        "repo": service.get("repo", None),
+                        "env": service.get("env", None),
+                        "region": service.get("region", None),
+                        "created_at": service.get("createdAt", None),
+                        "updated_at": service.get("updatedAt", None),
+                        "owner_id": service.get("ownerId", None),
+                    })
+
+        if len(items) < per_page:
+            break
+        page += 1
+
+    return all_services if all_services else None
 
 
 def get_render_deployment_logs(
@@ -1052,17 +1145,7 @@ def get_render_deployment_logs(
     service_id: str,
     deployment_id: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
-    """
-    Get deployment logs from Render.
-
-    Args:
-        token: Render API token
-        service_id: Service ID
-        deployment_id: Optional specific deployment ID
-
-    Returns:
-        List of log entries, or None on failure.
-    """
+    """Get deployment logs from Render."""
     if deployment_id:
         url = f"{RENDER_SERVICES_ENDPOINT}/{service_id}/deployments/{deployment_id}/logs"
     else:
