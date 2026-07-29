@@ -7,7 +7,7 @@ This is the main entry point for the OPUN8 CLI. It provides commands for:
     - Deployment (deploy to Vercel, Render, Netlify)
     - Account management (upgrade, status, history)
     - GitHub integration (connect, list repos, deploy from repo)
-    - Provider management (Vercel, Render)
+    - Provider management (Vercel, Render, Netlify)
 
 Author: OPUN8 Team
 Version: 0.1.4
@@ -46,6 +46,16 @@ from opun8.providers.render.auth import (
     prompt_owner_selection,
 )
 from opun8.providers.render.deploy import list_render_services
+
+# ✅ NEW: Netlify imports
+from opun8.providers.netlify.auth import (
+    login_to_netlify,
+    is_netlify_authenticated,
+    logout_netlify,
+    netlify_auth_command,
+    show_netlify_sites,
+    set_deploy_callback as set_netlify_deploy_callback,
+)
 
 # =============================================================================
 # NEW IMPORTS FOR AUTHENTICATION & UPGRADE
@@ -366,7 +376,7 @@ def _deploy_repository_from_github() -> None:
         console.print("[bold]Which platform would you like to deploy to?[/bold]")
         console.print()
         console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
-        console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Coming soon)[/dim]")
+        console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Great for static sites and frontend)[/dim]")
         console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
         console.print()
         
@@ -380,11 +390,12 @@ def _deploy_repository_from_github() -> None:
         if platform_choice == "1":
             from opun8.commands.repo import deploy_repository
             deploy_repository(clone_url, repo_name, platform="vercel")
+        elif platform_choice == "2":
+            from opun8.commands.repo import deploy_repository
+            deploy_repository(clone_url, repo_name, platform="netlify")
         elif platform_choice == "3":
             from opun8.commands.repo import deploy_repository
             deploy_repository(clone_url, repo_name, platform="render")
-        elif platform_choice == "2":
-            console.print("[yellow]⚠️ Netlify support coming soon![/yellow]")
         else:
             console.print("[yellow]Invalid platform selection.[/yellow]")
             
@@ -598,6 +609,61 @@ def _show_render_services() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# NETLIFY COMMANDS  ✅ NEW
+# ──────────────────────────────────────────────────────────────
+
+@app.command()
+def netlify(
+    logout_flag: bool = typer.Option(
+        False,
+        "--logout",
+        "-l",
+        help="Logout from Netlify.",
+    ),
+    show_flag: bool = typer.Option(
+        False,
+        "--show",
+        help="Show sites without re-authenticating.",
+    ),
+):
+    """Connect to Netlify account."""
+    if logout_flag:
+        logout_netlify()
+        return
+
+    if show_flag:
+        from opun8.commands.deploy import deploy as deploy_cmd
+        set_netlify_deploy_callback(deploy_cmd)
+        show_netlify_sites()
+        return
+
+    if is_netlify_authenticated():
+        console.print("[green]✅ Already connected to Netlify.[/green]")
+        console.print("[dim]To disconnect, run: opun8 netlify --logout[/dim]")
+        console.print()
+        from opun8.commands.deploy import deploy as deploy_cmd
+        set_netlify_deploy_callback(deploy_cmd)
+        show_netlify_sites()
+        return
+
+    console.print()
+    console.print("[bold cyan]📦 Connect to Netlify[/bold cyan]")
+    console.print("[dim]This will allow Opun8 to deploy sites to Netlify.[/dim]")
+    console.print()
+
+    from opun8.commands.deploy import deploy as deploy_cmd
+    set_netlify_deploy_callback(deploy_cmd)
+
+    token = login_to_netlify()
+
+    if token:
+        console.print("[green]✅ Connected to Netlify successfully![/green]")
+        console.print("[dim]Run [cyan]opun8 netlify[/cyan] again to see your sites.[/dim]")
+    else:
+        console.print("[red]❌ Connection failed.[/red]")
+
+
+# ──────────────────────────────────────────────────────────────
 # LOGOUT
 # ──────────────────────────────────────────────────────────────
 
@@ -607,6 +673,7 @@ def logout_all():
     logout_github()
     logout_vercel()
     logout_render()
+    logout_netlify()
     console.print("[green]✅ Logged out from all services.[/green]")
 
 
