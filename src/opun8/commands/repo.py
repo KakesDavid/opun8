@@ -4,11 +4,12 @@ Repository deployment - Deploy GitHub repositories directly.
 This module handles:
     - Cloning a GitHub repository to a temporary directory (for Vercel)
     - Detecting the project type
-    - Deploying to the selected platform (Vercel, Render)
+    - Deploying to the selected platform (Vercel, Render, Netlify)
     - Cleaning up temporary files
 
 For Render: we deploy directly from the GitHub URL without cloning.
 For Vercel: we clone the repo and upload local files.
+For Netlify: we clone the repo and upload local files.
 """
 
 import logging
@@ -51,14 +52,24 @@ from opun8.providers.render.auth import (
 )
 from opun8.providers.render.deploy import deploy_to_render
 
+# Netlify imports
+from opun8.providers.netlify.auth import (
+    get_netlify_token,
+    is_netlify_authenticated,
+    login_to_netlify,
+)
+from opun8.providers.netlify.deploy import deploy_to_netlify
+
 console = Console()
 logger = logging.getLogger(__name__)
 
 PANEL_WIDTH = 60
 
 # Platforms that are fully implemented
-LIVE_PLATFORMS = {"vercel", "render"}
-UPCOMING_PLATFORMS = {"netlify"}
+LIVE_PLATFORMS = {"vercel", "render", "netlify"}
+
+# Upcoming platforms (empty set)
+UPCOMING_PLATFORMS = set()
 
 DeployStatus = Literal["success", "unsupported", "failed"]
 
@@ -74,6 +85,7 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
     """
     project_path: Optional[Path] = None
     status: Optional[DeployStatus] = None
+    project_info: Optional[ProjectInfo] = None
 
     try:
         console.print()
@@ -87,52 +99,36 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
         ))
         console.print()
 
-        # For Render: skip cloning, deploy directly from GitHub
+        # Step 1: Clone the repository (needed for all platforms)
+        console.print("[bold]Step 1: Cloning repository[/bold]")
+        console.print(f"[dim]Cloning from: {repo_url}[/dim]\n")
+
+        project_path = _clone_repository(repo_url, repo_name)
+        if project_path is None:
+            msg.error("Failed to clone repository.", suggestion="Check the URL and your internet connection.")
+            return
+
+        console.print(f"[green]✅ Cloned to: {project_path}[/green]\n")
+
+        # Step 2: Detect project type
+        console.print("[bold]Step 2: Detecting project type[/bold]\n")
+        project_info = _detect_project(project_path)
+        if project_info is None:
+            msg.error("Could not detect project type.", suggestion="Make sure the repository contains a valid project.")
+            return
+
+        _show_project_summary(project_info)
+        console.print()
+
+        # Step 3: Deploy
         if platform == "render":
-            console.print("[bold]Step 1: Detecting project type from GitHub[/bold]\n")
-            
-            # We need to clone temporarily just to detect the project type
-            console.print("[dim]Cloning temporarily for detection...[/dim]")
-            project_path = _clone_repository(repo_url, repo_name)
-            if project_path is None:
-                msg.error("Failed to clone repository for detection.", suggestion="Check the URL and your internet connection.")
-                return
-
-            console.print(f"[green]✅ Cloned to: {project_path}[/green]\n")
-
-            console.print("[bold]Step 2: Detecting project type[/bold]\n")
-            project_info = _detect_project(project_path)
-            if project_info is None:
-                msg.error("Could not detect project type.", suggestion="Make sure the repository contains a valid project.")
-                return
-
-            _show_project_summary(project_info)
-            console.print()
-
-            # Deploy directly from GitHub (no local files)
-            status = _run_render_deployment_from_github(repo_url, repo_name, project_info)
-
+            # Render deploys directly from GitHub URL (no local files)
+            # But we still pass the cloned path for detection and env vars
+            status = _run_render_deployment_from_github(
+                repo_url, repo_name, project_info, project_path
+            )
         else:
-            # For Vercel and others: clone and deploy from local files
-            console.print("[bold]Step 1: Cloning repository[/bold]")
-            console.print(f"[dim]Cloning from: {repo_url}[/dim]\n")
-
-            project_path = _clone_repository(repo_url, repo_name)
-            if project_path is None:
-                msg.error("Failed to clone repository.", suggestion="Check the URL and your internet connection.")
-                return
-
-            console.print(f"[green]✅ Cloned to: {project_path}[/green]\n")
-
-            console.print("[bold]Step 2: Detecting project type[/bold]\n")
-            project_info = _detect_project(project_path)
-            if project_info is None:
-                msg.error("Could not detect project type.", suggestion="Make sure the repository contains a valid project.")
-                return
-
-            _show_project_summary(project_info)
-            console.print()
-
+            # Vercel and Netlify deploy from local files
             status = _run_deployment(platform, project_info, project_path, repo_name)
 
     except KeyboardInterrupt:
@@ -176,6 +172,8 @@ def _run_deployment(
 
     if platform == "vercel":
         success = _deploy_to_vercel(project_info, project_path, repo_name)
+    elif platform == "netlify":
+        success = _deploy_to_netlify(project_info, project_path, repo_name)
     else:
         success = False
 
@@ -186,6 +184,7 @@ def _run_render_deployment_from_github(
     repo_url: str,
     repo_name: str,
     project_info: ProjectInfo,
+    project_path: Path,
 ) -> DeployStatus:
     """Deploy a GitHub repository directly to Render (no local files)."""
     try:
@@ -210,31 +209,41 @@ def _run_render_deployment_from_github(
             if owner_id is None:
                 console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
 
+        # ✅ Load environment variables from the cloned repo
+        env_vars = _load_env_vars(project_path)
+        if env_vars:
+            console.print(f"[dim]📄 Loaded {len(env_vars)} environment variables for Render.[/dim]")
+        else:
+            console.print("[dim]ℹ️ No .env file found. Render env vars can be set in the dashboard.[/dim]")
+
         console.print()
         console.print("[bold]Step 3: Deploying to Render from GitHub[/bold]")
         console.print("[dim]☁️ This may take a few minutes.[/dim]\n")
 
+        # ✅ Pass env_vars to deploy_to_render
         success, url, service_id = deploy_to_render(
             token=token,
             project_name=repo_name,
-            project_path=Path.cwd(),
+            project_path=project_path,
             framework=project_info.framework,
             owner_id=owner_id,
             repo_url=repo_url,
             region="oregon",
+            output_dir=project_info.output_dir or ".",
+            env_vars=env_vars,
         )
 
         if success:
             if not url:
                 url = f"https://{repo_name}.onrender.com"
                 _debug_log(f"URL was None, using constructed URL: {url}")
-            
-            deployment_record = _record_deployment_history(
+
+            _record_deployment_history(
                 project_name=repo_name,
                 url=url,
                 project_id=service_id,
                 team_id=owner_id,
-                env_vars=[],
+                env_vars=list(env_vars.keys()) if env_vars else [],
                 platform="render",
             )
 
@@ -325,7 +334,6 @@ def _detect_project(project_path: Path) -> Optional[ProjectInfo]:
     finally:
         os.chdir(original_cwd)
 
-    # Check if detection was successful
     if result.framework == "unknown" and not result.is_static:
         return None
 
@@ -385,7 +393,6 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
             framework=project_info.framework,
             env_vars=env_vars,
             team_id=team_id,
-            output_dir=project_info.output_dir,
         )
 
         if not success:
@@ -394,7 +401,12 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
             console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
             return False
 
-        deployment_record = _record_deployment_history(
+        # ✅ Handle None URL
+        if not url:
+            url = f"https://{repo_name}.vercel.app"
+            _debug_log(f"URL was None, using constructed URL: {url}")
+
+        _record_deployment_history(
             project_name=repo_name,
             url=url,
             project_id=project_id,
@@ -432,11 +444,99 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
 
 
 # ──────────────────────────────────────────────────────────────
+# NETLIFY DEPLOYMENT
+# ──────────────────────────────────────────────────────────────
+
+def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
+    """Deploy the project to Netlify and record the result in deployment history."""
+    try:
+        if not is_netlify_authenticated():
+            console.print("[yellow]You're not connected to Netlify yet.[/yellow]")
+            login_to_netlify()
+            if not is_netlify_authenticated():
+                msg.error(
+                    "Netlify authentication failed.",
+                    suggestion="Run `opun8 netlify` to connect manually.",
+                )
+                return False
+
+        token = get_netlify_token()
+        if not token:
+            msg.error("No Netlify token found.", suggestion="Run `opun8 netlify` to connect.")
+            return False
+
+        env_vars = _load_env_vars(project_path)
+
+        console.print("[dim]☁️ Deploying to Netlify...[/dim]")
+        console.print("[dim]This may take a moment.[/dim]\n")
+
+        success, url, site_id = deploy_to_netlify(
+            token=token,
+            site_name=repo_name,
+            project_path=project_path,
+            env_vars=env_vars,
+        )
+
+        if not success:
+            error_msg = str(url) if url else "Unknown error"
+            error_msg = error_msg.replace("[", "(").replace("]", ")")
+            console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
+            return False
+
+        # ✅ Handle None URL
+        if not url:
+            url = f"https://{repo_name}.netlify.app"
+            _debug_log(f"URL was None, using constructed URL: {url}")
+
+        _record_deployment_history(
+            project_name=repo_name,
+            url=url,
+            project_id=site_id,
+            team_id=None,
+            env_vars=list(env_vars.keys()),
+            platform="netlify",
+        )
+
+        live_url = url if url.startswith("http") else f"https://{url}"
+
+        console.print()
+        console.print(Panel(
+            f"[bold green]✅ Deployment successful![/bold green]\n\n"
+            f"[bold]🌐 {live_url}[/bold]\n\n"
+            f"[dim]Your repository '{repo_name}' is now live on Netlify.[/dim]",
+            border_style="green",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
+        console.print()
+
+        try:
+            if Confirm.ask("[bold]Open the website?[/bold]", default=True):
+                webbrowser.open(live_url)
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]⚠️ Skipped opening website.[/yellow]")
+
+        return True
+
+    except Exception as exc:
+        logger.exception("Error deploying %s to Netlify", repo_name)
+        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        console.print(f"[red]❌ Netlify deployment error: {error_msg}[/red]")
+        return False
+
+
+# ──────────────────────────────────────────────────────────────
 # ENVIRONMENT VARIABLES
 # ──────────────────────────────────────────────────────────────
 
 def _load_env_vars(project_path: Path) -> Dict[str, str]:
-    """Load environment variables from a .env file if one exists."""
+    """
+    Load environment variables from a .env file if one exists.
+
+    Note: For Render deployments, .env variables are loaded and passed to
+    the deploy function, but you may still need to configure them in the
+    Render dashboard for full functionality.
+    """
     env_file = project_path / ".env"
     env_vars: Dict[str, str] = {}
 
@@ -475,7 +575,7 @@ def _record_deployment_history(
 ) -> Optional[Dict[str, Any]]:
     """
     Save deployment to history and show badge notification if unlocked.
-    
+
     Returns:
         The deployment record, or None if saving failed.
     """

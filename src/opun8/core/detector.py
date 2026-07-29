@@ -14,6 +14,7 @@ Supports:
     - Python (Flask, Django, FastAPI)
     - Static HTML
     - Node.js
+    - Netlify (detects netlify.toml)  ✅ NEW
 
 Usage:
     from opun8.core.detector import detect_project
@@ -24,7 +25,7 @@ Usage:
     print(project.output_dir)
 
 Author: OPUN8 Team
-Version: 0.1.4
+Version: 0.1.5
 """
 
 import os
@@ -52,6 +53,7 @@ class ProjectInfo:
         package_manager: Detected package manager (npm, yarn, pnpm)
         is_static: Whether the project is static HTML
         needs_build: Whether the project needs to be built
+        deploy_target: Suggested deployment platform (vercel, netlify, render)
         metadata: Additional metadata for extensibility
     """
     framework: str = "unknown"
@@ -62,6 +64,7 @@ class ProjectInfo:
     package_manager: str = "npm"
     is_static: bool = False
     needs_build: bool = False
+    deploy_target: Optional[str] = None  # ✅ NEW: Suggested platform
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -82,6 +85,7 @@ class ProjectInfo:
             self.output_dir = self.output_dir or "build"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} start"
+            self.deploy_target = "vercel"
 
         # Next.js
         elif framework == "nextjs":
@@ -89,6 +93,7 @@ class ProjectInfo:
             self.output_dir = self.output_dir or ".next"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} run dev"
+            self.deploy_target = "vercel"
 
         # Vite
         elif framework == "vite":
@@ -96,6 +101,7 @@ class ProjectInfo:
             self.output_dir = self.output_dir or "dist"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} run dev"
+            self.deploy_target = "vercel"
 
         # Vue CLI
         elif framework == "vue":
@@ -103,6 +109,7 @@ class ProjectInfo:
             self.output_dir = self.output_dir or "dist"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} run serve"
+            self.deploy_target = "vercel"
 
         # Angular
         elif framework == "angular":
@@ -110,6 +117,7 @@ class ProjectInfo:
             self.output_dir = self.output_dir or "dist"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} run start"
+            self.deploy_target = "vercel"
 
         # SvelteKit
         elif framework == "sveltekit":
@@ -117,48 +125,63 @@ class ProjectInfo:
             self.output_dir = self.output_dir or "build"
             self.build_command = self.build_command or f"{self.package_manager} run build"
             self.dev_command = self.dev_command or f"{self.package_manager} run dev"
+            self.deploy_target = "vercel"
 
         # Node.js (Express, Fastify, Koa, etc.)
         elif framework == "nodejs":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.dev_command = self.dev_command or f"{self.package_manager} run dev"
+            self.deploy_target = "render"
 
         # Django
         elif framework == "django":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = False
+            self.deploy_target = "render"
 
         # Flask
         elif framework == "flask":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = False
+            self.deploy_target = "render"
 
         # FastAPI
         elif framework == "fastapi":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = False
+            self.deploy_target = "render"
 
         # Python (generic fallback)
         elif framework == "python":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = False
+            self.deploy_target = "render"
 
         # Static HTML
         elif framework == "static":
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = True
+            self.deploy_target = "netlify"  # ✅ NEW: Static sites → Netlify
+
+        # Netlify-specific detection (already set)
+        elif framework == "netlify":
+            self.needs_build = False
+            self.output_dir = self.output_dir or "."
+            self.is_static = True
+            self.deploy_target = "netlify"
 
         # Unknown — treat as static
         else:
             self.needs_build = False
             self.output_dir = self.output_dir or "."
             self.is_static = True
+            self.deploy_target = "netlify"
 
 
 # =============================================================================
@@ -184,6 +207,10 @@ def detect_project(project_path: str = ".") -> ProjectInfo:
     """
     path = Path(project_path)
 
+    # ✅ NEW: Check for Netlify configuration first
+    if _has_netlify_config(path):
+        return _detect_netlify_project(path)
+
     # Check for package.json
     package_json_path = path / "package.json"
     if package_json_path.exists():
@@ -204,6 +231,111 @@ def detect_project(project_path: str = ".") -> ProjectInfo:
 
     # Unknown project
     return ProjectInfo(framework="unknown", needs_build=False, output_dir=".")
+
+
+# =============================================================================
+# NETLIFY DETECTION  ✅ NEW
+# =============================================================================
+
+def _has_netlify_config(path: Path) -> bool:
+    """
+    Check if the project has Netlify configuration.
+    """
+    # Check for netlify.toml
+    if (path / "netlify.toml").exists():
+        return True
+    
+    # Check for .netlify directory (created by Netlify CLI)
+    if (path / ".netlify").exists():
+        return True
+    
+    return False
+
+
+def _detect_netlify_project(path: Path) -> ProjectInfo:
+    """
+    Detect the project type from Netlify configuration.
+    """
+    # Check for netlify.toml
+    netlify_toml = path / "netlify.toml"
+    if netlify_toml.exists():
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            try:
+                import tomli as tomllib  # Python < 3.11
+            except ImportError:
+                tomllib = None
+        
+        if tomllib:
+            try:
+                with open(netlify_toml, "rb") as f:
+                    config = tomllib.load(f)
+                
+                # Extract build settings
+                build_config = config.get("build", {})
+                output_dir = build_config.get("publish", "dist")
+                build_command = build_config.get("command")
+                
+                # Detect framework from netlify.toml or fall back to package.json
+                framework = "netlify"
+                
+                # Check for function directory (indicates serverless)
+                functions = config.get("functions", {})
+                has_functions = bool(functions.get("directory"))
+                
+                # Check if there's a package.json to detect the actual framework
+                package_json_path = path / "package.json"
+                if package_json_path.exists():
+                    try:
+                        with open(package_json_path) as f:
+                            package_data = json.load(f)
+                            deps = {**package_data.get("dependencies", {}), **package_data.get("devDependencies", {})}
+                            if "next" in deps:
+                                framework = "nextjs"
+                            elif "react-scripts" in deps:
+                                framework = "react"
+                            elif "vite" in deps:
+                                framework = "vite"
+                            elif "@vue/cli-service" in deps:
+                                framework = "vue"
+                            elif "@angular/cli" in deps:
+                                framework = "angular"
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                
+                return ProjectInfo(
+                    framework=framework,
+                    build_command=build_command or f"{_detect_package_manager(path)} run build",
+                    output_dir=output_dir,
+                    package_manager=_detect_package_manager(path),
+                    needs_build=bool(build_command),
+                    is_static=not has_functions,
+                    deploy_target="netlify",
+                    metadata={"netlify_config": config},
+                )
+            except Exception as e:
+                # Fall back to package.json detection if netlify.toml parsing fails
+                pass
+
+    # If no netlify.toml or parsing failed, check if it's a static site
+    if _has_static_html(path):
+        return ProjectInfo(
+            framework="static",
+            is_static=True,
+            needs_build=False,
+            output_dir=".",
+            deploy_target="netlify",
+        )
+    
+    # Default to static with Netlify recommendation
+    return ProjectInfo(
+        framework="static",
+        is_static=True,
+        needs_build=False,
+        output_dir=".",
+        deploy_target="netlify",
+    )
 
 
 def _detect_from_package_json(package_data: Dict[str, Any], path: Path) -> ProjectInfo:
@@ -252,7 +384,6 @@ def _detect_from_package_json(package_data: Dict[str, Any], path: Path) -> Proje
     if framework is None:
         scripts = package_data.get("scripts", {})
         if "build" in scripts:
-            # Has a build script but no detected framework
             build_script = scripts.get("build", "")
             if "vite" in build_script:
                 framework = "vite"
@@ -260,8 +391,11 @@ def _detect_from_package_json(package_data: Dict[str, Any], path: Path) -> Proje
                 framework = "nodejs"
 
     if framework is None:
-        # Default to Node.js for any package.json project
-        framework = "nodejs"
+        # Check if it's a Netlify project by looking for netlify.toml
+        if (path / "netlify.toml").exists():
+            framework = "netlify"
+        else:
+            framework = "nodejs"
 
     return ProjectInfo(
         framework=framework,
@@ -390,7 +524,26 @@ def get_deploy_config(project: ProjectInfo) -> Dict[str, Any]:
         "is_static": project.is_static,
         "package_manager": project.package_manager,
         "build_command": project.build_command,
+        "deploy_target": project.deploy_target,
     }
+
+
+def get_recommended_platform(project: ProjectInfo) -> Optional[str]:
+    """
+    Get the recommended deployment platform for a project.
+
+    Args:
+        project: ProjectInfo object
+
+    Returns:
+        Recommended platform (vercel, netlify, render) or None
+
+    Example:
+        >>> project = detect_project(".")
+        >>> get_recommended_platform(project)
+        "vercel"
+    """
+    return project.deploy_target
 
 
 # =============================================================================
@@ -402,4 +555,5 @@ __all__ = [
     "detect_project",
     "get_build_commands",
     "get_deploy_config",
+    "get_recommended_platform",
 ]

@@ -7,22 +7,30 @@ Orchestrates the full deployment flow:
     3. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
     4. Show cost estimate
     5. Deploy and report the result
+
+Supported Platforms:
+    - Vercel (Frontend, Next.js, React, etc.)
+    - Netlify (Static sites, JAMstack)
+    - Render (Full-stack, Python, Node.js)
+
+Author: OPUN8 Team
+Version: 0.1.5
 """
 
 from __future__ import annotations
 
 import datetime
 import os
+import re
 import traceback
 import webbrowser
-import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional, Tuple
 
-import typer
 import requests
+import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -34,36 +42,49 @@ from opun8.auth import (
     is_authenticated,
     login_to_github,
 )
-from opun8.core.detector import detect_project, ProjectInfo
-from opun8.services.build_service import BuildService, get_build_service
-from opun8.services.git_service import GitService
-from opun8.services.cost_estimator import get_cost_estimator
-from opun8.ui.cost_display import display_cost_estimate, display_savings_tip
-from opun8.ui import messages as msg
 from opun8.commands.badges import show_badge_notification
+from opun8.core.detector import ProjectInfo, detect_project
+from opun8.services.build_service import get_build_service
+from opun8.services.cost_estimator import get_cost_estimator
 from opun8.services.deployment_history import add_deployment
+from opun8.services.git_service import GitService
+from opun8.ui import messages as msg
+from opun8.ui.cost_display import display_cost_estimate, display_savings_tip
 
-# Vercel imports
+# =============================================================================
+# PROVIDER IMPORTS
+# =============================================================================
+
+# Vercel
 from opun8.providers.vercel.auth import (
     get_vercel_scope,
     get_vercel_token,
     is_vercel_authenticated,
     login_to_vercel,
 )
-from opun8.providers.vercel.deploy import (
-    deploy_to_vercel,
-    rename_vercel_project,
-)
+from opun8.providers.vercel.deploy import deploy_to_vercel, rename_vercel_project
 
-# Render imports
+# Render
 from opun8.providers.render.auth import (
-    get_render_token,
     get_render_owner_id,
+    get_render_token,
     is_render_authenticated,
     login_to_render,
     prompt_owner_selection,
 )
 from opun8.providers.render.deploy import deploy_to_render
+
+# Netlify
+from opun8.providers.netlify.auth import (
+    get_netlify_token,
+    is_netlify_authenticated,
+    login_to_netlify,
+)
+from opun8.providers.netlify.deploy import deploy_to_netlify
+
+# =============================================================================
+# CLIPBOARD SUPPORT
+# =============================================================================
 
 try:
     import pyperclip
@@ -71,30 +92,21 @@ try:
 except ImportError:
     HAS_CLIPBOARD = False
 
+# =============================================================================
+# CONSTANTS
+# =============================================================================
 
 console = Console()
-
 PANEL_WIDTH = 60
-
 DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
 
 
-def _log_debug_exception(context: str, exc: Exception) -> None:
-    """Log debug exception to file."""
-    try:
-        DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] {context}\n")
-            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-            f.write("\n")
-    except Exception:
-        pass
-    if os.environ.get("OPUN8_DEBUG"):
-        console.print_exception()
-
+# =============================================================================
+# PLATFORM DEFINITIONS
+# =============================================================================
 
 class Platform(str, Enum):
+    """Supported deployment platforms."""
     VERCEL = "vercel"
     NETLIFY = "netlify"
     RENDER = "render"
@@ -106,20 +118,46 @@ PLATFORM_CHOICES: Dict[str, Platform] = {
     "3": Platform.RENDER,
 }
 
-IMPLEMENTED_PLATFORMS = {Platform.VERCEL, Platform.RENDER}
+IMPLEMENTED_PLATFORMS = {Platform.VERCEL, Platform.NETLIFY, Platform.RENDER}
 
 
 @dataclass
 class SuccessResult:
-    """Result of a successful deployment, ready for display."""
+    """Result of a successful deployment."""
     url: str
     project_name: str
     project_id: Optional[str] = None
 
 
-# ──────────────────────────────────────────────────────────────
-# HELPER: Safe prompt that handles Ctrl+C / Ctrl+Z
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
+# DEBUG LOGGING
+# =============================================================================
+
+def _log_debug_exception(context: str, exc: Exception) -> None:
+    """
+    Log exception details to debug file.
+
+    Args:
+        context: Description of where the error occurred
+        exc: The exception to log
+    """
+    try:
+        DEBUG_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {context}\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            f.write("\n")
+    except Exception:
+        pass
+
+    if os.environ.get("OPUN8_DEBUG"):
+        console.print_exception()
+
+
+# =============================================================================
+# SAFE PROMPT HELPERS
+# =============================================================================
 
 def _safe_prompt(
     message: str,
@@ -127,7 +165,18 @@ def _safe_prompt(
     default: str = "1",
     show_choices: bool = False,
 ) -> Optional[str]:
-    """Prompt with graceful handling of Ctrl+C and Ctrl+Z."""
+    """
+    Prompt user with graceful handling of Ctrl+C and Ctrl+Z.
+
+    Args:
+        message: The prompt message
+        choices: Optional list of valid choices
+        default: Default choice
+        show_choices: Whether to show choices in prompt
+
+    Returns:
+        User's choice, or None if cancelled
+    """
     try:
         if choices:
             return Prompt.ask(
@@ -136,15 +185,23 @@ def _safe_prompt(
                 default=default,
                 show_choices=show_choices,
             )
-        else:
-            return Prompt.ask(message, default=default)
+        return Prompt.ask(message, default=default)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
         return None
 
 
 def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
-    """Confirm with graceful handling of Ctrl+C and Ctrl+Z."""
+    """
+    Confirm with user, handling Ctrl+C and Ctrl+Z.
+
+    Args:
+        message: The confirmation message
+        default: Default response
+
+    Returns:
+        User's choice, or None if cancelled
+    """
     try:
         from rich.prompt import Confirm
         return Confirm.ask(message, default=default)
@@ -153,24 +210,13 @@ def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
         return None
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 # PLAN DETECTION
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _get_vercel_plan() -> str:
     """
-    Get the user's current Vercel plan from their account.
-
-    Vercel API response structure:
-        {
-            "user": {
-                "billing": {
-                    "plan": "hobby" | "pro" | "enterprise"
-                },
-                "isHobby": bool,
-                "hasPaymentMethod": bool
-            }
-        }
+    Detect the user's Vercel plan from their account.
 
     Returns:
         "hobby", "pro", or "enterprise"
@@ -187,41 +233,34 @@ def _get_vercel_plan() -> str:
             timeout=10,
         )
 
-        if response.status_code == 200:
-            data = response.json()
-
-            # Vercel wraps response in a "user" object
-            user = data.get("user", {})
-            billing = user.get("billing", {})
-
-            # Get plan from billing object
-            plan = billing.get("plan", "hobby").lower()
-
-            # Check for Hobby-specific flags
-            is_hobby = user.get("isHobby", False)
-            has_payment_method = user.get("hasPaymentMethod", False)
-
-            # If the account has isHobby=True or no payment method, it's Hobby
-            if is_hobby or not has_payment_method:
-                console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
-                return "hobby"
-
-            # If it's explicitly "hobby" in the response
-            if plan == "hobby":
-                console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
-                return "hobby"
-
-            # If it's "enterprise"
-            if plan == "enterprise":
-                console.print("[dim]📊 Detected Vercel plan: [bold]Enterprise[/bold][/dim]")
-                return "enterprise"
-
-            # Default to Pro for anything else
-            console.print("[dim]📊 Detected Vercel plan: [bold]Pro[/bold][/dim]")
-            return "pro"
-        else:
+        if response.status_code != 200:
             console.print("[dim]⚠️ Could not fetch Vercel plan. Assuming Hobby.[/dim]")
             return "hobby"
+
+        data = response.json()
+        user = data.get("user", {})
+        billing = user.get("billing", {})
+        plan = billing.get("plan", "").lower()
+
+        # Explicit plan checks first
+        if plan == "enterprise":
+            console.print("[dim]📊 Detected Vercel plan: [bold]Enterprise[/bold][/dim]")
+            return "enterprise"
+
+        if plan == "hobby":
+            console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
+            return "hobby"
+
+        # Fallback heuristics
+        is_hobby = user.get("isHobby", False)
+        has_payment_method = user.get("hasPaymentMethod", False)
+
+        if is_hobby or not has_payment_method:
+            console.print("[dim]📊 Detected Vercel plan: [bold]Hobby[/bold] (free)[/dim]")
+            return "hobby"
+
+        console.print("[dim]📊 Detected Vercel plan: [bold]Pro[/bold][/dim]")
+        return "pro"
 
     except Exception as e:
         console.print(f"[dim]⚠️ Could not detect Vercel plan: {e}[/dim]")
@@ -230,10 +269,7 @@ def _get_vercel_plan() -> str:
 
 def _get_render_plan() -> str:
     """
-    Get the user's current Render workspace tier.
-
-    Render's billing model is per-service, not per-seat.
-    Workspace tiers are: "individual", "team", "organization", "enterprise"
+    Detect the user's Render workspace tier.
 
     Returns:
         "individual", "team", "organization", or "enterprise"
@@ -248,45 +284,37 @@ def _get_render_plan() -> str:
         if not owner_id:
             return "individual"
 
-        # Render's owner API returns workspace info
         response = requests.get(
             f"https://api.render.com/v1/owners/{owner_id}",
             headers={"Authorization": f"Bearer {token}"},
             timeout=10,
         )
 
-        if response.status_code == 200:
-            data = response.json()
-
-            # Render doesn't have a simple "plan" field like Vercel
-            # The tier is in the `type` field:
-            # "individual", "team", "organization", "enterprise"
-            tier = data.get("type", "individual").lower()
-
-            # Map Render's tier to our internal plan names
-            plan_mapping = {
-                "individual": "individual",
-                "team": "team",
-                "organization": "organization",
-                "enterprise": "enterprise",
-            }
-
-            plan = plan_mapping.get(tier, "individual")
-
-            # Display the detected plan
-            plan_display = {
-                "individual": "Individual (free)",
-                "team": "Team (Pro)",
-                "organization": "Organization (Scale)",
-                "enterprise": "Enterprise",
-            }
-
-            console.print(f"[dim]📊 Detected Render tier: [bold]{plan_display.get(plan, plan.capitalize())}[/bold][/dim]")
-            return plan
-
-        else:
+        if response.status_code != 200:
             console.print("[dim]⚠️ Could not fetch Render tier. Assuming Individual.[/dim]")
             return "individual"
+
+        data = response.json()
+        tier = data.get("type", "individual").lower()
+
+        plan_mapping = {
+            "individual": "individual",
+            "team": "team",
+            "organization": "organization",
+            "enterprise": "enterprise",
+        }
+
+        plan = plan_mapping.get(tier, "individual")
+
+        plan_display = {
+            "individual": "Individual (free)",
+            "team": "Team (Pro)",
+            "organization": "Organization (Scale)",
+            "enterprise": "Enterprise",
+        }
+
+        console.print(f"[dim]📊 Detected Render tier: [bold]{plan_display.get(plan, plan.capitalize())}[/bold][/dim]")
+        return plan
 
     except Exception as e:
         console.print(f"[dim]⚠️ Could not detect Render tier: {e}[/dim]")
@@ -295,24 +323,65 @@ def _get_render_plan() -> str:
 
 def _get_netlify_plan() -> str:
     """
-    Get the user's current Netlify plan from their account.
+    Detect the user's Netlify plan from their account.
 
     Returns:
-        "starter", "pro", "business", or "enterprise"
+        "hobby", "personal", "pro", or "enterprise"
     """
     try:
-        # Netlify plan detection will be implemented when Netlify provider is added
-        # For now, return "starter" (free tier)
-        console.print("[dim]📊 Netlify plan: [bold]Starter[/bold] (free)[/dim]")
-        return "starter"
+        token = get_netlify_token()
+        if not token:
+            console.print("[dim]ℹ️ Not connected to Netlify. Assuming Hobby (free) plan.[/dim]")
+            return "hobby"
 
-    except Exception:
-        return "starter"
+        response = requests.get(
+            "https://api.netlify.com/api/v1/user",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        if response.status_code != 200:
+            console.print("[dim]⚠️ Could not fetch Netlify plan. Assuming Hobby.[/dim]")
+            return "hobby"
+
+        data = response.json()
+        plan = data.get("plan", {}).get("name", "").lower()
+
+        if not plan:
+            subscription = data.get("subscription", {})
+            plan = subscription.get("plan", {}).get("name", "").lower()
+
+        plan_mapping = {
+            "free": "hobby",
+            "hobby": "hobby",
+            "starter": "personal",
+            "personal": "personal",
+            "pro": "pro",
+            "professional": "pro",
+            "business": "pro",
+            "enterprise": "enterprise",
+        }
+
+        mapped_plan = plan_mapping.get(plan, "hobby")
+
+        plan_display = {
+            "hobby": "Hobby (free)",
+            "personal": "Personal ($9/month)",
+            "pro": "Pro ($20/month)",
+            "enterprise": "Enterprise (custom)",
+        }
+
+        console.print(f"[dim]📊 Detected Netlify plan: [bold]{plan_display.get(mapped_plan, mapped_plan.capitalize())}[/bold][/dim]")
+        return mapped_plan
+
+    except Exception as e:
+        console.print(f"[dim]⚠️ Could not detect Netlify plan: {e}[/dim]")
+        return "hobby"
 
 
-# ──────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
+# MAIN DEPLOY COMMAND
+# =============================================================================
 
 def deploy(
     platform_arg: Optional[str] = None,
@@ -320,11 +389,17 @@ def deploy(
     detected_project: Optional[ProjectInfo] = None,
 ) -> None:
     """
-    Run the interactive deploy flow.
+    Run the interactive deployment flow.
+
+    Args:
+        platform_arg: Optional platform to deploy to (vercel, netlify, render)
+        skip_github: Whether to skip GitHub integration
+        detected_project: Pre-detected project info (for reuse)
     """
     try:
         _print_welcome_banner()
 
+        # Detect or use provided project
         if detected_project:
             project_info = detected_project
             console.print()
@@ -336,6 +411,7 @@ def deploy(
             if project_info is None:
                 return
 
+        # Build the project if needed
         build_service = get_build_service()
         build_result = build_service.ensure_build()
 
@@ -349,6 +425,7 @@ def deploy(
         project_info.metadata["build_info"] = build_info
         project_info.metadata["output_dir"] = build_info.get("output_dir", ".")
 
+        # Proceed with deployment
         if skip_github:
             _deploy_without_github(project_info, platform_arg)
         else:
@@ -358,8 +435,10 @@ def deploy(
         console.print("\n[yellow]⚠️  Deployment cancelled.[/yellow]")
         console.print("[dim]Run `opun8 deploy` again when you're ready.[/dim]")
         raise typer.Exit(0)
+
     except typer.Exit:
         raise
+
     except Exception as exc:
         _log_debug_exception("deploy() unexpected error", exc)
         msg.error(
@@ -369,8 +448,14 @@ def deploy(
         raise typer.Exit(1)
 
 
+# =============================================================================
+# DEPLOY MENU
+# =============================================================================
+
 def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Show the deploy menu with options."""
+    """
+    Display the interactive deployment menu.
+    """
     while True:
         console.print()
         console.print("[bold]🎉 Nice! Your project is ready. What would you like to do?[/bold]")
@@ -380,48 +465,71 @@ def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = N
         console.print("  [bold cyan]3[/] 📂  [white]Select a different project[/white]")
         console.print("  [bold cyan]4[/] 🚪  [white]Exit[/white]")
         console.print()
-        
+
         choice = _safe_prompt(
             "[bold cyan]➜[/] Select an option",
             choices=["1", "2", "3", "4"],
             default="1",
         )
-        
+
         if choice is None:
             return
-        
+
         if choice == "1":
             _deploy_with_github(project_info, platform_arg)
             return
-        elif choice == "2":
+
+        if choice == "2":
             _deploy_without_github(project_info, platform_arg)
             return
-        elif choice == "3":
-            from opun8.commands.detect import go_to_folder
-            go_to_folder()
+
+        if choice == "3":
+            # Interactive folder browser using navigation service
+            from opun8.services.navigation import browse_to_folder
+            selected_path = browse_to_folder()
+            if selected_path:
+                os.chdir(selected_path)
+                # Re-run deploy with detected project
+                from opun8.commands.deploy import deploy as deploy_cmd
+                deploy_cmd(platform_arg=platform_arg)
             return
-        else:
-            msg.goodbye()
-            raise typer.Exit()
+
+        # Choice 4: Exit
+        msg.goodbye()
+        raise typer.Exit()
 
 
 def _deploy_with_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Deploy with GitHub push."""
-    repo_url = _handle_github_push(project_info)
+    """
+    Deploy with GitHub push.
+    """
+    repo_url, cancelled = _handle_github_push(project_info)
+
     if repo_url is None:
-        console.print("[yellow]⚠️  GitHub push failed. Continuing without GitHub.[/yellow]")
-    
+        if cancelled:
+            console.print("[dim]⏹️  GitHub push cancelled. Continuing without GitHub.[/dim]")
+        else:
+            console.print("[yellow]⚠️  GitHub push failed. Continuing without GitHub.[/yellow]")
+
     _continue_deploy(project_info, repo_url, platform_arg)
 
 
 def _deploy_without_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Deploy without GitHub push."""
+    """
+    Deploy without GitHub push.
+    """
     console.print("[dim]⏭️  Skipping GitHub push.[/dim]")
     _continue_deploy(project_info, None, platform_arg)
 
 
-def _continue_deploy(project_info: ProjectInfo, repo_url: Optional[str], platform_arg: Optional[str] = None) -> None:
-    """Continue with deployment after GitHub decision."""
+def _continue_deploy(
+    project_info: ProjectInfo,
+    repo_url: Optional[str],
+    platform_arg: Optional[str] = None,
+) -> None:
+    """
+    Continue with deployment after GitHub decision.
+    """
     platform = _ask_platform(default_platform=platform_arg)
     if platform is None:
         return
@@ -430,9 +538,7 @@ def _continue_deploy(project_info: ProjectInfo, repo_url: Optional[str], platfor
         msg.info(f"{platform.value.capitalize()} support is coming soon!")
         return
 
-    # ──────────────────────────────────────────────────────────
-    # ✅ COST ESTIMATOR WITH PLAN DETECTION
-    # ──────────────────────────────────────────────────────────
+    # Show cost estimate
     estimator = get_cost_estimator(project_info)
 
     if platform == Platform.VERCEL:
@@ -443,29 +549,38 @@ def _continue_deploy(project_info: ProjectInfo, repo_url: Optional[str], platfor
         estimate = estimator.estimate_render(workspace_plan=plan)
     elif platform == Platform.NETLIFY:
         plan = _get_netlify_plan()
-        # Netlify estimate will be added when provider is implemented
-        estimate = None
-        console.print("[yellow]⚠️ Netlify cost estimation coming soon.[/yellow]")
-        if not _safe_confirm("[bold]Continue with deployment?[/bold]", default=True):
-            return
+        estimate = estimator.estimate_netlify(plan=plan)
     else:
         msg.error(f"Unknown platform: {platform.value}")
         return
 
-    if estimate and not display_cost_estimate(estimate):
-        console.print("[dim]Deployment cancelled.[/dim]")
-        return
-
+    # Confirm deployment
     if estimate:
+        if not display_cost_estimate(estimate):
+            console.print("[dim]Deployment cancelled.[/dim]")
+            return
         display_savings_tip(estimate)
+    else:
+        console.print("[yellow]⚠️ Could not generate cost estimate.[/yellow]")
+        if not _safe_confirm("[bold]Continue with deployment?[/bold]", default=True):
+            console.print("[dim]Deployment cancelled.[/dim]")
+            return
 
+    # Execute deployment
     if platform == Platform.VERCEL:
         _handle_vercel_deploy(project_info, repo_url)
+    elif platform == Platform.NETLIFY:
+        _handle_netlify_deploy(project_info, repo_url)
     elif platform == Platform.RENDER:
         _handle_render_deploy(project_info, repo_url)
 
 
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+
 def _print_welcome_banner() -> None:
+    """Print the welcome banner."""
     console.print()
     console.print(Panel(
         "[bold cyan]🚀 Opun8 Deploy[/bold cyan]\n"
@@ -476,12 +591,17 @@ def _print_welcome_banner() -> None:
     ))
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 # PROJECT DETECTION
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _detect_project() -> Optional[ProjectInfo]:
-    """Detect the project type in the current directory."""
+    """
+    Detect the project type in the current directory.
+
+    Returns:
+        ProjectInfo if detected, None otherwise
+    """
     try:
         msg.detection_start()
         with msg.scanning_spinner():
@@ -509,7 +629,9 @@ def _detect_project() -> Optional[ProjectInfo]:
 
 
 def _show_project_summary(project_info: ProjectInfo) -> None:
-    """Print a summary table of the detected project."""
+    """
+    Display a summary of the detected project.
+    """
     console.print()
     console.print("[bold green]✅ Project detected![/bold green]")
     console.print()
@@ -526,6 +648,7 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
         ("Output Directory", project_info.output_dir or "."),
         ("Needs Build", "✅ Yes" if project_info.needs_build else "❌ No"),
     )
+
     for label, value in fields:
         table.add_row(label, str(value))
 
@@ -533,20 +656,34 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
     console.print()
 
 
-# ──────────────────────────────────────────────────────────────
-# GITHUB
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
+# GITHUB INTEGRATION
+# =============================================================================
 
 def _sanitize_repo_name(name: str) -> str:
-    """Sanitize repository name for GitHub compatibility."""
+    """
+    Sanitize a repository name for GitHub compatibility.
+
+    Args:
+        name: Raw repository name
+
+    Returns:
+        Sanitized name (lowercase, hyphens, no special chars)
+    """
     name = name.replace(" ", "-")
     name = re.sub(r'[^a-zA-Z0-9\-_]', '', name)
-    name = name.lower()
-    return name
+    return name.lower()
 
 
-def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
-    """Authenticate with GitHub, create a repo, and push the project."""
+def _handle_github_push(project_info: ProjectInfo) -> Tuple[Optional[str], bool]:
+    """
+    Authenticate with GitHub, create a repo, and push the project.
+
+    Returns:
+        (repo_url, cancelled)
+        - repo_url: URL of the repository, or None if failed/cancelled
+        - cancelled: True if user cancelled, False if actual failure
+    """
     try:
         console.print()
         console.print("[bold cyan]🔐 GitHub Authentication[/bold cyan]")
@@ -562,7 +699,7 @@ def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
                 "GitHub authentication failed.",
                 suggestion="Run `opun8 github` to connect manually.",
             )
-            return None
+            return None, False
 
         token = get_github_token()
         if not token:
@@ -570,7 +707,7 @@ def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
                 "No GitHub token found.",
                 suggestion="Run `opun8 github` to connect.",
             )
-            return None
+            return None, False
 
         username = get_authenticated_user()
         if not username:
@@ -578,17 +715,17 @@ def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
                 "Could not get GitHub username.",
                 suggestion="Run `opun8 github` to reconnect.",
             )
-            return None
+            return None, False
 
         default_name = project_info.metadata.get("name", Path.cwd().name)
         console.print()
         console.print(f"[bold]Repository name:[/bold] [cyan]{default_name}[/cyan]")
         console.print("[dim]Spaces will be replaced with hyphens for GitHub compatibility.[/dim]")
-        
+
         raw_name = _safe_prompt("[bold cyan]➜[/] Repository name", default=default_name)
         if raw_name is None:
-            return None
-        
+            return None, True
+
         repo_name = _sanitize_repo_name(raw_name)
 
         if repo_name != raw_name:
@@ -600,41 +737,50 @@ def _handle_github_push(project_info: ProjectInfo) -> Optional[str]:
         repo_url = f"https://github.com/{username}/{repo_name}"
         git_service = GitService()
         success, message = git_service.push_to_github(repo_url, token=token)
-        
+
         if success:
             msg.success(message)
-            return repo_url
-        
+            return repo_url, False
+
         if "nothing to commit" in message.lower():
             console.print("[dim]✅ No changes to commit — repository is already up to date.[/dim]")
-            return repo_url
-        
+            return repo_url, False
+
         msg.error(message)
-        return None
+        return None, False
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  GitHub push cancelled.[/yellow]")
-        return None
+        return None, True
+
     except Exception as exc:
         _log_debug_exception("_handle_github_push() unexpected error", exc)
         msg.error(
             f"GitHub push failed: {exc}",
             suggestion="Check your internet connection and try again.",
         )
-        return None
+        return None, False
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 # PLATFORM SELECTION
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
-    """Ask the user which platform to deploy to."""
+    """
+    Ask the user which platform to deploy to.
+
+    Args:
+        default_platform: Optional platform to default to
+
+    Returns:
+        Selected Platform, or None if cancelled
+    """
     console.print()
     console.print("[bold]Which platform would you like to deploy to?[/bold]")
     console.print()
     console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
-    console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Coming soon)[/dim]")
+    console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Great for static sites)[/dim]")
     console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
     console.print()
 
@@ -645,32 +791,33 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
             default_choice = "2"
         elif platform_lower == "render":
             default_choice = "3"
-    
+
     choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
         choices=list(PLATFORM_CHOICES.keys()),
         default=default_choice,
     )
-    
+
     if choice is None:
         return None
-    
+
     return PLATFORM_CHOICES.get(choice)
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 # VERCEL DEPLOYMENT
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
-    """Authenticate with Vercel and deploy the project."""
+    """
+    Deploy the project to Vercel.
+    """
     try:
         console.print()
         console.print("[bold cyan]▲ Vercel Deployment[/bold cyan]")
         console.print("[dim]I'll deploy your project to Vercel.[/dim]")
         console.print()
 
-        build_info = project_info.metadata.get("build_info", {})
         output_dir = project_info.metadata.get("output_dir", ".")
         console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
         console.print()
@@ -700,7 +847,6 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print("[dim]This may take a moment.[/dim]")
         console.print()
 
-        # ✅ Deploy to Vercel (output_dir parameter removed)
         success, url, project_id = deploy_to_vercel(
             token=token,
             project_name=project_name,
@@ -722,7 +868,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
             _show_success(SuccessResult(
                 url=url,
                 project_name=project_name,
-                project_id=project_id
+                project_id=project_id,
             ))
         else:
             msg.error(
@@ -733,13 +879,16 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Vercel deployment cancelled.[/yellow]")
         return
+
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+
     except typer.Exit:
         raise
+
     except Exception as exc:
         _log_debug_exception("_handle_vercel_deploy() unexpected error", exc)
         msg.error(
@@ -749,6 +898,12 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
 
 
 def _ensure_vercel_auth() -> bool:
+    """
+    Ensure the user is authenticated with Vercel.
+
+    Returns:
+        True if authenticated, False otherwise
+    """
     if is_vercel_authenticated():
         return True
 
@@ -765,19 +920,133 @@ def _ensure_vercel_auth() -> bool:
     return False
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
+# NETLIFY DEPLOYMENT
+# =============================================================================
+
+def _handle_netlify_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
+    """
+    Deploy the project to Netlify.
+    """
+    try:
+        console.print()
+        console.print("[bold cyan]📦 Netlify Deployment[/bold cyan]")
+        console.print("[dim]I'll deploy your project to Netlify.[/dim]")
+        console.print()
+
+        output_dir = project_info.metadata.get("output_dir", ".")
+        console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
+        console.print()
+
+        if repo_url:
+            console.print(f"[dim]ℹ️  GitHub repo: {repo_url}[/dim]")
+            console.print("[dim]   Netlify will deploy from your local files directly.[/dim]")
+            console.print()
+
+        if not _ensure_netlify_auth():
+            return
+
+        token = get_netlify_token()
+        if not token:
+            msg.error(
+                "No Netlify token found.",
+                suggestion="Run `opun8 netlify` to connect.",
+            )
+            return
+
+        project_path = Path.cwd()
+        site_name = project_info.metadata.get("name", project_path.name)
+
+        console.print()
+        console.print("[bold cyan]☁️  Deploying to Netlify...[/bold cyan]")
+        console.print("[dim]This may take a moment.[/dim]")
+        console.print()
+
+        success, url, site_id = deploy_to_netlify(
+            token=token,
+            site_name=site_name,
+            project_path=project_path,
+        )
+
+        if success:
+            _record_deployment_history(
+                project_name=site_name,
+                url=url,
+                project_id=site_id,
+                team_id=None,
+                platform="netlify",
+                env_vars=[],
+            )
+
+            _show_success(SuccessResult(
+                url=url,
+                project_name=site_name,
+                project_id=site_id,
+            ))
+        else:
+            msg.error(
+                url or "Deployment failed.",
+                suggestion="Check your project for build errors and try again.",
+            )
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️  Netlify deployment cancelled.[/yellow]")
+        return
+
+    except TimeoutError:
+        msg.error(
+            "Deployment timed out.",
+            suggestion="Your project may be large or complex. Try again later.",
+        )
+
+    except typer.Exit:
+        raise
+
+    except Exception as exc:
+        _log_debug_exception("_handle_netlify_deploy() unexpected error", exc)
+        msg.error(
+            f"Deployment failed: {exc}",
+            suggestion="Check your internet connection and try again.",
+        )
+
+
+def _ensure_netlify_auth() -> bool:
+    """
+    Ensure the user is authenticated with Netlify.
+
+    Returns:
+        True if authenticated, False otherwise
+    """
+    if is_netlify_authenticated():
+        return True
+
+    console.print("[yellow]You're not connected to Netlify yet.[/yellow]")
+    login_to_netlify()
+
+    if is_netlify_authenticated():
+        return True
+
+    msg.error(
+        "Netlify authentication failed.",
+        suggestion="Run `opun8 netlify` to connect manually.",
+    )
+    return False
+
+
+# =============================================================================
 # RENDER DEPLOYMENT
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
-    """Authenticate with Render and deploy the project."""
+    """
+    Deploy the project to Render.
+    """
     try:
         console.print()
         console.print("[bold cyan]☁️ Render Deployment[/bold cyan]")
         console.print("[dim]I'll deploy your project to Render.[/dim]")
         console.print()
 
-        build_info = project_info.metadata.get("build_info", {})
         output_dir = project_info.metadata.get("output_dir", ".")
         console.print(f"[dim]📁 Output directory: [cyan]{output_dir}[/dim]")
         console.print()
@@ -836,7 +1105,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
             _show_success(SuccessResult(
                 url=url,
                 project_name=project_name,
-                project_id=service_id
+                project_id=service_id,
             ))
         else:
             msg.error(
@@ -847,13 +1116,16 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️  Render deployment cancelled.[/yellow]")
         return
+
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+
     except typer.Exit:
         raise
+
     except Exception as exc:
         _log_debug_exception("_handle_render_deploy() unexpected error", exc)
         msg.error(
@@ -863,6 +1135,12 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
 
 
 def _ensure_render_auth() -> bool:
+    """
+    Ensure the user is authenticated with Render.
+
+    Returns:
+        True if authenticated, False otherwise
+    """
     if is_render_authenticated():
         return True
 
@@ -879,9 +1157,9 @@ def _ensure_render_auth() -> bool:
     return False
 
 
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 # DEPLOYMENT HISTORY
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
 
 def _record_deployment_history(
     project_name: str,
@@ -891,7 +1169,9 @@ def _record_deployment_history(
     platform: str,
     env_vars: list[str],
 ) -> None:
-    """Save a successful deployment to local history."""
+    """
+    Save a successful deployment to local history.
+    """
     try:
         deployment_record = add_deployment(
             project_name=project_name,
@@ -913,12 +1193,14 @@ def _record_deployment_history(
         console.print(f"[yellow]⚠️  Couldn't check badge progress: {exc}[/yellow]")
 
 
-# ──────────────────────────────────────────────────────────────
-# SUCCESS / POST-DEPLOY ACTIONS
-# ──────────────────────────────────────────────────────────────
+# =============================================================================
+# SUCCESS SCREEN & POST-DEPLOY ACTIONS
+# =============================================================================
 
 def _show_success(result: SuccessResult) -> None:
-    """Display the success screen and offer post-deploy actions."""
+    """
+    Display the success screen and offer post-deploy actions.
+    """
     full_url = _normalize_url(result.url)
 
     console.print()
@@ -963,7 +1245,9 @@ def _show_success(result: SuccessResult) -> None:
 
 
 def _rename_url_flow(result: SuccessResult) -> None:
-    """Guide the user through renaming their deployment URL via Vercel API."""
+    """
+    Guide the user through renaming their deployment URL via Vercel API.
+    """
     console.print()
     console.print("[bold cyan]✏️ Rename Your Deployment[/bold cyan]")
     console.print("[dim]Choose a shorter, cleaner name for your project.[/dim]")
@@ -1063,24 +1347,42 @@ def _rename_url_flow(result: SuccessResult) -> None:
                 msg.goodbye()
                 raise typer.Exit()
             return
-        else:
-            console.print(f"[red]❌ {message}[/red]")
-            if attempt < max_attempts:
-                console.print("[dim]Please try a different name.[/dim]")
-                continue
-            else:
-                console.print("[red]❌ Too many attempts. Skipping rename.[/red]")
-                return
+
+        console.print(f"[red]❌ {message}[/red]")
+        if attempt < max_attempts:
+            console.print("[dim]Please try a different name.[/dim]")
+            continue
+
+        console.print("[red]❌ Too many attempts. Skipping rename.[/red]")
+        return
 
     console.print("[yellow]⚠️  Could not rename. Your current URL is still active.[/yellow]")
-    console.print(f"[dim]🌐 https://{_normalize_url(result.url)}[/dim]")
+    console.print(f"[dim]🌐 {_normalize_url(result.url)}[/dim]")
 
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
 def _normalize_url(url: str) -> str:
-    return url if url.startswith(("http://", "https://")) else f"https://{url}"
+    """
+    Ensure a URL has a scheme.
+
+    Args:
+        url: The URL to normalize
+
+    Returns:
+        URL with https:// prefix if missing
+    """
+    if url and not url.startswith(("http://", "https://")):
+        return f"https://{url}"
+    return url or ""
 
 
 def _copy_to_clipboard(url: str) -> None:
+    """
+    Copy a URL to the system clipboard.
+    """
     if not HAS_CLIPBOARD:
         console.print(f"[dim]📋 {url}[/dim]")
         console.print("[yellow]⚠️  Install `pyperclip` for clipboard support: pip install pyperclip[/yellow]")

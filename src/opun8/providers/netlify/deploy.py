@@ -13,11 +13,12 @@ Error handling philosophy (matches Vercel):
     to a friendly message instead of a crash.
 """
 
+import datetime
 import os
 import hashlib
+import re
 import threading
 import time
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Callable
@@ -26,6 +27,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -35,7 +38,13 @@ from rich.progress import (
     MofNCompleteColumn,
 )
 
-from opun8.services.env_service import prompt_env_files_selection
+# ✅ FIX: import the module itself instead of cherry-picking names that
+# don't exist in env_service.py (prompt_env_files_selection, parse_env_file
+# were never defined there — that was causing an ImportError at load time,
+# which is why deployment "wasn't working at all": this file couldn't even
+# be imported). Importing the module and qualifying calls (env_service.x)
+# also avoids colliding with the local prompt_for_env_vars() defined below.
+from opun8.services import env_service
 
 console = Console()
 _console_lock = threading.Lock()
@@ -92,6 +101,7 @@ DEPLOYS_ENDPOINT = f"{NETLIFY_API_BASE}/deploys"
 ENV_ENDPOINT_TMPL = f"{NETLIFY_API_BASE}/sites/{{site_id}}/env"
 
 MAX_CONCURRENT_UPLOADS = 8
+MAX_SITE_NAME_ATTEMPTS = 5
 
 EXCLUDE_DIR_NAMES = {
     "node_modules", ".git", "__pycache__", ".venv", "venv",
@@ -108,27 +118,56 @@ def _is_env_file(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
+def _strip_scheme(url: str) -> str:
+    """
+    Strip http:// or https:// from the beginning of a URL only.
+
+    ✅ FIX: Uses regex to remove scheme only from the start,
+    not from anywhere in the string.
+
+    Args:
+        url: The URL to strip
+
+    Returns:
+        URL without scheme prefix
+    """
+    if not url:
+        return url
+    return re.sub(r'^https?://', '', url)
+
+
 def prompt_for_env_vars(
     project_path: Path,
     env_targets: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, str], List[str]]:
     """
-    Scan the project for .env files and interactively ask the user which
-    variables, if any, should be uploaded to Netlify as environment
-    variables.
-    """
-    from opun8.services.env_service import detect_env_files, parse_env_file, merge_env_vars
+    Scan the project for .env files / source usage and interactively ask
+    the user which variables, if any, should be uploaded to Netlify as
+    environment variables.
 
+    ✅ FIX: previously imported `prompt_env_files_selection` and
+    `parse_env_file` from env_service.py — neither exists there, which
+    raised an ImportError as soon as this module was loaded. Now calls
+    the real env_service API: `prompt_for_env_vars` (full interactive
+    detection + prompt flow) and `load_env_file` (raw .env parsing).
+
+    Note: env_targets currently has no filtering effect in env_service.
+    It's accepted here for API parity with the Vercel/Render providers.
+    """
     if env_targets is None:
-        return prompt_env_files_selection(project_path)
-    else:
-        env_files = detect_env_files(project_path)
-        all_vars: Dict[str, str] = {}
-        for env_file in env_files:
-            vars_from_file = parse_env_file(env_file)
-            if vars_from_file:
-                all_vars = merge_env_vars(all_vars, vars_from_file, prefer="new")
-        return all_vars, env_targets
+        # Full interactive flow: detect vars from source scanning,
+        # .env.example, and framework requirements, then prompt for values.
+        return env_service.prompt_for_env_vars(project_path)
+
+    # Non-interactive path: just merge whatever is already sitting in
+    # local .env files, no prompting.
+    env_files = env_service.detect_env_files(project_path)
+    all_vars: Dict[str, str] = {}
+    for env_file in env_files:
+        vars_from_file = env_service.load_env_file(env_file)
+        if vars_from_file:
+            all_vars = env_service.merge_env_vars(all_vars, vars_from_file, prefer="new")
+    return all_vars, env_targets
 
 
 # ──────────────────────────────────────────────────────────────
@@ -136,14 +175,18 @@ def prompt_for_env_vars(
 # ──────────────────────────────────────────────────────────────
 
 def _build_session(token: str) -> requests.Session:
+    """Build a requests session with retry configuration."""
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
 
+    # ✅ Retry configuration: 4 total retries, exponential backoff
+    # Note: respect_retry_after_header=False because Netlify returns
+    # Retry-After in date format (RFC 1123) which urllib3 fails to parse
     retry_kwargs = dict(
         total=4,
         backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
-        respect_retry_after_header=True,
+        respect_retry_after_header=False,
     )
     try:
         retry = Retry(allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH"]), **retry_kwargs)
@@ -171,7 +214,11 @@ def _coerce_session(session_or_token) -> Tuple[requests.Session, bool]:
 # ──────────────────────────────────────────────────────────────
 
 def _sanitize_project_name(name: str) -> str:
-    """Sanitize project name for Netlify."""
+    """
+    Sanitize project name for Netlify.
+
+    ✅ FIX: Strip trailing hyphens after truncation.
+    """
     name = name.lower()
     name = name.replace(" ", "-")
     name = re.sub(r'[^a-z0-9._-]', '-', name)
@@ -179,6 +226,7 @@ def _sanitize_project_name(name: str) -> str:
     name = name.strip('-')
     if len(name) > 100:
         name = name[:100]
+        name = name.strip('-')
     return name
 
 
@@ -263,7 +311,6 @@ def _collect_project_files(project_path: Path) -> List[Dict]:
             if file_path.suffix in EXCLUDE_SUFFIXES:
                 continue
 
-            # Compute SHA1 of file
             try:
                 content = file_path.read_bytes()
                 sha1 = hashlib.sha1(content).hexdigest()
@@ -298,10 +345,7 @@ def _get_existing_env_vars(
     session: requests.Session,
     site_id: str,
 ) -> Dict[str, Dict]:
-    """
-    Map of env var key -> its full env record.
-    Netlify uses a 'values' array with context/scope.
-    """
+    """Map of env var key -> its full env record."""
     try:
         response = session.get(
             ENV_ENDPOINT_TMPL.format(site_id=site_id),
@@ -322,11 +366,7 @@ def _set_env_vars(
     env_vars: Dict[str, str],
     context: str = "production",
 ) -> None:
-    """
-    Create or update environment variables on Netlify.
-
-    Netlify env vars use a 'values' array with context/scope.
-    """
+    """Create or update environment variables on Netlify."""
     if not env_vars:
         return
 
@@ -335,7 +375,6 @@ def _set_env_vars(
     failed_keys: List[str] = []
 
     for key, value in env_vars.items():
-        # Netlify uses a 'values' array with context
         payload = {
             "key": key,
             "values": [
@@ -348,7 +387,6 @@ def _set_env_vars(
 
         try:
             if key in existing:
-                # Update existing env var
                 response = session.patch(
                     f"{base_url}/{key}",
                     headers={"Content-Type": "application/json"},
@@ -379,14 +417,47 @@ def _set_env_vars(
 
 
 # ──────────────────────────────────────────────────────────────
-# GET OR CREATE SITE
+# GET OR CREATE SITE (WITH CONFLICT RESOLUTION)
+#
+# ✅ IMPORTANT: this function is interactive — it can print a Panel, list
+# sites, and call Prompt.ask() when a site name conflict (422) is hit.
+# It must NEVER be called from inside an open `rich.progress.Progress`
+# context. Progress owns the terminal via a Live region that repaints on
+# its own refresh loop; running Prompt.ask()/console.print() concurrently
+# with that produces duplicated/garbled output.
+# Call this fully OUTSIDE any Progress context, let it finish resolving
+# the site, and only THEN open Progress for the remaining non-interactive
+# upload/build steps.
 # ──────────────────────────────────────────────────────────────
 
 def _get_or_create_site(
     session: requests.Session,
     site_name: str,
+    original_name: Optional[str] = None,
+    attempt: int = 1,
 ) -> Optional[str]:
-    """Get existing site by name or create a new one."""
+    """
+    Get existing site by name or create a new one with conflict resolution.
+
+    Args:
+        session: Requests session
+        site_name: The site name to try
+        original_name: The original base name (for generating incrementing suffixes)
+        attempt: Current attempt number (for recursion limiting)
+
+    Returns:
+        site_id on success, None on failure
+    """
+    if original_name is None:
+        original_name = site_name
+
+    if attempt > MAX_SITE_NAME_ATTEMPTS:
+        _show_error(
+            f"Could not find an available site name after {MAX_SITE_NAME_ATTEMPTS} attempts.",
+            hint="Please choose a different name and try again.",
+        )
+        return None
+
     try:
         # Try to find existing site
         site_id = _find_site_by_name(session, site_name)
@@ -408,10 +479,137 @@ def _get_or_create_site(
             _debug_log(f"_get_or_create_site: created new site '{site_name}' -> {site_id}")
             return site_id
 
-        if response.status_code == 409:
-            site_id = _find_site_by_name(session, site_name)
-            if site_id:
+        # Handle rate limiting (429)
+        if response.status_code == 429:
+            _debug_log(f"Rate limited while creating site. Waiting...")
+            time.sleep(10)
+            response = session.post(
+                SITES_ENDPOINT,
+                headers={"Content-Type": "application/json"},
+                json={"name": site_name},
+                timeout=30,
+            )
+            if response.status_code in (200, 201):
+                site_id = response.json().get("id")
+                _debug_log(f"_get_or_create_site: created new site on retry '{site_name}' -> {site_id}")
                 return site_id
+            return None
+
+        # Handle duplicate subdomain conflict (422)
+        if response.status_code == 422:
+            try:
+                error_data = response.json()
+                errors = error_data.get("errors", {})
+
+                subdomain_error = errors.get("subdomain")
+                if subdomain_error and "must be unique" in str(subdomain_error):
+                    _debug_log(f"Site name '{site_name}' is already taken. Prompting user...")
+
+                    console.print()
+                    console.print(Panel(
+                        f"[bold yellow]⚠️ Site Name Conflict[/bold yellow]\n\n"
+                        f"The site name [cyan]{site_name}[/cyan] is already taken on Netlify.\n"
+                        f"This could be your own site or someone else's.\n\n"
+                        f"Here are the sites in your Netlify account:",
+                        border_style="yellow",
+                        padding=(1, 2),
+                    ))
+                    console.print()
+
+                    sites = _list_all_sites(session)
+                    if sites:
+                        for i, site in enumerate(sites[:10], 1):
+                            name = site.get("name", "Unnamed")
+                            url = site.get("url", "No URL")
+                            console.print(f"  [bold cyan]{i}[/]  [white]{name}[/white]  [dim]{url}[/dim]")
+                        if len(sites) > 10:
+                            console.print(f"  [dim]... and {len(sites) - 10} more[/dim]")
+                    else:
+                        console.print("[dim]No existing sites found in your account.[/dim]")
+
+                    console.print()
+                    console.print("[bold]What would you like to do?[/bold]")
+                    console.print()
+                    console.print("  [bold cyan]1[/]  [white]Use an existing site[/white]")
+                    console.print("  [bold cyan]2[/]  [white]Enter a new site name[/white]")
+                    console.print("  [bold cyan]3[/]  [yellow]Cancel deployment[/yellow]")
+                    console.print()
+
+                    choice = Prompt.ask(
+                        "[bold cyan]➜[/] Select an option",
+                        choices=["1", "2", "3"],
+                        default="1",
+                        show_choices=False,
+                    )
+
+                    if choice == "3":
+                        return None
+
+                    if choice == "1":
+                        if not sites:
+                            console.print("[yellow]No existing sites found. Please enter a new name.[/yellow]")
+                            new_name = f"{original_name}-{attempt + 1}"
+                            return _get_or_create_site(
+                                session, new_name, original_name, attempt + 1
+                            )
+
+                        console.print()
+                        console.print("[bold]Select a site to deploy to:[/bold]")
+                        console.print()
+
+                        site_choices = []
+                        for i, site in enumerate(sites, 1):
+                            name = site.get("name", "Unnamed")
+                            url = site.get("url", "No URL")
+                            console.print(f"  [bold cyan]{i}[/]  [white]{name}[/white]  [dim]{url}[/dim]")
+                            site_choices.append(str(i))
+
+                        console.print()
+                        site_choice = Prompt.ask(
+                            "[bold cyan]➜[/] Enter site number",
+                            choices=site_choices,
+                            default="1",
+                            show_choices=False,
+                        )
+
+                        try:
+                            idx = int(site_choice) - 1
+                            if 0 <= idx < len(sites):
+                                selected_site = sites[idx]
+                                site_id = selected_site.get("id")
+                                site_name = selected_site.get("name", site_name)
+                                console.print(f"[green]✅ Using existing site: {site_name}[/green]")
+                                return site_id
+                        except ValueError:
+                            pass
+
+                        console.print("[yellow]Invalid selection. Please try again.[/yellow]")
+                        new_name = f"{original_name}-{attempt + 1}"
+                        return _get_or_create_site(
+                            session, new_name, original_name, attempt + 1
+                        )
+
+                    if choice == "2":
+                        console.print()
+                        new_name = Prompt.ask(
+                            "[bold cyan]➜[/] Enter a new site name",
+                            default=f"{original_name}-{attempt + 1}",
+                            show_default=True,
+                        )
+
+                        if not new_name or new_name.strip() == "":
+                            console.print("[yellow]No name provided. Cancelling.[/yellow]")
+                            return None
+
+                        new_name = _sanitize_project_name(new_name)
+                        console.print(f"[dim]Trying: {new_name}[/dim]")
+
+                        return _get_or_create_site(session, new_name, new_name, 1)
+
+                    return None
+
+            except (ValueError, KeyError) as e:
+                _debug_log(f"Error parsing 422 response: {e}")
 
         _show_error(
             "We couldn't set up the Netlify site.",
@@ -441,27 +639,20 @@ def _create_deploy_with_manifest(
     """
     Create a deploy with a file manifest.
 
-    Netlify expects a list of files with their SHA1 hashes.
-    It returns which files it already has, so you only upload what's missing.
-
-    Returns:
-        Dict with deploy_id, required_files (list of files to upload), and deploy data.
-        None on failure.
+    Netlify expects: {"files": {"path/to/file": "sha1"}}
+    It returns "required" as a list of SHA1 hashes that need uploading.
     """
     try:
-        # Build the manifest format Netlify expects
-        # Each file: {"path": "path/to/file", "sha1": "hash"}
-        manifest = [
-            {"path": f["path"], "sha1": f["sha1"]}
-            for f in file_manifest
-        ]
+        # Build manifest: {"path/to/file": "sha1"}
+        manifest = {}
+        for f in file_manifest:
+            manifest[f["path"]] = f["sha1"]
 
         payload = {
             "site_id": site_id,
             "files": manifest,
         }
 
-        # ✅ Correct endpoint: /sites/{site_id}/deploys
         response = session.post(
             f"{SITES_ENDPOINT}/{site_id}/deploys",
             headers={"Content-Type": "application/json"},
@@ -476,15 +667,20 @@ def _create_deploy_with_manifest(
                 _debug_log(f"_create_deploy_with_manifest: response missing id: {data}")
                 return None
 
-            # Check which files are required (not already on Netlify)
+            # ✅ FIX: required is a list of SHA1 hashes that need uploading
             required_files = data.get("required", [])
             _debug_log(f"Deploy {deploy_id}: {len(required_files)} files required to upload")
 
             return {
                 "deploy_id": deploy_id,
-                "required_files": required_files,  # List of file paths to upload
+                "required_files": required_files,  # These are SHA1 hashes
                 "deploy_data": data,
             }
+
+        if response.status_code == 429:
+            _debug_log(f"Rate limited (429) in deploy creation after retries exhausted.")
+            time.sleep(10)
+            return None
 
         _show_error(
             "Netlify rejected the deployment.",
@@ -503,7 +699,7 @@ def _create_deploy_with_manifest(
 
 
 # ──────────────────────────────────────────────────────────────
-# UPLOAD FILES TO DEPLOY
+# UPLOAD FILES TO DEPLOY  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 def _upload_files_to_deploy(
@@ -518,19 +714,35 @@ def _upload_files_to_deploy(
     """
     Upload files to a Netlify deploy.
 
-    ✅ Correct API: PUT /deploys/{deploy_id}/files/{file_path}
+    ✅ FIX: required_files is a list of SHA1 hashes, not file paths.
+    Build lookup by SHA1 to find which local files correspond.
+
+    API: PUT /deploys/{deploy_id}/files/{file_path}
     With raw file content as body, Content-Type: application/octet-stream
     """
     if not required_files:
         return True
 
-    # Create a lookup for file paths to their SHA1
-    file_map = {f["path"]: f for f in file_manifest}
-    # Filter to only required files
-    upload_files = [file_map[f] for f in required_files if f in file_map]
+    # ✅ FIX: required_files are SHA1 hashes, not file paths
+    # Build lookup by SHA1
+    sha1_map = {f["sha1"]: f for f in file_manifest}
+
+    upload_files = []
+    missing_hashes = []
+    for sha1 in required_files:
+        if sha1 in sha1_map:
+            upload_files.append(sha1_map[sha1])
+        else:
+            missing_hashes.append(sha1)
+
+    if missing_hashes:
+        _debug_log(f"WARNING: {len(missing_hashes)} required hash(es) not found in local manifest: {', '.join(missing_hashes[:5])}")
+        if len(missing_hashes) > 5:
+            _debug_log(f"  ... and {len(missing_hashes) - 5} more")
 
     if not upload_files:
-        return True
+        _debug_log("ERROR: No files matched required hashes — upload would be empty!")
+        return False
 
     failed = threading.Event()
 
@@ -551,7 +763,6 @@ def _upload_files_to_deploy(
             return False
 
         try:
-            # ✅ Correct: PUT to /deploys/{deploy_id}/files/{file_path}
             response = session.put(
                 f"{DEPLOYS_ENDPOINT}/{deploy_id}/files/{file_path}",
                 headers={"Content-Type": "application/octet-stream"},
@@ -580,7 +791,6 @@ def _upload_files_to_deploy(
 
         for future in as_completed(futures):
             if failed.is_set():
-                # Cancel remaining futures
                 for f in futures:
                     f.cancel()
                 break
@@ -593,7 +803,6 @@ def _upload_files_to_deploy(
 
             if not success:
                 failed.set()
-                # ✅ Fail fast: break out of the loop
                 break
 
             if progress_callback:
@@ -632,7 +841,7 @@ def _wait_for_deploy(
                 if state == "ready":
                     url = data.get("url")
                     if url:
-                        return url.replace("https://", "").replace("http://", "")
+                        return _strip_scheme(url)
                     return None
 
                 if state in ("error", "failed"):
@@ -682,13 +891,14 @@ def deploy_to_netlify(
         (success, url_or_message, site_id)
     """
     project_path = Path(project_path)
-    site_id: Optional[str] = None  # ✅ Initialize before try
+    site_id: Optional[str] = None
 
     if not project_path.exists() or not project_path.is_dir():
         _debug_log(f"deploy_to_netlify: project path not found: {project_path}")
         return False, f"We couldn't find the project folder: {project_path}", None
 
-    # Detect env vars
+    # Detect env vars (may be interactive — always kept outside any
+    # Progress context, same reasoning as the site-resolution step below)
     if env_vars is None:
         env_vars, _ = prompt_for_env_vars(project_path)
 
@@ -709,6 +919,37 @@ def deploy_to_netlify(
     session = _build_session(token)
 
     try:
+        # ─────────────────────────────────────────────────────
+        # Step 1: Collect files with SHA1
+        # ─────────────────────────────────────────────────────
+        console.print("[cyan]📦 Analyzing project...[/cyan]")
+        file_manifest = _collect_project_files(project_path)
+        if not file_manifest:
+            console.print("[red]❌ No files found to deploy.[/red]")
+            return False, "No deployable files found in the project directory.", None
+        console.print(f"[green]✅ {len(file_manifest)} file(s) found.[/green]")
+
+        # ─────────────────────────────────────────────────────
+        # Step 2: Get or create site (with conflict resolution)
+        #
+        # ✅ FIX: this step is intentionally OUTSIDE of any Progress
+        # live-display context. It can prompt the user (site name
+        # conflicts), and Rich's Progress repaints the screen on its own
+        # refresh loop — running Prompt.ask() while that's active
+        # produced the duplicated/garbled output seen in testing, and
+        # made it look like the upload was kicking off before the user
+        # had actually made a choice. The deploy only proceeds to the
+        # progress-bar section below once the site is fully resolved.
+        # ─────────────────────────────────────────────────────
+        console.print("[cyan]📦 Getting/creating site...[/cyan]")
+        site_id = _get_or_create_site(session, site_name)
+        if not site_id:
+            return False, "Couldn't set up the site on Netlify. Please try again.", None
+        console.print("[green]✅ Site ready.[/green]")
+        console.print()
+
+        # From this point on, nothing requires user input, so it's safe
+        # to open a live progress display for the rest of the deploy.
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -719,30 +960,24 @@ def deploy_to_netlify(
             transient=False,
         ) as progress:
 
-            # Step 1: Collect files with SHA1
-            task = progress.add_task("[cyan]📦 Analyzing project...", total=None)
-            file_manifest = _collect_project_files(project_path)
-            if not file_manifest:
-                progress.update(task, description="[red]❌ No files found to deploy.")
-                return False, "No deployable files found in the project directory.", None
-            progress.update(task, description=f"[green]✅ {len(file_manifest)} file(s) found.")
-
-            # Step 2: Get or create site
-            task = progress.add_task("[cyan]📦 Getting/creating site...", total=None)
-            site_id = _get_or_create_site(session, site_name)
-            if not site_id:
-                return False, "Couldn't set up the site on Netlify. Please try again.", None
-            progress.update(task, description="[green]✅ Site ready.")
-
             # Step 3: Set environment variables
             if env_vars:
                 task = progress.add_task("[cyan]🔐 Setting environment variables...", total=None)
                 _set_env_vars(session, site_id, env_vars)
                 progress.update(task, description="[green]✅ Environment variables set.")
 
-            # Step 4: Create deploy with manifest
+            # Step 4: Create deploy with manifest (simple retry, session handles 429s)
             task = progress.add_task("[cyan]☁️ Creating deployment...", total=None)
-            deploy_result = _create_deploy_with_manifest(session, site_id, file_manifest)
+
+            deploy_result = None
+            for attempt in range(3):
+                deploy_result = _create_deploy_with_manifest(session, site_id, file_manifest)
+                if deploy_result:
+                    break
+                if attempt < 2:
+                    _debug_log(f"Retrying deploy creation (attempt {attempt + 2}/3)...")
+                    time.sleep(5)
+
             if not deploy_result:
                 return False, "Couldn't create the deployment on Netlify. Please try again.", site_id
 
