@@ -4,24 +4,61 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opun8"
-version = "0.1.3"
-description = "Universal Deployment Platform for developers."
+version = "0.1.5"
+description = "Universal Deployment Platform — One Command. Zero Friction."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.8"
 authors = [
     { name = "Kakes David", email = "codewithkakes@gmail.com" }
 ]
 license = { text = "MIT" }
-dependencies = [
-    "typer",
-    "rich",
-    "httpx",
-    "requests",
-    "python-dotenv",
-    "pydantic",
-    "gitpython",
-    "keyring"
+keywords = [
+    "deployment", "cli", "vercel", "netlify", "render", "github",
+    "devops", "automation", "hosting", "deploy", "universal"
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Internet :: WWW/HTTP :: Site Management",
+]
+
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.7.0",
+    "httpx>=0.27.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.5.0",
+    "gitpython>=3.1.40",
+    "keyring>=24.3.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+clipboard = [
+    "pyperclip>=1.8.2",
+]
+all = [
+    "pyperclip>=1.8.2",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.urls]
+Homepage = "https://opun8.dev"
+Repository = "https://github.com/KakesDavid/opun8"
+Documentation = "https://opun8.dev/docs"
+Issues = "https://github.com/KakesDavid/opun8/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -31,3 +68,42 @@ where = ["src"]
 
 [project.scripts]
 opun8 = "opun8.cli:app"
+
+# ============================================================================
+# DEVELOPMENT TOOLS
+# ============================================================================
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --tb=short"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

@@ -15,6 +15,11 @@ Why This File Exists:
     - Uses static pricing data (fast, works offline)
     - Provides consistent cost breakdown across platforms
 
+Supported Platforms:
+    - Vercel: estimate_vercel()
+    - Render: estimate_render()
+    - Netlify: estimate_netlify() ✅ NEW
+
 Usage:
     from opun8.services.cost_estimator import CostEstimator
 
@@ -23,7 +28,7 @@ Usage:
     print(estimate["total"])
 
 Author: OPUN8 Team
-Version: 0.1.4
+Version: 0.1.5
 """
 
 from typing import Dict, Any, Optional
@@ -41,6 +46,15 @@ from opun8.providers.render.pricing import (
     calculate_total_render_cost,
 )
 
+# ✅ NEW: Netlify imports
+from opun8.providers.netlify.pricing import (
+    get_plan as get_netlify_plan,
+    get_framework_resources as get_netlify_resources,
+    calculate_credits_used as calculate_netlify_credits,
+    calculate_credit_shortfall as calculate_netlify_shortfall,
+    calculate_recharge_cost as calculate_netlify_recharge,
+)
+
 
 # =============================================================================
 # DATA MODELS
@@ -52,7 +66,7 @@ class CostEstimate:
     Cost estimate for a deployment.
 
     Attributes:
-        platform: Platform name (vercel, render)
+        platform: Platform name (vercel, render, netlify)
         total: Total estimated monthly cost
         breakdown: Dictionary of cost components
         plan: Selected plan name
@@ -341,6 +355,142 @@ class CostEstimator:
         )
 
     # =========================================================================
+    # NETLIFY ESTIMATION  ✅ NEW
+    # =========================================================================
+
+    def estimate_netlify(
+        self,
+        plan: str = "hobby",
+        ai_spend_usd: float = 0,
+    ) -> CostEstimate:
+        """
+        Estimate Netlify deployment cost using credit-based pricing.
+
+        Netlify uses a credit-based system where:
+            - Each plan has a monthly credit allocation
+            - Usage meters consume credits (bandwidth, compute, web requests, deploys)
+            - Additional credits can be purchased as recharge blocks
+
+        Args:
+            plan: Plan name (hobby, personal, pro)
+            ai_spend_usd: AI model usage in USD (optional)
+
+        Returns:
+            CostEstimate object
+
+        Example:
+            >>> estimator = CostEstimator()
+            >>> estimate = estimator.estimate_netlify("pro")
+            >>> print(estimate.formatted_total)
+            $20.00/month
+        """
+        # Get plan info
+        plan_obj = get_netlify_plan(plan)
+        if plan_obj is None:
+            return CostEstimate(
+                platform="netlify",
+                error=f"Unknown plan: {plan}"
+            )
+
+        # Check if custom pricing
+        is_custom = plan.lower() == "enterprise"
+        if is_custom:
+            return CostEstimate(
+                platform="netlify",
+                plan="Enterprise",
+                is_custom_pricing=True,
+                warning="Enterprise pricing is custom — contact Netlify sales for accurate pricing."
+            )
+
+        # Get framework resources
+        if self.project_info is None:
+            resources = get_netlify_resources("unknown")
+        else:
+            framework = self.project_info.framework
+            resources = get_netlify_resources(framework)
+
+        # Extract usage values
+        bandwidth_gb = resources.get("bandwidth_gb", 10)
+        compute_gb_hours = resources.get("compute_gb_hours", 20)
+        web_requests = resources.get("web_requests", 50000)
+        production_deploys = resources.get("production_deploys", 5)
+
+        # Apply custom overrides if set
+        if self.custom_bandwidth_gb is not None:
+            bandwidth_gb = self.custom_bandwidth_gb
+
+        # Calculate credits used
+        credits_result = calculate_netlify_credits(
+            bandwidth_gb=bandwidth_gb,
+            compute_gb_hours=compute_gb_hours,
+            web_requests=web_requests,
+            production_deploys=production_deploys,
+            ai_spend_usd=ai_spend_usd,
+        )
+
+        credits_used = credits_result.get("total", 0)
+
+        # Check shortfall
+        shortfall = calculate_netlify_shortfall(credits_used, plan)
+        overage_credits = shortfall.get("overage_credits", 0)
+
+        # Calculate recharge cost if needed
+        recharge_info = calculate_netlify_recharge(plan, overage_credits)
+        recharge_cost = recharge_info.get("total_recharge_cost", 0)
+        recharge_available = recharge_info.get("recharge_available", False)
+
+        # Base cost
+        base_cost = plan_obj.monthly_price
+
+        # Total cost
+        total = base_cost + recharge_cost
+
+        # Build breakdown
+        breakdown = {}
+
+        # Base plan cost (if not free)
+        if base_cost > 0:
+            breakdown["Plan"] = base_cost
+
+        # Recharge cost (if any)
+        if recharge_cost > 0:
+            breakdown["Extra Credits"] = recharge_cost
+
+        # Credits breakdown
+        credits_breakdown = credits_result.copy()
+        credits_breakdown.pop("total", None)
+
+        # Build the result
+        result = CostEstimate(
+            platform="netlify",
+            total=total,
+            breakdown=breakdown,
+            plan=plan_obj.name,
+            is_custom_pricing=is_custom,
+        )
+
+        # Add extra metadata as attributes (optional)
+        result.credits_used = credits_used
+        result.plan_credits = plan_obj.credits
+        result.overage_credits = overage_credits
+        result.recharge_available = recharge_available
+        result.credits_breakdown = credits_breakdown
+        result.usage = {
+            "bandwidth_gb": bandwidth_gb,
+            "compute_gb_hours": compute_gb_hours,
+            "web_requests": web_requests,
+            "production_deploys": production_deploys,
+        }
+
+        # Add warning for overages
+        if overage_credits > 0 and not recharge_available:
+            result.warning = "⚠️ You've exceeded your plan's credits and auto-recharge is not available."
+        elif overage_credits > 0 and recharge_available:
+            result.warning = f"ℹ️ You'll need {recharge_info.get('blocks_needed', 0)} recharge block(s) for extra credits."
+
+        return result
+
+    # =========================================================================
     # AUTO DETECTION
     # =========================================================================
 
@@ -349,7 +499,7 @@ class CostEstimator:
         Auto-detect and estimate cost for a platform.
 
         Args:
-            platform: Platform name (vercel, render)
+            platform: Platform name (vercel, render, netlify)
 
         Returns:
             CostEstimate object
@@ -366,6 +516,8 @@ class CostEstimator:
             return self.estimate_vercel()
         elif platform == "render":
             return self.estimate_render()
+        elif platform == "netlify":
+            return self.estimate_netlify()
         else:
             return CostEstimate(
                 platform=platform,

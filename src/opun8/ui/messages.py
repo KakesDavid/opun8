@@ -57,6 +57,7 @@ _SYMBOLS = {
     "clone": "📦" if not _NO_EMOJI else "",
     "upgrade": "⬆️" if not _NO_EMOJI else "",
     "verify": "🔑" if not _NO_EMOJI else "",
+    "box": "📦" if not _NO_EMOJI else "",
 }
 
 
@@ -74,7 +75,7 @@ def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
 
 
 # ──────────────────────────────────────────────────────────────
-# FOLDER DIALOG
+# FOLDER DIALOG  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]:
@@ -89,24 +90,26 @@ def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]
         import tkinter as tk
         from tkinter import filedialog
         
-        # Create a minimal root window and hide it
         root = tk.Tk()
         root.withdraw()
         root.attributes('-topmost', True)
         
-        # Open folder dialog
-        folder_path = filedialog.askdirectory(
-            title=title,
-            mustexist=True
-        )
-        
-        root.destroy()
+        try:
+            folder_path = filedialog.askdirectory(
+                title=title,
+                mustexist=True
+            )
+        except Exception:
+            # No display available or other Tk error
+            folder_path = None
+        finally:
+            root.destroy()
         
         if folder_path:
             return Path(folder_path)
         return None
         
-    except ImportError:
+    except Exception:
         # Fallback: try PyQt5
         try:
             from PyQt5.QtWidgets import QApplication, QFileDialog
@@ -116,18 +119,21 @@ def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]
             if app is None:
                 app = QApplication([])
             
-            folder_path = QFileDialog.getExistingDirectory(
-                None,
-                title,
-                os.path.expanduser("~"),
-                QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-            )
+            try:
+                folder_path = QFileDialog.getExistingDirectory(
+                    None,
+                    title,
+                    os.path.expanduser("~"),
+                    QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+                )
+            except Exception:
+                folder_path = None
             
             if folder_path:
                 return Path(folder_path)
             return None
             
-        except ImportError:
+        except Exception:
             # Fallback: try easygui
             try:
                 import easygui
@@ -139,7 +145,7 @@ def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]
                     return Path(folder_path)
                 return None
                 
-            except ImportError:
+            except Exception:
                 # Last resort: use input prompt
                 console.print("[yellow]⚠️ Could not open folder dialog. Please enter path manually.[/yellow]")
                 folder_path = Prompt.ask(
@@ -263,7 +269,10 @@ def _render_welcome_and_get_next() -> str:
         console.print("[bold]📁 Recent Projects:[/bold]")
         console.print()
         for i, project in enumerate(recent[:5], 1):
-            console.print(f"  [bold cyan]{i}[/]  [white]{project['name']}[/white]  [dim]({project['path']})[/dim]")
+            # ✅ FIX: Use .get() defensively
+            name = project.get("name", "Unnamed")
+            path = project.get("path", "Unknown")
+            console.print(f"  [bold cyan]{i}[/]  [white]{name}[/white]  [dim]({path})[/dim]")
         if len(recent) > 5:
             console.print(f"  [dim]... and {len(recent) - 5} more[/dim]")
 
@@ -339,6 +348,7 @@ def _render_help_and_get_next() -> str:
     table.add_row("opun8 github", "Connect to GitHub")
     table.add_row("opun8 vercel", "Connect to Vercel")
     table.add_row("opun8 render", "Connect to Render")
+    table.add_row("opun8 netlify", "Connect to Netlify")
 
     # Advanced Commands
     table.add_row("opun8 clone", "Clone any website")
@@ -544,8 +554,6 @@ def render_services_list(services: list) -> None:
         console.print("[dim]Run [cyan]opun8 deploy[/cyan] to create your first service.[/dim]")
         return
 
-    from rich.table import Table
-    
     console.print()
     console.print(Panel(
         f"[bold cyan]{_sym('cloud')} Render Services[/bold cyan]\n"
@@ -564,10 +572,11 @@ def render_services_list(services: list) -> None:
     table.add_column("URL", style="cyan", width=25)
 
     for idx, service in enumerate(services, 1):
-        name = service.get("name", "Unknown")[:20]
-        service_type = service.get("type", "unknown")[:12]
-        status = service.get("status", "unknown")[:12]
-        url = service.get("url", "N/A")[:25]
+        # ✅ FIX: Handle None values with (value or "Unknown") pattern
+        name = (service.get("name") or "Unknown")[:20]
+        service_type = (service.get("type") or "unknown")[:12]
+        status = (service.get("status") or "unknown")[:12]
+        url = (service.get("url") or "N/A")[:25]
 
         table.add_row(str(idx), name, service_type, status, url)
 
@@ -577,9 +586,10 @@ def render_services_list(services: list) -> None:
 
 def render_api_key_prompt() -> None:
     """Show Render API key prompt message."""
+    # ✅ FIX: Use _sym('verify') instead of _sym('key')
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('key')} Render API Key[/bold cyan]\n\n"
+        f"[bold cyan]{_sym('verify')} Render API Key[/bold cyan]\n\n"
         "You can get your API key from:\n"
         "[dim]https://dashboard.render.com/settings/keys[/dim]\n\n"
         "Create a new key with 'read' and 'write' permissions.\n"
@@ -590,3 +600,156 @@ def render_api_key_prompt() -> None:
     ))
     console.print()
     console.print("[dim]🌐 Opening Render API keys page in your browser...[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────
+# NETLIFY-SPECIFIC MESSAGES
+# ──────────────────────────────────────────────────────────────
+
+def netlify_auth_start() -> None:
+    """Show Netlify authentication start message."""
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('box')} Netlify Authentication[/bold cyan]\n\n"
+        "Opun8 needs access to Netlify to:\n"
+        "  • Create sites\n"
+        "  • Deploy your code\n"
+        "  • Get deployment URLs\n\n"
+        "[dim]Your browser will open for OAuth authorization.[/dim]"
+        "\n[dim]Or paste a Personal Access Token as an alternative.[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+
+
+def netlify_auth_success(username: str) -> None:
+    """Show Netlify authentication success message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Connected to Netlify as: [white]{username}[/white][/bold green]")
+    console.print("[dim]Token saved securely for future use.[/dim]")
+
+
+def netlify_auth_failed() -> None:
+    """Show Netlify authentication failure message."""
+    error(
+        "Netlify authentication failed.",
+        suggestion="Run `opun8 netlify` to try again, or use a Personal Access Token.",
+    )
+
+
+def netlify_already_authenticated(username: str) -> None:
+    """Show Netlify already authenticated message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Already connected to Netlify as: [white]{username}[/white][/bold green]")
+    console.print("[dim]To disconnect, run: [cyan]opun8 netlify --logout[/cyan][/dim]")
+    console.print()
+
+
+def netlify_deploy_start(site_name: str) -> None:
+    """Show Netlify deployment start message."""
+    console.print()
+    console.print(f"[bold cyan]{_sym('box')} Deploying to Netlify[/bold cyan]")
+    console.print(f"[dim]Site: {site_name}[/dim]")
+    console.print()
+
+
+def netlify_deploy_success(url: str) -> None:
+    """Show Netlify deployment success message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Deployment successful![/bold green]")
+    console.print(f"[dim]🌐 {url}[/dim]")
+
+
+def netlify_deploy_failed(message: str) -> None:
+    """Show Netlify deployment failure message."""
+    error(
+        f"Deployment failed: {message}",
+        suggestion="Check your project for build errors and try again.",
+    )
+
+
+def netlify_site_created(site_name: str) -> None:
+    """Show Netlify site created message."""
+    console.print(f"[green]{_sym('success')} Site created: [white]{site_name}[/white][/green]")
+
+
+def netlify_site_conflict(site_name: str) -> None:
+    """Show Netlify site conflict message."""
+    console.print()
+    console.print(f"[bold yellow]{_sym('warning')} Site name conflict[/bold yellow]")
+    console.print(f"[dim]The site name [cyan]{site_name}[/cyan] is already taken on Netlify.[/dim]")
+
+
+def netlify_site_selected(site_name: str) -> None:
+    """Show Netlify site selected message."""
+    console.print(f"[green]{_sym('success')} Using existing site: [white]{site_name}[/white][/green]")
+
+
+def netlify_sites_list(sites: list) -> None:
+    """Show Netlify sites list."""
+    if not sites:
+        console.print("[yellow]No sites found on Netlify.[/yellow]")
+        console.print("[dim]Run [cyan]opun8 deploy netlify[/cyan] to create your first site.[/dim]")
+        return
+
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('box')} Netlify Sites[/bold cyan]\n"
+        f"[dim]{len(sites)} site(s) found[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+
+    table = Table(border_style="cyan")
+    table.add_column("#", style="bold white", width=4)
+    table.add_column("Name", style="bold white", width=20)
+    table.add_column("URL", style="cyan", width=30)
+    table.add_column("Created", style="dim", width=15)
+
+    for idx, site in enumerate(sites, 1):
+        # ✅ FIX: Handle None values with (value or "Unknown") pattern
+        name = (site.get("name") or "Unknown")[:20]
+        url = (site.get("url") or "N/A")[:30]
+        created = (site.get("created_at") or "Unknown")[:15]
+
+        table.add_row(str(idx), name, url, created)
+
+    console.print(table)
+    console.print()
+
+
+def netlify_pat_prompt() -> None:
+    """Show Netlify Personal Access Token prompt message."""
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('verify')} Netlify Personal Access Token[/bold cyan]\n\n"
+        "You can get a Personal Access Token from:\n"
+        "[dim]https://app.netlify.com/user/applications[/dim]\n\n"
+        "1. Click [bold]Create Access Token[/bold]\n"
+        "2. Give it a name, e.g. [dim]\"Opun8 CLI\"[/dim]\n"
+        "3. Click [bold]Generate Token[/bold]\n"
+        "4. Copy the token (it's only shown once)\n\n"
+        "This is useful for automation and CI/CD.",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+    console.print("[dim]🌐 Opening Netlify tokens page in your browser...[/dim]")
+
+
+def netlify_pat_verified() -> None:
+    """Show Netlify PAT verified message."""
+    console.print()
+    console.print(f"[bold green]{_sym('success')} Personal Access Token verified![/bold green]")
+
+
+def netlify_pat_invalid() -> None:
+    """Show Netlify PAT invalid message."""
+    console.print()
+    console.print(f"[red]{_sym('error')} Invalid Personal Access Token.[/red]")
+    console.print("[dim]Please check the token and try again.[/dim]")
