@@ -1,285 +1,342 @@
 """
 Detect command - Detect your project type and stack.
 
-This command scans the current directory and identifies:
-    - Project name
-    - Framework (React, Next.js, Vue, etc.)
-    - Package manager (npm, yarn, pnpm)
-    - Build command
-    - Output directory
-    - Whether a build is needed
+This module:
+    - Scans the current directory for project files
+    - Detects framework (React, Next.js, Vue, Angular, etc.)
+    - Identifies package manager (npm, yarn, pnpm)
+    - Shows build configuration
+    - Allows navigation to different folders
 
-Usage:
-    opun8 detect
-
-Author: OPUN8 Team
-Version: 0.1.4
+✅ FIX: 'typer.Exit' raised from menu choices no longer gets swallowed by
+        the generic error handler — closing the app or hitting "back" was
+        printing a full traceback instead of exiting cleanly.
+✅ FIX: Folder navigation no longer recurses into detect(). Hopping
+        between folders now loops in place instead of stacking a new
+        try/except (and a new failure mode) on every switch.
+✅ FIX: Ctrl+D / EOF during detection is now handled as gracefully as
+        Ctrl+C, instead of only catching KeyboardInterrupt.
+✅ FIX: No more duplicate "no project found" menu. msg.no_project_detected()
+        already runs its own complete interactive flow (see messages.py) —
+        this module used to show a second, redundant menu right after it.
+✅ UPDATED: Full-width, partner-tone UI — bordered menus, warmer copy,
+            and history/badges now bring you back to the menu instead of
+            dead-ending the command.
 """
 
+from __future__ import annotations
+
 import os
+import typer
 from pathlib import Path
 from typing import Optional
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
 from opun8.core.detector import detect_project, ProjectInfo
-from opun8.services.build_service import get_build_service
 from opun8.ui import messages as msg
-
 
 console = Console()
 
 
 # ──────────────────────────────────────────────────────────────
-# CORE IMPLEMENTATION
+# HELPERS
 # ──────────────────────────────────────────────────────────────
 
-def _run_detection() -> None:
-    """
-    Core detection logic.
-    Always shows formatted output.
-    """
+def _safe_prompt(
+    message: str,
+    choices: Optional[list] = None,
+    default: str = "1",
+) -> Optional[str]:
+    """Prompt with graceful handling of Ctrl+C and Ctrl+Z/Ctrl+D."""
     try:
-        _print_header()
-
-        # Detect the project
-        with console.status("[bold cyan]🔍 Scanning project...[/bold cyan]"):
-            project_info = detect_project(".")
-
-        # Check if detection was successful
-        if project_info.framework == "unknown" and not project_info.is_static:
-            _show_no_project_detected()
-            return
-
-        # Get build service info
-        build_service = get_build_service()
-        build_info = build_service.get_build_info()
-
-        # Always show formatted output
-        _output_formatted(project_info, build_info)
-
-    except PermissionError:
-        msg.error(
-            "Permission denied reading this folder.",
-            suggestion="Make sure you have read access to this directory.",
-        )
-        raise typer.Exit(1)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]⚠️  Detection cancelled.[/yellow]")
-        raise typer.Exit(0)
-    except Exception as exc:
-        msg.error(
-            f"Unexpected error while detecting project: {exc}",
-            suggestion="Try running from a different directory or check for broken files.",
-        )
-        raise typer.Exit(1)
+        from rich.prompt import Prompt
+        if choices:
+            return Prompt.ask(message, choices=choices, default=default, show_choices=False)
+        return Prompt.ask(message, default=default)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────
-# TYPER COMMAND
+# MAIN DETECT COMMAND
 # ──────────────────────────────────────────────────────────────
 
 def detect() -> None:
     """
     Detect your project type and stack.
-
-    This command scans the current directory and identifies:
-        - Project name
-        - Framework (React, Next.js, Vue, etc.)
-        - Package manager (npm, yarn, pnpm)
-        - Build command
-        - Output directory
-        - Whether a build is needed
     """
-    _run_detection()
+    try:
+        _show_detect_screen()
+    except typer.Exit:
+        # A clean, intentional exit (closing the app, "go back", etc.)
+        # — let it pass through instead of being reported as a crash.
+        raise
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]⚠️  Detection cancelled.[/yellow]")
+        raise typer.Exit(0)
+    except Exception as e:
+        console.print_exception()
+        msg.error(
+            f"Unexpected error: {e}",
+            suggestion="Try again or run `opun8 help` for assistance.",
+        )
+        raise typer.Exit(1)
+
+
+def _show_detect_screen() -> None:
+    """
+    Main detection screen with partner tone.
+
+    Runs in a loop so switching folders re-scans in place instead of
+    recursing into detect() again — no matter how many folders someone
+    bounces through in one session, this stays a single stack frame.
+    """
+    while True:
+        console.clear()
+        console.print()
+        msg.detection_start()
+
+        with msg.scanning_spinner():
+            result = detect_project(".")
+
+        if result.framework == "unknown" and not result.is_static:
+            # opun8.ui.messages.no_project_detected() is a fully self-contained
+            # interactive flow (warning panel + its own menu: pick another
+            # folder / back to main menu / exit) — it is NOT a passive
+            # banner. Showing our own menu after it returns used to produce
+            # a confusing second "no project found" menu once the user's
+            # choice had already been fully handled inside that call.
+            msg.no_project_detected()
+            return
+
+        _display_detection_results(result)
+        action = _show_detect_menu(result)
+
+        if action == "rescan":
+            continue
+        return
 
 
 # ──────────────────────────────────────────────────────────────
-# OUTPUT FUNCTIONS
+# DISPLAY RESULTS
 # ──────────────────────────────────────────────────────────────
 
-def _print_header() -> None:
-    """Print the detection header."""
+def _display_detection_results(result: ProjectInfo) -> None:
+    """Display detection results with partner tone."""
     console.print()
     console.print(Panel(
-        "[bold cyan]🔍 Opun8 Project Detector[/bold cyan]\n"
-        "[dim]I'll scan your current directory and identify your project type.[/dim]",
-        border_style="cyan",
+        f"[bold green]{msg._sym('hooray')} HOORAY! Everything looks perfect and healthy! {msg._sym('heart')}[/bold green]\n"
+        f"[dim]{msg._emoji_or_empty('point_down')}Here's everything I found for us, partner — take a look:[/dim]",
+        border_style="green",
         padding=(1, 2),
-        width=60,
     ))
     console.print()
 
-
-def _output_formatted(project_info: ProjectInfo, build_info: dict) -> None:
-    """
-    Display detection results in a formatted table.
-    """
-    console.print()
-    console.print("[bold green]✅ Project detected![/bold green]")
-    console.print()
-
-    # ──────────────────────────────────────────────────────────────
     # Project Details Table
-    # ──────────────────────────────────────────────────────────────
-
     table = Table(
-        title="📋 Project Details",
+        title=f"{msg._emoji_or_empty('clipboard')}Project Details",
         box=box.ROUNDED,
-        title_style="bold cyan",
         border_style="cyan",
+        title_style="bold cyan",
+        show_lines=False,
+        padding=(0, 1),
     )
-    table.add_column("Field", style="bold white", width=20)
-    table.add_column("Value", style="white")
+    table.add_column("Field", style="bold white", width=18, no_wrap=True)
+    table.add_column("Value", style="white", no_wrap=False)
 
-    # Get project name from metadata or directory name
-    project_name = project_info.metadata.get("name", Path.cwd().name)
+    project_name = result.metadata.get("name", Path.cwd().name)
+    framework = result.framework or "Unknown"
+    package_manager = result.package_manager or "Unknown"
+    project_type = "Static HTML" if result.is_static else "Dynamic"
 
-    table.add_row("📁 Project Name", project_name)
-    table.add_row("📦 Framework", project_info.framework.capitalize() if project_info.framework else "Unknown")
+    # Map framework to display name
+    framework_display = {
+        "react": "React",
+        "nextjs": "Next.js",
+        "vue": "Vue",
+        "angular": "Angular",
+        "vite": "Vite",
+        "nodejs": "Node.js",
+        "django": "Django",
+        "flask": "Flask",
+        "fastapi": "FastAPI",
+        "python": "Python",
+        "static": "Static HTML",
+        "unknown": "Unknown",
+    }.get(framework, framework.capitalize())
 
-    if project_info.package_manager:
-        table.add_row("📦 Package Manager", project_info.package_manager)
-    else:
-        table.add_row("📦 Package Manager", "[dim]None[/dim]")
-
-    if project_info.is_static:
-        table.add_row("📄 Type", "[dim]Static HTML[/dim]")
-    else:
-        table.add_row("📄 Type", "Application")
+    table.add_row(f"{msg._sym('folder')} Project Name", msg._escape_text(project_name))
+    table.add_row(f"{msg._sym('box')} Framework", msg._escape_text(framework_display))
+    table.add_row(f"{msg._sym('box')} Package Manager", msg._escape_text(package_manager))
+    table.add_row(f"{msg._emoji_or_empty('clipboard')}Type", msg._escape_text(project_type))
 
     console.print(table)
-    console.print()
 
-    # ──────────────────────────────────────────────────────────────
     # Build Configuration Table
-    # ──────────────────────────────────────────────────────────────
-
-    build_table = Table(
-        title="🔨 Build Configuration",
+    console.print()
+    table2 = Table(
+        title=f"{msg._emoji_or_empty('hammer')}Build Configuration",
         box=box.ROUNDED,
-        title_style="bold yellow",
-        border_style="yellow",
+        border_style="cyan",
+        title_style="bold cyan",
+        show_lines=False,
+        padding=(0, 1),
     )
-    build_table.add_column("Field", style="bold white", width=20)
-    build_table.add_column("Value", style="white")
+    table2.add_column("Field", style="bold white", width=18, no_wrap=True)
+    table2.add_column("Value", style="white", no_wrap=False)
 
-    if project_info.needs_build:
-        build_table.add_row("🛠️  Needs Build", "✅ Yes")
-    else:
-        build_table.add_row("🛠️  Needs Build", "❌ No (static or Python)")
+    needs_build = result.needs_build
+    build_command = result.build_command or "None"
+    output_dir = result.output_dir or "."
 
-    if project_info.build_command:
-        build_table.add_row("📝 Build Command", f"[cyan]{project_info.build_command}[/cyan]")
-    else:
-        build_table.add_row("📝 Build Command", "[dim]None[/dim]")
-
-    if project_info.dev_command:
-        build_table.add_row("🔄 Dev Command", f"[cyan]{project_info.dev_command}[/cyan]")
-
-    build_table.add_row("📁 Output Directory", f"[cyan]{project_info.output_dir}[/cyan]")
+    table2.add_row(
+        f"{msg._emoji_or_empty('hammer')}Needs Build",
+        f"{msg._sym('success')} Yes" if needs_build else f"{msg._sym('error')} No (static)"
+    )
+    table2.add_row(
+        f"{msg._emoji_or_empty('clipboard')}Build Command",
+        msg._escape_text(build_command)
+    )
+    table2.add_row(
+        f"{msg._sym('folder')} Output Directory",
+        msg._escape_text(output_dir)
+    )
 
     # Check if build folder exists
-    build_folder_exists = build_info.get("build_exists", False)
-    if build_folder_exists:
-        build_table.add_row("📂 Build Folder", "[green]✅ Exists[/green]")
-    else:
-        build_table.add_row("📂 Build Folder", "[yellow]❌ Not found (will be auto-created)[/yellow]")
+    build_folder_exists = f"{msg._sym('success')} Exists" if Path(output_dir).exists() else f"{msg._sym('error')} Not built yet"
+    table2.add_row(f"{msg._sym('browse')} Build Folder", build_folder_exists)
 
-    console.print(build_table)
+    console.print(table2)
     console.print()
 
-    # ──────────────────────────────────────────────────────────────
-    # Next Steps
-    # ──────────────────────────────────────────────────────────────
 
-    _show_next_steps(project_info)
+# ──────────────────────────────────────────────────────────────
+# DETECT MENU
+# ──────────────────────────────────────────────────────────────
 
+def _show_detect_menu(result: ProjectInfo) -> str:
+    """
+    Show next steps menu after detection.
 
-def _show_no_project_detected() -> None:
-    """Show message when no project is detected."""
-    console.print()
-    console.print("[yellow]⚠️  No project detected in this directory.[/yellow]")
-    console.print()
-    console.print("[dim]I looked for:[/dim]")
-    console.print("  • [dim]package.json[/dim] [dim](Node.js/React/Next.js)[/dim]")
-    console.print("  • [dim]requirements.txt[/dim] [dim](Python)[/dim]")
-    console.print("  • [dim]app.py / main.py[/dim] [dim](Python/FastAPI)[/dim]")
-    console.print("  • [dim]index.html[/dim] [dim](Static HTML)[/dim]")
-    console.print()
-    console.print("[dim]💡 Make sure you're in your project's root directory.[/dim]")
+    Returns "rescan" if the user switched to a different folder (so the
+    caller re-scans it), or "done" once they've picked a terminal action
+    (deploy, or closing the app raises typer.Exit directly).
+    """
+    while True:
+        console.print(Panel(
+            f"[bold green]{msg._sym('point')} WHAT SHOULD WE DO NEXT, PARTNER? {msg._sym('smile')}[/bold green]\n\n"
+            f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]LAUNCH THIS WEBSITE TO THE INTERNET NOW![/white] [dim](Recommended)[/dim]\n"
+            f"  [bold cyan]2[/] {msg._sym('browse')}  [white]Select a different project[/white]\n"
+            f"  [bold cyan]3[/] {msg._sym('history')}  [white]View deployment history[/white]\n"
+            f"  [bold cyan]4[/] {msg._sym('badge')}  [white]View badges[/white]\n"
+            f"  [bold cyan]5[/] {msg._sym('door')}  [white]Close app[/white]\n\n"
+            f"[green]{msg._sym('success')} STUCK OR NOT SURE? Just smash the ENTER key! {msg._sym('joy')}[/green]\n"
+            f"[dim]   I'll go ahead and put your site live, partner! {msg._sym('party')}[/dim]",
+            border_style="green",
+            padding=(1, 2),
+        ))
+        console.print()
 
+        choice = _safe_prompt(
+            f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Press a number or Enter",
+            choices=["1", "2", "3", "4", "5"],
+            default="1",
+        )
 
-def _show_next_steps(project_info: ProjectInfo) -> None:
-    """Show recommended next steps with clear, actionable guidance."""
-    console.print()
-    console.print("[bold]📋 Next Steps[/bold]")
-    console.print()
+        if choice is None:
+            msg.goodbye()
+            raise typer.Exit()
 
-    # Show project type-specific guidance
-    if project_info.is_static:
-        console.print("  [dim]1. Deploy your static site:[/dim]")
-        console.print("     [cyan]  opun8 deploy vercel[/cyan]")
-        console.print("     [cyan]  opun8 deploy render[/cyan]")
+        if choice == "1":
+            from opun8.commands.deploy import deploy
+            deploy(detected_project=result)
+            return "done"
 
-    elif project_info.needs_build:
-        # Check if build folder exists
-        build_folder_exists = (Path.cwd() / project_info.output_dir).exists()
-
-        if build_folder_exists:
-            console.print("  [dim]1. Deploy your project:[/dim]")
-            console.print("     [cyan]  opun8 deploy vercel[/cyan]")
-            console.print("     [cyan]  opun8 deploy render[/cyan]")
+        elif choice == "2":
+            if _browse_and_change_folder():
+                return "rescan"
             console.print()
-            console.print(f"  [dim]📁 Build folder: [cyan]{project_info.output_dir}[/cyan] (found!)[/dim]")
+            continue
+
+        elif choice == "3":
+            from opun8.commands.history import history
+            history()
+            console.print()
+            console.print(f"[dim]{msg._sym('point')} Back to your project, partner —[/dim]")
+            console.print()
+            continue
+
+        elif choice == "4":
+            from opun8.commands.badges import badges
+            badges()
+            console.print()
+            console.print(f"[dim]{msg._sym('point')} Back to your project, partner —[/dim]")
+            console.print()
+            continue
+
         else:
-            console.print("  [dim]1. Build your project:[/dim]")
-            console.print(f"     [cyan]  {project_info.build_command}[/cyan]")
-            console.print()
-            console.print("  [dim]2. Deploy your project:[/dim]")
-            console.print("     [cyan]  opun8 deploy vercel[/cyan]")
-            console.print("     [cyan]  opun8 deploy render[/cyan]")
-            console.print()
-            console.print(f"  [dim]📁 Output will be in: [cyan]{project_info.output_dir}[/cyan][/dim]")
-            console.print("  [dim]💡 Opun8 will auto-build if you run [cyan]opun8 deploy[/cyan][/dim]")
+            msg.goodbye()
+            raise typer.Exit()
 
-    else:
-        console.print("  [dim]1. Deploy your project directly:[/dim]")
-        console.print("     [cyan]  opun8 deploy vercel[/cyan]")
-        console.print("     [cyan]  opun8 deploy render[/cyan]")
 
+# ──────────────────────────────────────────────────────────────
+# GO TO FOLDER — Interactive Folder Navigation
+# ──────────────────────────────────────────────────────────────
+
+def _browse_and_change_folder() -> bool:
+    """
+    Open the folder browser and cd into whatever the user picks.
+
+    Returns True if the working directory actually changed, False if the
+    user backed out. Kept separate from go_to_folder() so the in-menu
+    navigation loop can react to a folder switch without recursing back
+    into detect().
+    """
     console.print()
-    console.print("[dim]💡 Run [cyan]opun8 deploy[/cyan] to start the interactive deployment flow.[/dim]")
-    console.print("[dim]📖 Run [cyan]opun8 help[/cyan] to see all available commands.[/dim]")
+    console.print(Panel(
+        f"[bold cyan]{msg._sym('browse')} Let's find your project, partner![/bold cyan]\n"
+        f"[dim]Pick a folder below, or type a path — I'll take it from there.[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    console.print()
 
+    from opun8.services.navigation import browse_to_folder
+    selected = browse_to_folder()
 
-# ──────────────────────────────────────────────────────────────
-# FOLDER SELECTION
-# ──────────────────────────────────────────────────────────────
+    if not selected:
+        console.print(f"[dim]{msg._sym('smile')} All good — folder selection cancelled.[/dim]")
+        return False
+
+    os.chdir(selected)
+    console.print()
+    console.print(f"[green]{msg._sym('success')} Hopped into [cyan]{selected}[/cyan] — let's see what we've got![/green]")
+    console.print()
+    return True
+
 
 def go_to_folder() -> None:
     """
-    Handle the "Select a different project" flow from the deploy menu.
-    This opens a folder browser and re-runs detection.
+    Interactive folder navigation to select a project, then run detection
+    on it.
+
+    Public entry point kept for callers outside this module. Internal
+    menu navigation uses _browse_and_change_folder() directly (inside a
+    loop) so switching folders repeatedly from the menu can't stack
+    recursive detect() calls.
     """
-    from opun8.services.navigation import browse_to_folder
-
-    folder = browse_to_folder()
-    if folder:
-        console.print(f"[dim]📂 Changed to: {folder}[/dim]")
-        os.chdir(folder)
-        _run_detection()
-    else:
-        console.print("[yellow]No folder selected. Returning to main menu.[/yellow]")
+    if _browse_and_change_folder():
+        detect()
 
 
-# =============================================================================
+# ──────────────────────────────────────────────────────────────
 # MODULE EXPORTS
-# =============================================================================
+# ──────────────────────────────────────────────────────────────
 
 __all__ = [
     "detect",
