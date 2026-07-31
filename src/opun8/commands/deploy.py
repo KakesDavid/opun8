@@ -4,7 +4,11 @@ Deploy command - Deploy your project to the cloud.
 Orchestrates the full deployment flow:
     1. Detect the project
     2. Auto-build if needed
-    3. Show menu: Deploy with GitHub / Deploy without GitHub / Select different project
+    3. Show platform-specific welcome and 4-option menu:
+        a. Deploy Now
+        b. Select Different Project
+        c. Deploy GitHub Repo
+        d. Exit
     4. Show cost estimate
     5. Deploy and report the result
 
@@ -14,7 +18,7 @@ Supported Platforms:
     - Render (Full-stack, Python, Node.js)
 
 Author: OPUN8 Team
-Version: 0.1.5
+Version: 0.1.6
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import webbrowser
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import requests
 import typer
@@ -35,9 +39,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
+from rich.markup import escape
 
 from opun8.auth import (
-    get_authenticated_user,
     get_github_token,
     is_authenticated,
     login_to_github,
@@ -56,6 +60,9 @@ from opun8.ui.messages import (
     _escape_text,
     _safe_prompt,
     _safe_confirm,
+    _safe_prompt_free,
+    deploy_platform_start,
+    deploy_platform_menu,
 )
 
 # =============================================================================
@@ -125,7 +132,11 @@ PLATFORM_CHOICES: Dict[str, Platform] = {
     "3": Platform.RENDER,
 }
 
-IMPLEMENTED_PLATFORMS = {Platform.VERCEL, Platform.NETLIFY, Platform.RENDER}
+PLATFORM_DISPLAY_NAMES = {
+    Platform.VERCEL: "Vercel",
+    Platform.NETLIFY: "Netlify",
+    Platform.RENDER: "Render",
+}
 
 
 @dataclass
@@ -133,6 +144,7 @@ class SuccessResult:
     """Result of a successful deployment."""
     url: str
     project_name: str
+    platform: Platform
     project_id: Optional[str] = None
 
 
@@ -202,7 +214,7 @@ def _get_vercel_plan() -> str:
         return "pro"
 
     except Exception as e:
-        console.print(f"[dim]⚠️ Could not detect Vercel plan: {e}[/dim]")
+        console.print(f"[dim]⚠️ Could not detect Vercel plan: {escape(str(e))}[/dim]")
         return "hobby"
 
 
@@ -251,7 +263,7 @@ def _get_render_plan() -> str:
         return plan
 
     except Exception as e:
-        console.print(f"[dim]⚠️ Could not detect Render tier: {e}[/dim]")
+        console.print(f"[dim]⚠️ Could not detect Render tier: {escape(str(e))}[/dim]")
         return "individual"
 
 
@@ -304,8 +316,36 @@ def _get_netlify_plan() -> str:
         return mapped_plan
 
     except Exception as e:
-        console.print(f"[dim]⚠️ Could not detect Netlify plan: {e}[/dim]")
+        console.print(f"[dim]⚠️ Could not detect Netlify plan: {escape(str(e))}[/dim]")
         return "hobby"
+
+
+# =============================================================================
+# BUILD STEP
+# =============================================================================
+
+def _build_project(project_info: ProjectInfo) -> Optional[ProjectInfo]:
+    """
+    Run the build step for a (re)detected project and stamp the resulting
+    output directory onto its metadata.
+
+    Returns:
+        The updated ProjectInfo, or None if the build failed (an error
+        has already been printed to the console).
+    """
+    build_service = get_build_service()
+    build_result = build_service.ensure_build()
+
+    if not build_result["built"]:
+        console.print()
+        console.print(f"[red]{_sym('error')} Build failed. Please fix build errors and try again.[/red]")
+        console.print(f"[dim]   Error: {escape(str(build_result.get('message', 'Unknown error')))}[/dim]")
+        return None
+
+    build_info = build_service.get_build_info()
+    project_info.metadata["build_info"] = build_info
+    project_info.metadata["output_dir"] = build_info.get("output_dir", ".")
+    return project_info
 
 
 # =============================================================================
@@ -314,13 +354,16 @@ def _get_netlify_plan() -> str:
 
 def deploy(
     platform_arg: Optional[str] = None,
-    skip_github: bool = False,
     detected_project: Optional[ProjectInfo] = None,
 ) -> None:
-    """Run the interactive deployment flow."""
-    try:
-        _print_welcome_banner()
+    """
+    Deploy your project to the cloud.
 
+    If a platform is specified (netlify, vercel, render), skips the platform
+    selection menu and goes directly to the 4-option deploy menu.
+    """
+    try:
+        # Step 1: Detect or use provided project
         if detected_project:
             project_info = detected_project
             console.print()
@@ -332,23 +375,41 @@ def deploy(
             if project_info is None:
                 return
 
-        build_service = get_build_service()
-        build_result = build_service.ensure_build()
-
-        if not build_result["built"]:
-            console.print()
-            console.print(f"[red]{_sym('error')} Build failed. Please fix build errors and try again.[/red]")
-            console.print(f"[dim]   Error: {build_result.get('message', 'Unknown error')}[/dim]")
+        # Step 2: Build if needed
+        project_info = _build_project(project_info)
+        if project_info is None:
             return
 
-        build_info = build_service.get_build_info()
-        project_info.metadata["build_info"] = build_info
-        project_info.metadata["output_dir"] = build_info.get("output_dir", ".")
+        # Step 3: Determine platform
+        platform = None
 
-        if skip_github:
-            _deploy_without_github(project_info, platform_arg)
+        if platform_arg:
+            # Platform specified via command line
+            platform_lower = platform_arg.lower()
+            if platform_lower == "vercel":
+                platform = Platform.VERCEL
+            elif platform_lower == "netlify":
+                platform = Platform.NETLIFY
+            elif platform_lower == "render":
+                platform = Platform.RENDER
+            else:
+                msg.error(
+                    f"Unknown platform: {platform_arg}",
+                    suggestion="Supported platforms: vercel, netlify, render",
+                )
+                raise typer.Exit(1)
+
+            # Show platform-specific welcome and 4-option menu
+            _show_platform_deploy_menu(project_info, platform)
+
         else:
-            _show_deploy_menu(project_info, platform_arg)
+            # No platform specified — show platform selection first
+            platform = _ask_platform()
+            if platform is None:
+                return
+
+            # Then show 4-option menu
+            _show_platform_deploy_menu(project_info, platform)
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]{_sym('warning')} Deployment cancelled.[/yellow]")
@@ -368,132 +429,290 @@ def deploy(
 
 
 # =============================================================================
-# DEPLOY MENU
+# PLATFORM DEPLOY MENU (4 Options)
 # =============================================================================
 
-def _show_deploy_menu(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Display the interactive deployment menu."""
+def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) -> None:
+    """
+    Show the 4-option deploy menu for a specific platform.
+
+    ✅ FIX: Now uses ui.messages.deploy_platform_start() and deploy_platform_menu()
+    
+    Options:
+        1. Deploy Now
+        2. Select Different Project
+        3. Deploy GitHub Repo
+        4. Exit
+    """
+    while True:
+        # Show platform-specific welcome (from ui.messages)
+        deploy_platform_start(platform.value)
+        
+        # Show project summary
+        _show_project_summary(project_info)
+
+        # Show 4 options and get user choice (from ui.messages)
+        choice = deploy_platform_menu()
+        
+        # _safe_prompt raises Exit on cancel, so choice should never be None
+        # but keep check for safety
+        if choice is None:
+            msg.goodbye()
+            raise typer.Exit()
+
+        if choice == "1":
+            # Deploy Now
+            _deploy_to_platform(project_info, platform)
+            # After deployment attempt, return to menu
+            continue
+
+        elif choice == "2":
+            # Select Different Project
+            if _browse_and_change_folder():
+                new_project = _detect_project()
+                if new_project:
+                    new_project = _build_project(new_project)
+                    if new_project:
+                        project_info = new_project
+                        continue
+                else:
+                    console.print("[yellow]No project detected in the selected folder.[/yellow]")
+                    continue
+            else:
+                console.print("[dim]Folder selection cancelled.[/dim]")
+                continue
+
+        elif choice == "3":
+            # Deploy GitHub Repo
+            _deploy_github_repo(platform)
+            continue
+
+        else:
+            # Exit
+            msg.goodbye()
+            raise typer.Exit()
+
+
+def _browse_and_change_folder() -> bool:
+    """
+    Open the native OS folder picker and change to the selected folder.
+
+    Returns:
+        True if folder was selected and directory changed, False if cancelled.
+    """
     console.print()
-    console.print(f"[bold]{_emoji_or_empty('party')} Nice! Your project is ready. What would you like to do?[/bold]")
-    console.print()
-    console.print(f"  [bold cyan]1[/] {_emoji_or_empty('rocket')} [white]Deploy this project (with GitHub)[/white]")
-    console.print(f"  [bold cyan]2[/] {_emoji_or_empty('skip')} [white]Deploy without GitHub[/white]")
-    console.print(f"  [bold cyan]3[/] {_emoji_or_empty('folder')} [white]Select a different project[/white]")
-    console.print(f"  [bold cyan]4[/] {_emoji_or_empty('door')} [white]Exit[/white]")
+    console.print(Panel(
+        f"[bold cyan]{_sym('browse')} Let's find your project, partner![/bold cyan]\n"
+        f"[dim]The folder picker dialog will open — just select your project folder.[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=PANEL_WIDTH,
+    ))
     console.print()
 
-    choice = _safe_prompt(
-        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
-        choices=["1", "2", "3", "4"],
-        default="1",
+    from opun8.services.navigation import browse_to_folder
+    selected = browse_to_folder()
+
+    if not selected:
+        console.print(f"[dim]{_sym('smile')} All good — folder selection cancelled.[/dim]")
+        return False
+
+    os.chdir(selected)
+    console.print()
+    console.print(
+        f"[green]{_sym('success')} Hopped into [cyan]{escape(str(selected))}[/cyan] "
+        f"— let's see what we've got![/green]"
+    )
+    console.print()
+    return True
+
+
+def _ensure_github_auth() -> Optional[str]:
+    """
+    Ensure the user is authenticated with GitHub and return the token.
+    
+    Returns:
+        GitHub token if authenticated, None otherwise.
+    """
+    if not is_authenticated():
+        console.print(f"[yellow]{_sym('warning')} You're not connected to GitHub yet.[/yellow]")
+        login_to_github()
+
+    if not is_authenticated():
+        msg.error(
+            "GitHub authentication failed.",
+            suggestion="Run `opun8 github` to connect manually.",
+        )
+        return None
+
+    token = get_github_token()
+    if not token:
+        msg.error(
+            "No GitHub token found.",
+            suggestion="Run `opun8 github` to connect.",
+        )
+        return None
+
+    return token
+
+
+def _deploy_github_repo(platform: Platform) -> None:
+    """
+    Clone and deploy a GitHub repository.
+    
+    ✅ FIX: Uses _safe_prompt_free() for free-text input.
+    """
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{_sym('clone')} Deploy GitHub Repo[/bold cyan]\n"
+        f"[dim]{_emoji_or_empty('handshake')} Let's get a repo from GitHub and deploy it![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=PANEL_WIDTH,
+    ))
+    console.print()
+
+    # Step 1: Ensure GitHub auth
+    github_token = _ensure_github_auth()
+    if github_token is None:
+        console.print("[yellow]GitHub authentication required for this feature.[/yellow]")
+        return
+
+    # Step 2: Ask for GitHub repo URL
+    # ✅ FIX: Use _safe_prompt_free() for free-text input
+    repo_url = _safe_prompt_free(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter GitHub repository URL (e.g., https://github.com/user/repo)",
+        default="",
     )
 
-    if choice is None:
+    if not repo_url or not repo_url.strip():
+        console.print("[yellow]No repository URL provided. Returning to menu.[/yellow]")
         return
 
-    if choice == "1":
-        _deploy_with_github(project_info, platform_arg)
+    repo_url = repo_url.strip()
 
-    elif choice == "2":
-        _deploy_without_github(project_info, platform_arg)
+    # Step 3: Ask for clone destination
+    default_dest = Path.cwd() / "cloned_repo"
+    # ✅ FIX: Use _safe_prompt_free() for free-text input
+    dest_path = _safe_prompt_free(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Clone destination path",
+        default=str(default_dest),
+    )
 
-    elif choice == "3":
-        from opun8.services.navigation import browse_to_folder
-        selected_path = browse_to_folder()
-        if selected_path:
-            os.chdir(selected_path)
-            # ✅ FIX: Call deploy() directly, no self-import
-            deploy(platform_arg=platform_arg)
-        else:
-            console.print(f"[dim]{_emoji_or_empty('back')} Folder selection cancelled. Returning to menu.[/dim]")
-            _show_deploy_menu(project_info, platform_arg)
+    if not dest_path or not dest_path.strip():
+        console.print("[yellow]No destination provided. Returning to menu.[/yellow]")
+        return
 
+    dest_path = dest_path.strip()
+
+    dest = Path(dest_path).expanduser()
+
+    # Warn before overwriting existing folder
+    if dest.exists():
+        console.print()
+        console.print(
+            f"[yellow]{_sym('warning')} '{escape(str(dest))}' already exists "
+            f"and will be erased before cloning.[/yellow]"
+        )
+        confirm = _safe_confirm(
+            f"{_emoji_or_empty('arrow')} Continue and overwrite it?",
+            default=False,
+        )
+        if confirm is None or not confirm:
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    # Step 4: Clone the repo with GitHub token
+    console.print()
+    console.print(f"[dim]{_emoji_or_empty('clone')} Cloning repository...[/dim]")
+
+    git_service = GitService()
+    success, message = git_service.clone_repository(
+        repo_url=repo_url,
+        target_path=str(dest),
+        token=github_token,
+        depth=1,
+    )
+
+    if not success:
+        console.print(f"[red]{_sym('error')} Failed to clone: {escape(message)}[/red]")
+        return
+
+    console.print(f"[green]{_sym('success')} {escape(message)}[/green]")
+
+    # Step 5: Change to the cloned directory
+    cloned_path = dest.resolve()
+    if cloned_path.exists() and cloned_path.is_dir():
+        os.chdir(cloned_path)
+        console.print(f"[dim]{_emoji_or_empty('folder')} Changed to: {escape(str(cloned_path))}[/dim]")
+        console.print()
+
+        # Step 6: Detect the cloned project
+        project_info = _detect_project()
+        if project_info is None:
+            console.print("[yellow]No project detected in the cloned repository.[/yellow]")
+            return
+
+        # Step 7: Build the cloned project
+        project_info = _build_project(project_info)
+        if project_info is None:
+            return
+
+        # Step 8: Deploy, passing the repo URL through
+        _deploy_to_platform(project_info, platform, repo_url=repo_url)
     else:
-        msg.goodbye()
-        raise typer.Exit()
+        console.print(f"[red]{_sym('error')} Could not find cloned directory: {escape(str(cloned_path))}[/red]")
 
 
-def _deploy_with_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Deploy with GitHub push."""
-    repo_url, cancelled = _handle_github_push(project_info)
-
-    if repo_url is None:
-        if cancelled:
-            console.print(f"[dim]{_emoji_or_empty('back')} GitHub push cancelled. Continuing without GitHub.[/dim]")
-        else:
-            console.print(f"[yellow]{_sym('warning')} GitHub push failed. Continuing without GitHub.[/yellow]")
-
-    _continue_deploy(project_info, repo_url, platform_arg)
-
-
-def _deploy_without_github(project_info: ProjectInfo, platform_arg: Optional[str] = None) -> None:
-    """Deploy without GitHub push."""
-    console.print(f"[dim]{_emoji_or_empty('skip')} Skipping GitHub push.[/dim]")
-    _continue_deploy(project_info, None, platform_arg)
-
-
-def _continue_deploy(
+def _deploy_to_platform(
     project_info: ProjectInfo,
-    repo_url: Optional[str],
-    platform_arg: Optional[str] = None,
-) -> None:
-    """Continue with deployment after GitHub decision."""
-    platform = _ask_platform(default_platform=platform_arg)
-    if platform is None:
-        return
+    platform: Platform,
+    repo_url: Optional[str] = None,
+) -> bool:
+    """
+    Show the cost estimate and deploy the project to the specified platform
+    if the user confirms.
 
-    if platform not in IMPLEMENTED_PLATFORMS:
-        msg.info(f"{platform.value.capitalize()} support is coming soon!")
-        return
-
+    Returns:
+        True if a deployment attempt was made; False if the user backed out.
+    """
+    # Show cost estimate
     estimator = get_cost_estimator(project_info)
 
     if platform == Platform.VERCEL:
         plan = _get_vercel_plan()
         estimate = estimator.estimate_vercel(plan=plan)
-    elif platform == Platform.RENDER:
-        plan = _get_render_plan()
-        estimate = estimator.estimate_render(workspace_plan=plan)
     elif platform == Platform.NETLIFY:
         plan = _get_netlify_plan()
         estimate = estimator.estimate_netlify(plan=plan)
+    elif platform == Platform.RENDER:
+        plan = _get_render_plan()
+        estimate = estimator.estimate_render(workspace_plan=plan)
     else:
         msg.error(f"Unknown platform: {platform.value}")
-        return
+        return False
 
     if estimate:
         if not display_cost_estimate(estimate):
             console.print(f"[dim]{_emoji_or_empty('back')} Deployment cancelled.[/dim]")
-            return
+            return False
         display_savings_tip(estimate)
     else:
         console.print(f"[yellow]{_sym('warning')} Could not generate cost estimate.[/yellow]")
         if not _safe_confirm(f"{_emoji_or_empty('rocket')} Continue with deployment?", default=True):
             console.print(f"[dim]{_emoji_or_empty('back')} Deployment cancelled.[/dim]")
-            return
+            return False
 
+    # Execute deployment
+    # ✅ FIX: repo_url only passed to Render (Vercel/Netlify don't use it)
     if platform == Platform.VERCEL:
-        _handle_vercel_deploy(project_info, repo_url)
+        _handle_vercel_deploy(project_info)
     elif platform == Platform.NETLIFY:
-        _handle_netlify_deploy(project_info, repo_url)
+        _handle_netlify_deploy(project_info)
     elif platform == Platform.RENDER:
         _handle_render_deploy(project_info, repo_url)
 
-
-# =============================================================================
-# UI HELPERS
-# =============================================================================
-
-def _print_welcome_banner() -> None:
-    """Print the welcome banner with partner tone."""
-    console.print()
-    console.print(Panel(
-        f"[bold cyan]{_emoji_or_empty('rocket')} Opun8 Deploy — Let's launch your site![/bold cyan]\n"
-        f"[dim]{_emoji_or_empty('heart')} I'll guide you through deploying your project, partner![/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=PANEL_WIDTH,
-    ))
+    return True
 
 
 # =============================================================================
@@ -548,113 +767,17 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
     )
 
     for label, value in fields:
-        table.add_row(label, str(value))
+        table.add_row(label, escape(str(value)))
 
     console.print(table)
     console.print()
 
 
 # =============================================================================
-# GITHUB INTEGRATION
-# =============================================================================
-
-def _sanitize_repo_name(name: str) -> str:
-    """Sanitize a repository name for GitHub compatibility."""
-    name = name.replace(" ", "-")
-    name = re.sub(r'[^a-zA-Z0-9\-_]', '', name)
-    return name.lower()
-
-
-def _handle_github_push(project_info: ProjectInfo) -> Tuple[Optional[str], bool]:
-    """
-    Authenticate with GitHub, create a repo, and push the project.
-
-    Returns:
-        (repo_url, cancelled)
-    """
-    try:
-        console.print()
-        console.print(f"[bold cyan]{_emoji_or_empty('lock')} GitHub Authentication[/bold cyan]")
-        console.print(f"[dim]{_emoji_or_empty('handshake')} I need access to create a repository and push your code.[/dim]")
-        console.print()
-
-        if not is_authenticated():
-            console.print(f"[yellow]{_sym('warning')} You're not connected to GitHub yet.[/yellow]")
-            login_to_github()
-
-        if not is_authenticated():
-            msg.error(
-                "GitHub authentication failed.",
-                suggestion="Run `opun8 github` to connect manually.",
-            )
-            return None, False
-
-        token = get_github_token()
-        if not token:
-            msg.error(
-                "No GitHub token found.",
-                suggestion="Run `opun8 github` to connect.",
-            )
-            return None, False
-
-        username = get_authenticated_user()
-        if not username:
-            msg.error(
-                "Could not get GitHub username.",
-                suggestion="Run `opun8 github` to reconnect.",
-            )
-            return None, False
-
-        default_name = project_info.metadata.get("name", Path.cwd().name)
-        console.print()
-        console.print(f"[bold]Repository name:[/bold] [cyan]{default_name}[/cyan]")
-        console.print("[dim]Spaces will be replaced with hyphens for GitHub compatibility.[/dim]")
-
-        raw_name = _safe_prompt(f"[bold cyan]{_emoji_or_empty('arrow')}[/] Repository name", default=default_name)
-        if raw_name is None:
-            return None, True
-
-        repo_name = _sanitize_repo_name(raw_name)
-
-        if repo_name != raw_name:
-            console.print(f"[dim]ℹ️ Using sanitized name: [cyan]{repo_name}[/cyan][/dim]")
-
-        console.print()
-        console.print(f"[dim]{_emoji_or_empty('folder')} Creating repository and pushing code...[/dim]")
-
-        repo_url = f"https://github.com/{username}/{repo_name}"
-        git_service = GitService()
-        success, message = git_service.push_to_github(repo_url, token=token)
-
-        if success:
-            msg.success(message)
-            return repo_url, False
-
-        if "nothing to commit" in message.lower():
-            console.print(f"[dim]{_sym('success')} No changes to commit — repository is already up to date.[/dim]")
-            return repo_url, False
-
-        msg.error(message)
-        return None, False
-
-    except KeyboardInterrupt:
-        console.print(f"\n[yellow]{_sym('warning')} GitHub push cancelled.[/yellow]")
-        return None, True
-
-    except Exception as exc:
-        _log_debug_exception("_handle_github_push() unexpected error", exc)
-        msg.error(
-            f"GitHub push failed: {exc}",
-            suggestion="Check your internet connection and try again.",
-        )
-        return None, False
-
-
-# =============================================================================
 # PLATFORM SELECTION
 # =============================================================================
 
-def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
+def _ask_platform() -> Optional[Platform]:
     """Ask the user which platform to deploy to."""
     console.print()
     console.print(f"[bold]{_emoji_or_empty('question')} Which platform would you like to deploy to?[/bold]")
@@ -664,20 +787,13 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
     console.print(f"  [bold cyan]3[/] {_emoji_or_empty('cloud')} [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
     console.print()
 
-    default_choice = "1"
-    if default_platform:
-        platform_lower = default_platform.lower()
-        if platform_lower == "netlify":
-            default_choice = "2"
-        elif platform_lower == "render":
-            default_choice = "3"
-
     choice = _safe_prompt(
         f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
         choices=list(PLATFORM_CHOICES.keys()),
-        default=default_choice,
+        default="1",
     )
 
+    # _safe_prompt raises Exit on cancel, so choice should never be None
     if choice is None:
         return None
 
@@ -688,7 +804,7 @@ def _ask_platform(default_platform: Optional[str] = None) -> Optional[Platform]:
 # VERCEL DEPLOYMENT
 # =============================================================================
 
-def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
+def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
     """Deploy the project to Vercel."""
     try:
         console.print()
@@ -697,14 +813,8 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print()
 
         output_dir = project_info.metadata.get("output_dir", ".")
-        # ✅ FIX: Properly close [cyan] tag
-        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{output_dir}[/cyan][/dim]")
+        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{escape(str(output_dir))}[/cyan][/dim]")
         console.print()
-
-        if repo_url:
-            console.print(f"[dim]ℹ️ GitHub repo: {repo_url}[/dim]")
-            console.print("[dim]   (GitHub-linked deploys are coming soon — uploading directly for now)[/dim]")
-            console.print()
 
         if not _ensure_vercel_auth():
             return
@@ -748,6 +858,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
                 url=url,
                 project_name=project_name,
                 project_id=project_id,
+                platform=Platform.VERCEL,
             ))
         else:
             msg.error(
@@ -798,7 +909,7 @@ def _ensure_vercel_auth() -> bool:
 # NETLIFY DEPLOYMENT
 # =============================================================================
 
-def _handle_netlify_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
+def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
     """Deploy the project to Netlify."""
     try:
         console.print()
@@ -807,14 +918,8 @@ def _handle_netlify_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -
         console.print()
 
         output_dir = project_info.metadata.get("output_dir", ".")
-        # ✅ FIX: Properly close [cyan] tag
-        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{output_dir}[/cyan][/dim]")
+        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{escape(str(output_dir))}[/cyan][/dim]")
         console.print()
-
-        if repo_url:
-            console.print(f"[dim]ℹ️ GitHub repo: {repo_url}[/dim]")
-            console.print("[dim]   Netlify will deploy from your local files directly.[/dim]")
-            console.print()
 
         if not _ensure_netlify_auth():
             return
@@ -855,6 +960,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -
                 url=url,
                 project_name=site_name,
                 project_id=site_id,
+                platform=Platform.NETLIFY,
             ))
         else:
             msg.error(
@@ -905,7 +1011,7 @@ def _ensure_netlify_auth() -> bool:
 # RENDER DEPLOYMENT
 # =============================================================================
 
-def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) -> None:
+def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = None) -> None:
     """Deploy the project to Render."""
     try:
         console.print()
@@ -914,14 +1020,8 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
         console.print()
 
         output_dir = project_info.metadata.get("output_dir", ".")
-        # ✅ FIX: Properly close [cyan] tag
-        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{output_dir}[/cyan][/dim]")
+        console.print(f"[dim]{_emoji_or_empty('folder')} Output directory: [cyan]{escape(str(output_dir))}[/cyan][/dim]")
         console.print()
-
-        if repo_url:
-            console.print(f"[dim]ℹ️ GitHub repo: {repo_url}[/dim]")
-            console.print("[dim]   Render will deploy directly from GitHub.[/dim]")
-            console.print()
 
         if not _ensure_render_auth():
             return
@@ -973,6 +1073,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str]) ->
                 url=url,
                 project_name=project_name,
                 project_id=service_id,
+                platform=Platform.RENDER,
             ))
         else:
             msg.error(
@@ -1043,14 +1144,14 @@ def _record_deployment_history(
         )
     except Exception as exc:
         console.print(
-            f"[yellow]{_sym('warning')} Deployment succeeded, but couldn't be saved to history: {exc}[/yellow]"
+            f"[yellow]{_sym('warning')} Deployment succeeded, but couldn't be saved to history: {escape(str(exc))}[/yellow]"
         )
         return
 
     try:
         show_badge_notification(deployment_record.get("badge_unlocked"))
     except Exception as exc:
-        console.print(f"[yellow]{_sym('warning')} Couldn't check badge progress: {exc}[/yellow]")
+        console.print(f"[yellow]{_sym('warning')} Couldn't check badge progress: {escape(str(exc))}[/yellow]")
 
 
 # =============================================================================
@@ -1064,25 +1165,33 @@ def _show_success(result: SuccessResult) -> None:
     console.print()
     console.print(Panel(
         f"[bold green]{_sym('party')} WE DID IT, PARTNER! {_sym('party')}[/bold green]\n\n"
-        f"[bold]{_emoji_or_empty('globe')} {full_url}[/bold]\n\n"
-        f"[dim]Your project '{result.project_name}' is now live![/dim]",
+        f"[bold]{_emoji_or_empty('globe')} {escape(full_url)}[/bold]\n\n"
+        f"[dim]Your project '{escape(result.project_name)}' is now live![/dim]",
         border_style="green",
         padding=(1, 2),
         width=PANEL_WIDTH,
     ))
     console.print()
 
+    # Only show rename option for Vercel deployments
+    can_rename = result.platform == Platform.VERCEL and bool(result.project_id)
+
     console.print("[bold]What would you like to do?[/bold]")
     console.print()
     console.print(f"  [bold cyan]1[/] {_emoji_or_empty('globe')} [white]Open website[/white]")
     console.print(f"  [bold cyan]2[/] {_emoji_or_empty('clipboard')} [white]Copy URL[/white]")
-    console.print(f"  [bold cyan]3[/] {_emoji_or_empty('pencil')} [white]Rename URL[/white]  [dim](make it shorter)[/dim]")
-    console.print(f"  [bold cyan]4[/] {_emoji_or_empty('door')} [white]Exit[/white]")
+    if can_rename:
+        console.print(f"  [bold cyan]3[/] {_emoji_or_empty('pencil')} [white]Rename URL[/white]  [dim](make it shorter)[/dim]")
+        console.print(f"  [bold cyan]4[/] {_emoji_or_empty('door')} [white]Exit[/white]")
+        choices = ["1", "2", "3", "4"]
+    else:
+        console.print(f"  [bold cyan]3[/] {_emoji_or_empty('door')} [white]Exit[/white]")
+        choices = ["1", "2", "3"]
     console.print()
 
     choice = _safe_prompt(
         f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
-        choices=["1", "2", "3", "4"],
+        choices=choices,
         default="1",
     )
 
@@ -1092,10 +1201,10 @@ def _show_success(result: SuccessResult) -> None:
 
     if choice == "1":
         webbrowser.open(full_url)
-        console.print(f"[dim]{_emoji_or_empty('globe')} Opened {full_url}[/dim]")
+        console.print(f"[dim]{_emoji_or_empty('globe')} Opened {escape(full_url)}[/dim]")
     elif choice == "2":
         _copy_to_clipboard(full_url)
-    elif choice == "3":
+    elif choice == "3" and can_rename:
         _rename_url_flow(result)
     else:
         msg.goodbye()
@@ -1108,7 +1217,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
     console.print(f"[bold cyan]{_emoji_or_empty('pencil')} Rename Your Deployment[/bold cyan]")
     console.print("[dim]Choose a shorter, cleaner name for your project.[/dim]")
     console.print()
-    console.print(f"[dim]Current URL: [cyan]{result.url}[/cyan][/dim]")
+    console.print(f"[dim]Current URL: [cyan]{escape(result.url)}[/cyan][/dim]")
     console.print()
 
     if not result.project_id:
@@ -1131,15 +1240,17 @@ def _rename_url_flow(result: SuccessResult) -> None:
         console.print()
 
         sanitized_name = current_name.replace("-", "")
-        new_name = _safe_prompt(
+        # ✅ FIX: Use _safe_prompt_free() for free-text input
+        new_name = _safe_prompt_free(
             f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter a new name",
             default=sanitized_name,
         )
 
-        if new_name is None:
+        if not new_name or not new_name.strip():
             console.print("[dim]Skipping rename.[/dim]")
             return
 
+        new_name = new_name.strip()
         new_name = re.sub(r'[^a-zA-Z0-9-]', '', new_name)
         new_name = new_name.lower().strip('-')
 
@@ -1151,7 +1262,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
             console.print(f"[red]{_sym('error')} Name must be less than 30 characters.[/red]")
             continue
 
-        # ✅ FIX: Compare against sanitized name, not original
         if new_name == sanitized_name:
             console.print(f"[yellow]{_sym('warning')} Same as current name. Skipping rename.[/yellow]")
             return
@@ -1164,10 +1274,10 @@ def _rename_url_flow(result: SuccessResult) -> None:
         team_id = (get_vercel_scope() or {}).get("team_id")
 
         console.print()
-        console.print(f"[dim]Attempting rename to [cyan]{new_name}[/cyan]...[/dim]")
+        console.print(f"[dim]Attempting rename to [cyan]{escape(new_name)}[/cyan]...[/dim]")
 
         confirm = _safe_confirm(
-            f"[bold]Rename to [cyan]{new_name}[/cyan]?[/bold]",
+            f"[bold]Rename to [cyan]{escape(new_name)}[/cyan]?[/bold]",
             default=True
         )
 
@@ -1181,7 +1291,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
         if success:
             console.print()
             console.print(f"[bold green]{_sym('success')} Renamed successfully![/bold green]")
-            console.print(f"[bold]{_emoji_or_empty('globe')} https://{message}[/bold]")
+            console.print(f"[bold]{_emoji_or_empty('globe')} https://{escape(message)}[/bold]")
             console.print()
             console.print("[bold]What would you like to do?[/bold]")
             console.print()
@@ -1198,7 +1308,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
 
             if choice == "1":
                 webbrowser.open(f"https://{message}")
-                console.print(f"[dim]{_emoji_or_empty('globe')} Opened https://{message}[/dim]")
+                console.print(f"[dim]{_emoji_or_empty('globe')} Opened https://{escape(message)}[/dim]")
             elif choice == "2":
                 _copy_to_clipboard(f"https://{message}")
             else:
@@ -1206,7 +1316,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
                 raise typer.Exit()
             return
 
-        console.print(f"[red]{_sym('error')} {message}[/red]")
+        console.print(f"[red]{_sym('error')} {escape(message)}[/red]")
         if attempt < max_attempts:
             console.print("[dim]Please try a different name.[/dim]")
             continue
@@ -1215,7 +1325,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
         return
 
     console.print(f"[yellow]{_sym('warning')} Could not rename. Your current URL is still active.[/yellow]")
-    console.print(f"[dim]{_emoji_or_empty('globe')} {_normalize_url(result.url)}[/dim]")
+    console.print(f"[dim]{_emoji_or_empty('globe')} {escape(_normalize_url(result.url))}[/dim]")
 
 
 # =============================================================================
@@ -1232,13 +1342,13 @@ def _normalize_url(url: str) -> str:
 def _copy_to_clipboard(url: str) -> None:
     """Copy a URL to the system clipboard."""
     if not HAS_CLIPBOARD:
-        console.print(f"[dim]{_emoji_or_empty('clipboard')} {url}[/dim]")
+        console.print(f"[dim]{_emoji_or_empty('clipboard')} {escape(url)}[/dim]")
         console.print("[yellow]⚠️ Install `pyperclip` for clipboard support: pip install pyperclip[/yellow]")
         return
 
     try:
         pyperclip.copy(url)
-        console.print(f"[green]{_sym('success')} Copied: {url}[/green]")
+        console.print(f"[green]{_sym('success')} Copied: {escape(url)}[/green]")
     except Exception:
-        console.print(f"[dim]{_emoji_or_empty('clipboard')} {url}[/dim]")
-        console.print("[yellow]⚠️ This Could not copy to clipboard. URL printed above.[/yellow]")
+        console.print(f"[dim]{_emoji_or_empty('clipboard')} {escape(url)}[/dim]")
+        console.print("[yellow]⚠️ Could not copy to clipboard. URL printed above.[/yellow]")

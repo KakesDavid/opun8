@@ -14,8 +14,15 @@ Why This File Exists:
 
 Source: https://www.netlify.com/pricing/
 
+FIXES APPLIED:
+    1. Corrected docstring example (actual calculation matches real output)
+    2. Enterprise plan now correctly shows custom pricing in recharge cost
+    3. All error responses now include consistent shape with expected keys
+    4. get_plan_recommendation() now reads from PLANS dict (single source of truth)
+    5. Recharge block math now uses integer arithmetic (no floating-point issues)
+
 Author: OPUN8 Team
-Version: 0.1.5
+Version: 0.1.6
 """
 
 from typing import Dict, Optional, Union, Any
@@ -40,7 +47,7 @@ class NetlifyPlan:
     features: list[str]
 
 
-# Available plans
+# Available plans - SINGLE SOURCE OF TRUTH
 PLANS = {
     "hobby": NetlifyPlan(
         name="Hobby",
@@ -110,9 +117,9 @@ PLANS = {
         name="Enterprise",
         monthly_price=-1.0,  # -1 indicates custom pricing (contact sales)
         credits=-1,
-        recharge_credits=-1,
+        recharge_credits=-1,  # Fixes Issue #2: Enterprise is custom, not hard-pause
         recharge_price=-1.0,
-        auto_recharge_available=True,
+        auto_recharge_available=True,  # Fixes Issue #2: Enterprise can recharge via contract
         rollover_credits=True,
         description="Custom pricing for large teams with advanced needs",
         features=[
@@ -299,12 +306,49 @@ def calculate_credits_used(
     }
 
 
+def _error_response(error_message: str) -> Dict[str, Any]:
+    """
+    Create a consistent error response shape.
+    
+    Fixes Issue #3: All error responses now include expected keys with safe defaults.
+    """
+    return {
+        "error": error_message,
+        "plan_credits": 0,
+        "credits_used": 0.0,
+        "overage_credits": 0.0,
+        "within_plan": False,
+        "message": error_message,
+        # Additional keys for calculate_total_netlify_cost compatibility
+        "base_cost": 0.0,
+        "overage_cost": 0.0,
+        "recharge_available": False,
+        "total": 0.0,
+        "plan_name": "unknown",
+        "credits_breakdown": {
+            "bandwidth_credits": 0.0,
+            "compute_credits": 0.0,
+            "web_requests_credits": 0.0,
+            "deploy_credits": 0.0,
+            "ai_credits": 0.0,
+            "total": 0.0,
+        },
+        # Additional keys for calculate_recharge_cost compatibility
+        "total_recharge_cost": 0.0,
+        "blocks_needed": 0,
+        "credits_per_block": 0,
+        "price_per_block": 0.0,
+    }
+
+
 def calculate_credit_shortfall(
     credits_used: float,
     plan: str,
-) -> Dict[str, Union[float, str, bool]]:
+) -> Dict[str, Union[float, str, bool, int]]:
     """
     Calculate if credits used exceed plan allocation.
+
+    Fixes Issue #3: Now returns consistent shape with ALL keys present.
 
     Args:
         credits_used: Total credits used
@@ -320,32 +364,39 @@ def calculate_credit_shortfall(
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        return {"error": f"Unknown plan: {plan}"}
+        # Fixes Issue #3: Return ALL keys with safe defaults
+        return _error_response(f"Unknown plan: {plan}")
 
     plan_credits = plan_obj.credits
 
+    # Enterprise: custom pricing
     if plan_credits < 0:
         return {
             "plan_credits": -1,
             "credits_used": credits_used,
-            "overage_credits": 0,
+            "overage_credits": 0.0,
             "within_plan": True,
             "message": "Enterprise plan: custom pricing",
         }
 
-    overage = max(0, credits_used - plan_credits)
+    overage = max(0.0, float(credits_used - plan_credits))
 
     return {
         "plan_credits": plan_credits,
         "credits_used": credits_used,
         "overage_credits": overage,
         "within_plan": overage <= 0,
+        "message": "All credits are within plan" if overage <= 0 else f"Exceeds plan by {overage} credits",
     }
 
 
-def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Union[float, str, bool]]:
+def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Union[float, str, bool, int]]:
     """
     Calculate cost to purchase additional credits via recharge blocks.
+
+    Fixes Issue #2: Enterprise now shows custom pricing correctly.
+    Fixes Issue #3: Now returns consistent error shape.
+    Fixes Issue #5: Uses integer arithmetic to avoid floating-point rounding.
 
     Args:
         plan: Plan name (personal, pro)
@@ -361,7 +412,19 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        return {"error": f"Unknown plan: {plan}"}
+        # Fixes Issue #3: Return consistent error shape
+        return _error_response(f"Unknown plan: {plan}")
+
+    # Fixes Issue #2: Enterprise special case
+    if plan == "enterprise":
+        return {
+            "recharge_available": True,
+            "total_recharge_cost": 0.0,  # Custom pricing, will be quoted by sales
+            "blocks_needed": 0,
+            "credits_per_block": 0,
+            "price_per_block": 0.0,
+            "message": "Enterprise plan: custom pricing — contact sales for details",
+        }
 
     # Hobby/Free has no recharge
     if not plan_obj.auto_recharge_available or plan_obj.recharge_credits <= 0:
@@ -369,6 +432,9 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
             "recharge_available": False,
             "message": "This plan has no recharge option. Sites will pause if credits are exhausted.",
             "total_recharge_cost": 0.0,
+            "blocks_needed": 0,
+            "credits_per_block": plan_obj.recharge_credits,
+            "price_per_block": plan_obj.recharge_price,
         }
 
     if overage_credits <= 0:
@@ -380,18 +446,22 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
             "price_per_block": plan_obj.recharge_price,
         }
 
-    # Calculate how many recharge blocks are needed
-    blocks_needed = int(overage_credits / plan_obj.recharge_credits)
-    if overage_credits % plan_obj.recharge_credits > 0:
-        blocks_needed += 1
+    # Fixes Issue #5: Use integer arithmetic to avoid floating-point rounding
+    # Convert to integer credits (assuming fractional credits are possible)
+    # We use integer math to avoid the floating-point % issue
+    credits_needed = int(overage_credits)
+    credits_per_block = plan_obj.recharge_credits
+    
+    # Integer division with ceiling
+    blocks_needed = (credits_needed + credits_per_block - 1) // credits_per_block
 
     total_cost = blocks_needed * plan_obj.recharge_price
 
     return {
         "recharge_available": True,
-        "total_recharge_cost": total_cost,
+        "total_recharge_cost": float(total_cost),
         "blocks_needed": blocks_needed,
-        "credits_per_block": plan_obj.recharge_credits,
+        "credits_per_block": credits_per_block,
         "price_per_block": plan_obj.recharge_price,
     }
 
@@ -407,6 +477,9 @@ def calculate_total_netlify_cost(
     """
     Calculate total Netlify monthly cost.
 
+    Fixes Issue #1: Corrected docstring example to match actual output.
+    Fixes Issue #3: Now returns consistent error shape.
+
     Args:
         plan: Plan name (hobby, personal, pro, enterprise)
         bandwidth_gb: Bandwidth used in GB
@@ -421,18 +494,34 @@ def calculate_total_netlify_cost(
     Example:
         >>> costs = calculate_total_netlify_cost("personal", 15, 30, 100000, 5)
         >>> print(costs["total"])
-        14.0  # $9 plan + $5 recharge for 200 overage credits
+        9.0  # $9 plan base, 695 credits used within 1000-credit allowance
+        >>> # No overage because 695 < 1000
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        return {"error": f"Unknown plan: {plan}"}
+        # Fixes Issue #3: Return consistent error shape
+        return _error_response(f"Unknown plan: {plan}")
 
     # Enterprise: custom pricing
     if plan_obj.monthly_price < 0:
         return {
             "message": "Enterprise plan: custom pricing",
+            "base_cost": -1.0,
+            "credits_used": 0.0,
+            "plan_credits": -1,
+            "overage_credits": 0.0,
+            "overage_cost": 0.0,
+            "recharge_available": True,
             "total": -1.0,
             "plan_name": plan_obj.name,
+            "credits_breakdown": {
+                "bandwidth_credits": 0.0,
+                "compute_credits": 0.0,
+                "web_requests_credits": 0.0,
+                "deploy_credits": 0.0,
+                "ai_credits": 0.0,
+                "total": 0.0,
+            },
         }
 
     # Base plan cost
@@ -451,7 +540,7 @@ def calculate_total_netlify_cost(
 
     # Check if usage exceeds plan
     credit_check = calculate_credit_shortfall(credits_used, plan)
-    overage_credits = credit_check.get("overage_credits", 0)
+    overage_credits = credit_check.get("overage_credits", 0.0)
 
     # Calculate recharge cost (if applicable)
     if isinstance(overage_credits, (int, float)) and overage_credits > 0:
@@ -509,33 +598,57 @@ def get_plan_recommendation(credits_needed: float) -> Dict[str, Any]:
     """
     Get recommended plan based on estimated credits needed.
 
+    Fixes Issue #4: Now reads from PLANS dict (single source of truth).
+
     Args:
         credits_needed: Estimated credits needed per month
 
     Returns:
         Dictionary with recommended plan and details
     """
-    if credits_needed <= 300:
-        return {"plan": "hobby", "credits": 300, "price": 0.00, "message": "Free tier — good for experimenting"}
-    elif credits_needed <= 1000:
-        return {"plan": "personal", "credits": 1000, "price": 9.00, "message": "Personal — good for solo developers"}
-    elif credits_needed <= 3000:
-        return {"plan": "pro", "credits": 3000, "price": 20.00, "message": "Pro — good for teams and production"}
+    # Fixes Issue #4: Read thresholds from PLANS dict
+    hobby_credits = PLANS["hobby"].credits
+    personal_credits = PLANS["personal"].credits
+    pro_credits = PLANS["pro"].credits
+    
+    if credits_needed <= hobby_credits:
+        return {
+            "plan": "hobby",
+            "credits": hobby_credits,
+            "price": PLANS["hobby"].monthly_price,
+            "message": "Free tier — good for experimenting"
+        }
+    elif credits_needed <= personal_credits:
+        return {
+            "plan": "personal",
+            "credits": personal_credits,
+            "price": PLANS["personal"].monthly_price,
+            "message": "Personal — good for solo developers"
+        }
+    elif credits_needed <= pro_credits:
+        return {
+            "plan": "pro",
+            "credits": pro_credits,
+            "price": PLANS["pro"].monthly_price,
+            "message": "Pro — good for teams and production"
+        }
     else:
         # Calculate how many Pro plans + recharges needed
-        base_credits = 3000
-        base_price = 20.00
+        base_credits = pro_credits
+        base_price = PLANS["pro"].monthly_price
         remaining = credits_needed - base_credits
-        recharge_blocks = int(remaining / 1500)
-        if remaining % 1500 > 0:
-            recharge_blocks += 1
-        recharge_cost = recharge_blocks * 10.00
+        recharge_credits_per_block = PLANS["pro"].recharge_credits
+        recharge_price_per_block = PLANS["pro"].recharge_price
+        
+        # Fixes Issue #5: Use integer arithmetic
+        blocks_needed = int((remaining + recharge_credits_per_block - 1) // recharge_credits_per_block)
+        recharge_cost = blocks_needed * recharge_price_per_block
         
         return {
             "plan": "pro",
-            "credits": 3000,
-            "price": 20.00,
-            "recharge_blocks": recharge_blocks,
+            "credits": pro_credits,
+            "price": base_price,
+            "recharge_blocks": blocks_needed,
             "recharge_cost": recharge_cost,
             "total_price": base_price + recharge_cost,
             "message": "Pro plan with additional recharge blocks",

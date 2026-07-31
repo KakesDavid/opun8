@@ -1,198 +1,199 @@
 """
 Navigation service for Opun8.
-Interactive folder browser.
+Provides folder selection using native system file picker.
 """
 
 import os
+import subprocess
+import sys
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional
+
+from rich.console import Console
+
+console = Console()
 
 
-def get_current_directory() -> str:
-    """Get current working directory."""
-    return str(Path.cwd())
-
-
-def change_directory(path: str) -> bool:
-    """Change current working directory."""
+def open_folder_picker() -> Optional[Path]:
+    """
+    Open the native system folder picker dialog.
+    
+    Returns:
+        Selected folder path, or None if cancelled.
+    
+    Supported platforms:
+        - Windows: Uses tkinter.filedialog.askdirectory()
+        - macOS: Uses osascript (AppleScript)
+        - Linux: Uses zenity or kdialog
+    """
     try:
-        new_path = Path(path).resolve()
-        if new_path.exists() and new_path.is_dir():
-            os.chdir(new_path)
-            return True
-        return False
-    except Exception:
-        return False
+        if sys.platform == "win32":
+            return _windows_picker()
+        elif sys.platform == "darwin":
+            return _macos_picker()
+        else:
+            return _linux_picker()
+    except Exception as e:
+        console.print(f"[red]❌ Failed to open folder picker: {e}[/red]")
+        console.print("[dim]Falling back to terminal input...[/dim]")
+        return _fallback_picker()
 
 
-def go_up() -> bool:
-    """Go up one directory level."""
-    current = Path.cwd()
-    parent = current.parent
-    if parent == current:
-        return False
-    os.chdir(parent)
-    return True
+def _windows_picker() -> Optional[Path]:
+    """Windows native folder picker using tkinter."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.withdraw()  # Hide the main window
+        root.attributes('-topmost', True)
+        
+        folder_path = filedialog.askdirectory(
+            title="Select Project Folder to Deploy",
+            mustexist=True,
+        )
+        
+        root.destroy()
+        
+        if folder_path:
+            return Path(folder_path)
+        return None
+        
+    except ImportError:
+        console.print("[yellow]⚠️  tkinter not available. Falling back to terminal.[/yellow]")
+        return _fallback_picker()
+    except Exception as e:
+        console.print(f"[red]❌ Folder picker error: {e}[/red]")
+        return _fallback_picker()
 
 
-def list_items(path: Optional[str] = None) -> Tuple[List[str], List[str]]:
-    """
-    List folders and files in the given path.
-    Returns: (folders, files)
-    """
-    target = Path(path) if path else Path.cwd()
-    folders = []
-    files = []
+def _macos_picker() -> Optional[Path]:
+    """macOS native folder picker using AppleScript."""
+    script = '''
+    tell application "System Events"
+        activate
+        set folderPath to choose folder with prompt "Select Project Folder to Deploy"
+        if folderPath is not false then
+            return POSIX path of folderPath
+        end if
+    end tell
+    '''
     
     try:
-        for item in target.iterdir():
-            if item.name.startswith('.'):
-                continue
-            if item.is_dir():
-                folders.append(item.name)
-            else:
-                files.append(item.name)
-    except Exception:
+        result = subprocess.run(
+            ['osascript', '-e', script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip())
+        return None
+        
+    except Exception as e:
+        console.print(f"[red]❌ Folder picker error: {e}[/red]")
+        return _fallback_picker()
+
+
+def _linux_picker() -> Optional[Path]:
+    """Linux native folder picker using zenity or kdialog."""
+    # Try zenity (GNOME)
+    try:
+        result = subprocess.run(
+            [
+                'zenity',
+                '--file-selection',
+                '--directory',
+                '--title=Select Project Folder to Deploy',
+                '--filename=' + str(Path.cwd()),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip())
+            
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     
-    return sorted(folders), sorted(files)
-
-
-def get_drive_list() -> List[str]:
-    """Get list of available drives on Windows."""
-    drives = []
+    # Try kdialog (KDE)
     try:
-        import win32api
-        drives = win32api.GetLogicalDriveStrings().split('\000')[:-1]
-    except ImportError:
-        # Fallback: check common drives
-        for letter in 'CDEFGHIJKLMNOPQRSTUVWXYZ':
-            drive = f"{letter}:\\"
-            if Path(drive).exists():
-                drives.append(drive)
-    return drives
+        result = subprocess.run(
+            [
+                'kdialog',
+                '--getexistingdirectory',
+                str(Path.cwd()),
+                '--title=Select Project Folder to Deploy',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            return Path(result.stdout.strip())
+            
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    
+    console.print("[yellow]⚠️  No GUI folder picker found. Using terminal fallback.[/yellow]")
+    return _fallback_picker()
 
 
-def is_valid_path(path: str) -> bool:
-    """Check if a path is valid."""
+def _fallback_picker() -> Optional[Path]:
+    """Fallback: terminal-based folder selection."""
+    console.print()
+    console.print("[bold]📁 Enter the path to your project folder:[/bold]")
+    console.print(f"[dim]Current directory: {Path.cwd()}[/dim]")
+    console.print("[dim](Press Enter to use current directory)[/dim]")
+    console.print()
+    
     try:
-        return Path(path).exists() and Path(path).is_dir()
-    except Exception:
-        return False
+        path_input = input("[bold cyan]➜[/] Path: ").strip()
+        
+        if not path_input:
+            return Path.cwd()
+        
+        target = Path(path_input).expanduser().resolve()
+        
+        if target.exists() and target.is_dir():
+            return target
+        
+        console.print(f"[red]❌ Invalid path: {path_input}[/red]")
+        return None
+        
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]⚠️  Cancelled.[/yellow]")
+        return None
 
 
 def browse_to_folder() -> Optional[Path]:
     """
-    Interactive folder browser for selecting a project directory.
-
-    Allows the user to:
-        - Navigate through directories
-        - Go up one level
-        - Select a folder
-        - Cancel
-
+    Open native folder picker for selecting a project directory.
+    
     Returns:
         Path of the selected folder, or None if cancelled.
-
+    
     Example:
         >>> selected = browse_to_folder()
         >>> if selected:
         ...     print(f"Selected: {selected}")
     """
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.prompt import Prompt
-    from rich.table import Table
-
-    console = Console()
-    current_path = Path.cwd()
-    PANEL_WIDTH = 60
-
-    while True:
-        # Clear screen for cleaner UX
-        os.system('cls' if os.name == 'nt' else 'clear')
-
-        # Show current directory
-        console.print()
-        console.print(Panel(
-            f"[bold cyan]📂 Select Project Folder[/bold cyan]\n"
-            f"[dim]Current: {current_path}[/dim]",
-            border_style="cyan",
-            padding=(1, 2),
-            width=PANEL_WIDTH,
-        ))
-        console.print()
-
-        # List items
-        folders, files = list_items(str(current_path))
-
-        # Show navigation options
-        console.print("[bold]Navigation:[/bold]")
-        console.print("  [bold cyan]..[/]  [white]Go up one level[/white]")
-
-        if folders:
-            console.print()
-            console.print("[bold]📁 Folders:[/bold]")
-            for i, folder in enumerate(folders[:20], 1):
-                console.print(f"  [bold cyan]{i:2}[/]  [white]{folder}[/white]")
-            if len(folders) > 20:
-                console.print(f"  [dim]... and {len(folders) - 20} more[/dim]")
-
-        if files:
-            console.print()
-            console.print("[bold]📄 Files:[/bold] [dim](for reference)[/dim]")
-            for i, file in enumerate(files[:10], 1):
-                console.print(f"  [dim]{i:2}[/]  {file}")
-            if len(files) > 10:
-                console.print(f"  [dim]... and {len(files) - 10} more[/dim]")
-
-        console.print()
-        console.print("[bold]Options:[/bold]")
-        console.print("  [bold cyan]0[/]  [green]Select this folder[/green]")
-        console.print("  [bold cyan]..[/]  [yellow]Go up one level[/yellow]")
-        console.print("  [bold cyan]q[/]   [red]Cancel[/red]")
-        console.print()
-
-        choice = Prompt.ask(
-            "[bold cyan]➜[/] Enter folder number, '..' to go up, 'q' to cancel",
-            default="0",
-            show_choices=False,
-        )
-
-        if choice.lower() == 'q':
-            console.print("[yellow]Cancelled.[/yellow]")
-            return None
-
-        if choice == '..':
-            if current_path.parent == current_path:
-                console.print("[yellow]Already at root.[/yellow]")
-                # Pause so user can see the message
-                Prompt.ask("[dim]Press Enter to continue...[/dim]", default="")
-                continue
-            current_path = current_path.parent
-            continue
-
-        try:
-            idx = int(choice)
-            if idx == 0:
-                # Select current folder
-                console.print(f"[green]✅ Selected: {current_path}[/green]")
-                return current_path
-
-            if 1 <= idx <= len(folders):
-                selected_folder = folders[idx - 1]
-                new_path = current_path / selected_folder
-                if new_path.exists() and new_path.is_dir():
-                    current_path = new_path
-                else:
-                    console.print("[red]❌ Invalid folder.[/red]")
-                    Prompt.ask("[dim]Press Enter to continue...[/dim]", default="")
-            else:
-                console.print("[red]❌ Invalid selection.[/red]")
-                Prompt.ask("[dim]Press Enter to continue...[/dim]", default="")
-        except ValueError:
-            console.print("[red]❌ Please enter a number, '..', or 'q'.[/red]")
-            Prompt.ask("[dim]Press Enter to continue...[/dim]", default="")
+    console.print()
+    console.print("[bold cyan]📂 Opening folder picker...[/bold cyan]")
+    
+    result = open_folder_picker()
+    
+    if result:
+        console.print(f"[green]✅ Selected: {result}[/green]")
+    else:
+        console.print("[yellow]⚠️  No folder selected.[/yellow]")
+    
+    return result
 
 
 # =============================================================================
@@ -200,11 +201,6 @@ def browse_to_folder() -> Optional[Path]:
 # =============================================================================
 
 __all__ = [
-    "get_current_directory",
-    "change_directory",
-    "go_up",
-    "list_items",
-    "get_drive_list",
-    "is_valid_path",
+    "open_folder_picker",
     "browse_to_folder",
 ]

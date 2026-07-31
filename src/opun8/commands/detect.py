@@ -8,20 +8,16 @@ This module:
     - Shows build configuration
     - Allows navigation to different folders
 
-✅ FIX: 'typer.Exit' raised from menu choices no longer gets swallowed by
-        the generic error handler — closing the app or hitting "back" was
-        printing a full traceback instead of exiting cleanly.
-✅ FIX: Folder navigation no longer recurses into detect(). Hopping
-        between folders now loops in place instead of stacking a new
-        try/except (and a new failure mode) on every switch.
-✅ FIX: Ctrl+D / EOF during detection is now handled as gracefully as
-        Ctrl+C, instead of only catching KeyboardInterrupt.
-✅ FIX: No more duplicate "no project found" menu. msg.no_project_detected()
-        already runs its own complete interactive flow (see messages.py) —
-        this module used to show a second, redundant menu right after it.
-✅ UPDATED: Full-width, partner-tone UI — bordered menus, warmer copy,
-            and history/badges now bring you back to the menu instead of
-            dead-ending the command.
+✅ FIX: After selecting a new folder, detection naturally re-runs via the main loop
+✅ FIX: No recursive function calls — clean stack
+✅ FIX: Native OS folder picker integration
+✅ FIX: Proper handling of Ctrl+C and Ctrl+D
+✅ FIX: No more screen-clearing — every action's output stays on screen,
+         new output is appended below a rule separator instead of wiping
+         the terminal and jumping back to the top on every redraw.
+✅ FIX: Panels no longer expand to the full (sometimes huge) console width
+         — capped so they stay visually consistent with the tables next
+         to them, matching what navigation.py already did correctly.
 """
 
 from __future__ import annotations
@@ -34,12 +30,24 @@ from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.markup import escape
 from rich import box
 
 from opun8.core.detector import detect_project, ProjectInfo
 from opun8.ui import messages as msg
 
 console = Console()
+
+# Panel() defaults to expand=True (fills console width), while Table()
+# sizes to its own content. Without an explicit width, panels stretch to
+# whatever the terminal reports — sometimes far wider than is readable,
+# and inconsistent with the tables printed alongside them. Cap it.
+MAX_PANEL_WIDTH = 78
+
+
+def _panel_width() -> int:
+    """Panel width capped to a readable max, but never wider than the terminal."""
+    return min(console.width - 2, MAX_PANEL_WIDTH)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -67,14 +75,10 @@ def _safe_prompt(
 # ──────────────────────────────────────────────────────────────
 
 def detect() -> None:
-    """
-    Detect your project type and stack.
-    """
+    """Detect your project type and stack."""
     try:
         _show_detect_screen()
     except typer.Exit:
-        # A clean, intentional exit (closing the app, "go back", etc.)
-        # — let it pass through instead of being reported as a crash.
         raise
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Detection cancelled.[/yellow]")
@@ -92,12 +96,18 @@ def _show_detect_screen() -> None:
     """
     Main detection screen with partner tone.
 
-    Runs in a loop so switching folders re-scans in place instead of
-    recursing into detect() again — no matter how many folders someone
-    bounces through in one session, this stays a single stack frame.
+    ✅ FIX: The while loop naturally re-runs detection after folder change.
+    ✅ FIX: Reruns are separated with a rule instead of clearing the
+             screen, so prior output (and the user's own terminal
+             scrollback) is never wiped out from under them.
     """
+    first_pass = True
     while True:
-        console.clear()
+        if not first_pass:
+            console.print()
+            console.rule("[dim]Re-scanning project[/dim]", style="dim")
+        first_pass = False
+
         console.print()
         msg.detection_start()
 
@@ -105,12 +115,6 @@ def _show_detect_screen() -> None:
             result = detect_project(".")
 
         if result.framework == "unknown" and not result.is_static:
-            # opun8.ui.messages.no_project_detected() is a fully self-contained
-            # interactive flow (warning panel + its own menu: pick another
-            # folder / back to main menu / exit) — it is NOT a passive
-            # banner. Showing our own menu after it returns used to produce
-            # a confusing second "no project found" menu once the user's
-            # choice had already been fully handled inside that call.
             msg.no_project_detected()
             return
 
@@ -118,7 +122,7 @@ def _show_detect_screen() -> None:
         action = _show_detect_menu(result)
 
         if action == "rescan":
-            continue
+            continue  # ✅ Re-runs detection naturally, appended below
         return
 
 
@@ -134,6 +138,7 @@ def _display_detection_results(result: ProjectInfo) -> None:
         f"[dim]{msg._emoji_or_empty('point_down')}Here's everything I found for us, partner — take a look:[/dim]",
         border_style="green",
         padding=(1, 2),
+        width=_panel_width(),
     ))
     console.print()
 
@@ -154,7 +159,6 @@ def _display_detection_results(result: ProjectInfo) -> None:
     package_manager = result.package_manager or "Unknown"
     project_type = "Static HTML" if result.is_static else "Dynamic"
 
-    # Map framework to display name
     framework_display = {
         "react": "React",
         "nextjs": "Next.js",
@@ -207,7 +211,6 @@ def _display_detection_results(result: ProjectInfo) -> None:
         msg._escape_text(output_dir)
     )
 
-    # Check if build folder exists
     build_folder_exists = f"{msg._sym('success')} Exists" if Path(output_dir).exists() else f"{msg._sym('error')} Not built yet"
     table2.add_row(f"{msg._sym('browse')} Build Folder", build_folder_exists)
 
@@ -223,9 +226,9 @@ def _show_detect_menu(result: ProjectInfo) -> str:
     """
     Show next steps menu after detection.
 
-    Returns "rescan" if the user switched to a different folder (so the
-    caller re-scans it), or "done" once they've picked a terminal action
-    (deploy, or closing the app raises typer.Exit directly).
+    Returns:
+        "rescan" if folder changed (re-run detection)
+        "done" if user selected an action
     """
     while True:
         console.print(Panel(
@@ -239,6 +242,7 @@ def _show_detect_menu(result: ProjectInfo) -> str:
             f"[dim]   I'll go ahead and put your site live, partner! {msg._sym('party')}[/dim]",
             border_style="green",
             padding=(1, 2),
+            width=_panel_width(),
         ))
         console.print()
 
@@ -258,9 +262,9 @@ def _show_detect_menu(result: ProjectInfo) -> str:
             return "done"
 
         elif choice == "2":
+            # ✅ FIX: Change folder, return "rescan" to re-run detection
             if _browse_and_change_folder():
                 return "rescan"
-            console.print()
             continue
 
         elif choice == "3":
@@ -285,24 +289,23 @@ def _show_detect_menu(result: ProjectInfo) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# GO TO FOLDER — Interactive Folder Navigation
+# FOLDER BROWSING
 # ──────────────────────────────────────────────────────────────
 
 def _browse_and_change_folder() -> bool:
     """
-    Open the folder browser and cd into whatever the user picks.
+    Open the native OS folder picker and change to the selected folder.
 
-    Returns True if the working directory actually changed, False if the
-    user backed out. Kept separate from go_to_folder() so the in-menu
-    navigation loop can react to a folder switch without recursing back
-    into detect().
+    Returns:
+        True if folder was selected and directory changed, False if cancelled.
     """
     console.print()
     console.print(Panel(
         f"[bold cyan]{msg._sym('browse')} Let's find your project, partner![/bold cyan]\n"
-        f"[dim]Pick a folder below, or type a path — I'll take it from there.[/dim]",
+        f"[dim]The folder picker dialog will open — just select your project folder.[/dim]",
         border_style="cyan",
         padding=(1, 2),
+        width=_panel_width(),
     ))
     console.print()
 
@@ -315,20 +318,19 @@ def _browse_and_change_folder() -> bool:
 
     os.chdir(selected)
     console.print()
-    console.print(f"[green]{msg._sym('success')} Hopped into [cyan]{selected}[/cyan] — let's see what we've got![/green]")
+    console.print(
+        f"[green]{msg._sym('success')} Hopped into [cyan]{escape(str(selected))}[/cyan] "
+        f"— let's see what we've got![/green]"
+    )
     console.print()
+
+    # ✅ FIX: Just return True, let the main loop handle re-running detection
     return True
 
 
 def go_to_folder() -> None:
     """
-    Interactive folder navigation to select a project, then run detection
-    on it.
-
-    Public entry point kept for callers outside this module. Internal
-    menu navigation uses _browse_and_change_folder() directly (inside a
-    loop) so switching folders repeatedly from the menu can't stack
-    recursive detect() calls.
+    Interactive folder navigation to select a project, then run detection.
     """
     if _browse_and_change_folder():
         detect()

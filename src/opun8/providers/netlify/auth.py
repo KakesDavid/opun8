@@ -4,6 +4,9 @@ Now uses the Opun8 API backend instead of local .env file.
 
 ✅ FIX: UI has been removed from this file. All UI is now handled by
 `ui/messages.py` -> `netlify_auth_start()` to avoid duplicate flows.
+
+✅ FIX: Added clear user-facing error messages when API is unavailable.
+✅ FIX: Shows specific error details (403, 404, timeout, connection refused).
 """
 
 import os
@@ -24,6 +27,7 @@ from typing import Optional, Dict, Callable, List
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.panel import Panel
 
 console = Console()
 
@@ -56,6 +60,11 @@ DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
 _DIR_MODE = stat.S_IRWXU
 _FILE_MODE = stat.S_IRUSR | stat.S_IWUSR
 
+# Token cache with TTL to prevent redundant reads
+_token_cache: Optional[Dict] = None
+_cache_timestamp: float = 0
+CACHE_TTL: int = 2  # seconds
+
 
 def _debug_log(message: str) -> None:
     """Record technical detail for later troubleshooting."""
@@ -79,9 +88,75 @@ def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional
         _debug_log(debug_detail)
 
 
+def _show_api_error_panel(error_message: str, error_detail: Optional[str] = None) -> None:
+    """
+    Show a clear, user-friendly error panel when the API is unavailable.
+    
+    ✅ FIX: New function to display clear error messages.
+    """
+    console.print()
+    
+    # Determine error type and provide helpful guidance
+    error_type = "Connection Error"
+    guidance = "The backend authentication service cannot be reached."
+    
+    if error_detail:
+        error_lower = error_detail.lower()
+        if "403" in error_lower or "forbidden" in error_lower:
+            error_type = "Access Denied (403)"
+            guidance = "The authentication service is currently unavailable (suspended or quota exceeded)."
+        elif "404" in error_lower or "not found" in error_lower:
+            error_type = "Service Not Found (404)"
+            guidance = "The authentication service could not be found. It may be down or misconfigured."
+        elif "timeout" in error_lower or "timed out" in error_lower:
+            error_type = "Timeout"
+            guidance = "The authentication service is taking too long to respond (free tier may be waking up)."
+        elif "connection refused" in error_lower:
+            error_type = "Connection Refused"
+            guidance = "The authentication service is not accepting connections (server may be down)."
+        elif "ssl" in error_lower or "certificate" in error_lower:
+            error_type = "SSL/TLS Error"
+            guidance = "There's a security certificate issue with the authentication service."
+    
+    console.print(Panel(
+        f"[bold red]❌ Authentication Service Unavailable[/bold red]\n\n"
+        f"[yellow]⚠️  {guidance}[/yellow]\n\n"
+        f"[bold]Error Details:[/bold]\n"
+        f"  Type: {error_type}\n"
+        f"  {_escape_text(error_detail or 'Unknown error')}\n\n"
+        f"[bold white]What you can do:[/bold white]\n"
+        f"  • Wait a few minutes and try again\n"
+        f"  • Check your internet connection\n"
+        f"  • Try again later when the service is restored\n\n"
+        f"[dim]💡 The authentication service is hosted on Render.com[/dim]\n"
+        f"[dim]   Free tier services may sleep after periods of inactivity.[/dim]",
+        border_style="red",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+    
+    _debug_log(f"API error shown to user: {error_type} - {error_detail}")
+
+
+def _escape_text(value) -> str:
+    """Escape rich markup in dynamic values."""
+    from rich.markup import escape
+    return escape(str(value))
+
+
+def _panel_width(preferred: int = 70, minimum: int = 40) -> int:
+    """Calculate safe panel width based on terminal size."""
+    import shutil
+    term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
+    return max(minimum, min(preferred, term_width - 4))
+
+
 def _fetch_netlify_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
     """
     Fetch Netlify client ID from the API with retry logic.
+    
+    ✅ FIX: Now shows clear user-facing error messages.
     
     Args:
         retries: Number of retry attempts (default: 3)
@@ -91,11 +166,12 @@ def _fetch_netlify_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
         client_id string, or None if all attempts fail
     """
     last_error = None
+    console.print("[dim]🔍 Connecting to authentication service...[/dim]")
     
     for attempt in range(retries):
         try:
             if attempt > 0:
-                console.print(f"[dim]⏳ Connecting to API (attempt {attempt + 1}/{retries})...[/dim]")
+                console.print(f"[dim]⏳ Retry {attempt + 1}/{retries}...[/dim]")
                 time.sleep(1.5 * attempt)
             
             response = requests.get(
@@ -108,59 +184,74 @@ def _fetch_netlify_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
                 client_id = response.json().get("client_id")
                 if client_id:
                     if attempt > 0:
-                        console.print("[green]✅ Connected to API successfully![/green]")
+                        console.print("[green]✅ Connected to authentication service[/green]")
                     return client_id
                 last_error = "Response missing client_id"
                 _debug_log(f"Netlify config response missing client_id: {response.text}")
                 continue
             
-            # 3xx redirect - unlikely, but follow or log
+            # 3xx redirect
             if 300 <= response.status_code < 400:
-                _debug_log(f"Netlify config returned redirect: {response.status_code} - {response.headers.get('Location')}")
+                last_error = f"Redirect: {response.status_code} - {response.headers.get('Location')}"
+                _debug_log(last_error)
                 continue
             
             # 5xx server errors - retry
             if response.status_code >= 500:
-                last_error = f"API returned {response.status_code}"
+                last_error = f"Server error (HTTP {response.status_code})"
                 _debug_log(f"Netlify config failed: {response.status_code} - {response.text}")
+                if attempt < retries - 1:
+                    console.print("[dim]⏳ Server error, retrying...[/dim]")
                 continue
             
-            # 4xx client errors - permanent (except 404 which might be waking up)
+            # 4xx client errors
+            if response.status_code == 403:
+                last_error = "403 Forbidden - Service suspended or quota exceeded"
+                _debug_log(f"API returned 403: {response.text}")
+                break
+            
             if response.status_code == 404:
-                # Render free tier might be waking up
-                _debug_log(f"API returned 404 - likely waking from sleep")
+                last_error = "404 Not Found - Service not available"
+                _debug_log(f"API returned 404")
                 if attempt < retries - 1:
-                    console.print("[dim]⏳ API is waking up (Render free tier sleep)...[/dim]")
+                    console.print("[dim]⏳ Service is waking up (Render free tier sleep)...[/dim]")
                 continue
             
             if 400 <= response.status_code < 500:
-                last_error = f"API returned {response.status_code}"
+                last_error = f"HTTP {response.status_code}"
                 _debug_log(f"Netlify config failed: {response.status_code} - {response.text}")
                 break
                 
         except requests.exceptions.ConnectionError as e:
-            last_error = str(e)
+            last_error = f"Connection refused: {str(e)}"
             _debug_log(f"Connection error to API: {e}")
             if attempt < retries - 1:
-                # Check for common connection error patterns
-                error_str = str(e).lower()
-                if any(word in error_str for word in ["connection", "refused", "timeout", "unreachable"]):
-                    console.print("[dim]⏳ API is waking up (Render free tier sleep)...[/dim]")
+                console.print("[dim]⏳ Cannot connect (service may be down or waking up)...[/dim]")
             continue
             
         except requests.exceptions.Timeout as e:
-            last_error = str(e)
+            last_error = f"Timeout: {str(e)}"
             _debug_log(f"Timeout connecting to API: {e}")
             if attempt < retries - 1:
-                console.print("[dim]⏳ API taking longer than expected (waking up)...[/dim]")
+                console.print("[dim]⏳ Service taking too long to respond...[/dim]")
             continue
+            
+        except requests.exceptions.SSLError as e:
+            last_error = f"SSL Error: {str(e)}"
+            _debug_log(f"SSL error: {e}")
+            break
             
         except Exception as e:
             last_error = str(e)
             _debug_log(f"Error fetching Netlify config: {e}")
             break
     
+    # ✅ FIX: Show clear error message to user
     _debug_log(f"Failed to fetch Netlify config after {retries} attempts: {last_error}")
+    _show_api_error_panel(
+        error_message="Could not connect to authentication service",
+        error_detail=last_error or "Unknown error"
+    )
     return None
 
 
@@ -266,13 +357,32 @@ def _wait_for_callback(timeout: int = 180) -> _CallbackResult:
 
 
 def _read_token_file() -> Dict:
+    """Read token file with TTL caching to avoid redundant disk I/O."""
+    global _token_cache, _cache_timestamp
+    
+    now = time.time()
+    if _token_cache is not None and (now - _cache_timestamp) < CACHE_TTL:
+        return _token_cache
+    
     try:
         if TOKEN_FILE.exists():
             with open(TOKEN_FILE, "r") as f:
-                return json.load(f)
+                _token_cache = json.load(f)
+                _cache_timestamp = now
+                return _token_cache
     except Exception as e:
         _debug_log(f"Failed to read token file: {e}")
-    return {}
+    
+    _token_cache = {}
+    _cache_timestamp = now
+    return _token_cache
+
+
+def _invalidate_cache() -> None:
+    """Force cache invalidation after writes."""
+    global _token_cache, _cache_timestamp
+    _token_cache = None
+    _cache_timestamp = 0
 
 
 def _write_token_file(data: Dict) -> bool:
@@ -297,6 +407,8 @@ def _write_token_file(data: Dict) -> bool:
             os.chmod(TOKEN_FILE, _FILE_MODE)
         except OSError as e:
             _debug_log(f"Failed to chmod token file: {e}")
+        
+        _invalidate_cache()
         return True
     except Exception as e:
         _debug_log(f"Failed to write token file: {e}")
@@ -307,30 +419,50 @@ def _write_token_file(data: Dict) -> bool:
         return False
 
 
-def get_netlify_token() -> Optional[str]:
+def is_netlify_authenticated() -> bool:
+    """Cheap local check — NO network I/O."""
     data = _read_token_file()
+    
+    if data.get("pat_token"):
+        return True
+    
+    access_token = data.get("access_token")
+    if not access_token:
+        return False
+    
+    expires_at = data.get("expires_at")
+    if expires_at is None:
+        return True
+    
+    return time.time() < expires_at
 
-    # Check PAT first
-    pat = data.get("pat_token")
-    if pat:
-        return pat
 
-    # Check OAuth token with expiry
+def refresh_if_needed() -> Optional[str]:
+    """Explicit refresh function with network I/O."""
+    data = _read_token_file()
+    
+    if data.get("pat_token"):
+        return data["pat_token"]
+    
     access_token = data.get("access_token")
     if not access_token:
         return None
-
+    
     expires_at = data.get("expires_at")
-    if expires_at is not None:
-        now = time.time()
-        if now >= expires_at - TOKEN_REFRESH_SKEW_SECONDS:
-            refreshed = refresh_netlify_token()
-            if refreshed:
-                return refreshed
-            if now >= expires_at:
-                return None
-
+    if expires_at and time.time() >= expires_at - TOKEN_REFRESH_SKEW_SECONDS:
+        return refresh_netlify_token()
+    
     return access_token
+
+
+def get_netlify_token() -> Optional[str]:
+    """Get token with optional refresh if needed."""
+    data = _read_token_file()
+    pat = data.get("pat_token")
+    if pat:
+        return pat
+    
+    return refresh_if_needed()
 
 
 def refresh_netlify_token() -> Optional[str]:
@@ -339,7 +471,6 @@ def refresh_netlify_token() -> Optional[str]:
     if not refresh_token:
         return None
 
-    # Call your API to refresh the token
     try:
         response = requests.post(
             f"{API_BASE_URL}/netlify/refresh",
@@ -368,10 +499,8 @@ def refresh_netlify_token() -> Optional[str]:
     new_refresh_token = payload.get("refresh_token")
     expires_in = payload.get("expires_in")
     
-    # Use existing user data (don't re-fetch)
     existing_user = data.get("user", {"email": "Unknown"})
 
-    # Always write expires_at - use default 3600 if missing
     save_netlify_token(new_access_token, existing_user, new_refresh_token, expires_in or 3600)
     _debug_log("refresh_netlify_token: access token refreshed successfully")
     return new_access_token
@@ -389,7 +518,6 @@ def save_netlify_token(
 ) -> None:
     data = _read_token_file()
     
-    # Clear PAT when saving OAuth token
     data.pop("pat_token", None)
     
     data["access_token"] = token
@@ -397,7 +525,6 @@ def save_netlify_token(
     if refresh_token:
         data["refresh_token"] = refresh_token
     
-    # Always set expires_at with safe default
     if expires_in is not None:
         data["expires_at"] = time.time() + expires_in
     elif "expires_at" not in data:
@@ -407,7 +534,6 @@ def save_netlify_token(
 
 
 def save_pat_token(token: str, user_info: Optional[Dict] = None) -> None:
-    """Save PAT with optional user info."""
     data = _read_token_file()
     data["pat_token"] = token
     
@@ -430,69 +556,89 @@ def clear_pat_token() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# LOGIN TO NETLIFY — SILENT (No UI)
-# ✅ FIX: All UI is now handled by ui/messages.py -> netlify_auth_start()
+# LOGIN TO NETLIFY
 # ──────────────────────────────────────────────────────────────
 
 def login_to_netlify() -> Optional[str]:
     """
-    Authenticate with Netlify using OAuth or PAT.
+    Authenticate with Netlify using OAuth.
     
-    ✅ FIX: This function is now SILENT — it does NOT show any UI.
-    All UI is handled by ui/messages.py -> netlify_auth_start().
+    ✅ FIX: Now shows clear user-facing error messages.
     
     Returns:
         Access token if successful, None otherwise.
     """
-    # Get client_id from API with retry logic
     client_id = _fetch_netlify_config()
     if not client_id:
-        _debug_log("Netlify OAuth misconfigured: could not fetch client_id from API")
+        # Error already shown by _fetch_netlify_config()
         return None
 
     code_verifier, code_challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(32)
     authorize_url = _build_authorize_url(state, code_challenge, client_id)
 
-    # Open browser silently
+    console.print("[dim]🌐 Opening browser for Netlify authorization...[/dim]")
     opened = webbrowser.open(authorize_url)
     if not opened:
-        _debug_log(f"Could not open browser automatically. Please open manually: {authorize_url}")
+        console.print("[yellow]⚠️ Could not open browser automatically.[/yellow]")
+        console.print(f"[dim]Please open this URL manually:[/dim]")
+        console.print(f"[cyan]{authorize_url}[/cyan]")
+        console.print()
+    else:
+        console.print("[green]✅ Browser opened. Please authorize Opun8 to access Netlify.[/green]")
+        console.print("[dim]Waiting for authorization...[/dim]")
+        console.print()
 
-    # Wait for callback
     result = _wait_for_callback()
 
     if result.error and not result.code:
-        _debug_log(f"OAuth callback error: {result.error}")
+        console.print(f"[red]❌ Authorization failed: {result.error}[/red]")
         return None
 
     if not secrets.compare_digest(result.state or "", state):
-        _debug_log("OAuth state mismatch on callback — possible CSRF, aborting login.")
+        console.print("[red]❌ Security check failed. Please try again.[/red]")
         return None
 
     token = _exchange_code_for_token(result.code, code_verifier)
     if not token:
-        _debug_log("Failed to exchange code for token.")
+        console.print("[red]❌ Failed to exchange authorization code for token.[/red]")
+        console.print("[dim]The authentication service may be temporarily unavailable.[/dim]")
         return None
 
+    console.print("[green]✅ Successfully authenticated with Netlify![/green]")
     return token
 
 
-def _pat_login_flow() -> Optional[str]:
+def _pat_login_flow(pat: str, max_attempts: int = 3) -> Optional[str]:
     """
-    Handle PAT-based authentication (SILENT).
+    Handle PAT-based authentication with retry logic.
     
-    ✅ FIX: This function is now SILENT — it does NOT show any UI.
-    All UI is handled by ui/messages.py -> netlify_auth_start().
+    Args:
+        pat: Personal Access Token to validate
+        max_attempts: Number of retry attempts (default: 3)
     
     Returns:
-        Access token if successful, None otherwise.
+        Access token if valid, None otherwise.
     """
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        # The UI handles prompting for the PAT via messages.py
-        # This function is called with the PAT already provided
+    if not pat or not pat.strip():
+        _debug_log("_pat_login_flow: Empty PAT provided")
         return None
+    
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            _debug_log(f"_pat_login_flow: Retry attempt {attempt}/{max_attempts}")
+            time.sleep(1 * attempt)
+        
+        user = get_netlify_user_info(pat)
+        if user:
+            save_pat_token(pat, user)
+            _debug_log(f"_pat_login_flow: PAT validated and saved successfully (attempt {attempt})")
+            return pat
+        
+        _debug_log(f"_pat_login_flow: PAT validation failed on attempt {attempt}")
+    
+    _debug_log(f"_pat_login_flow: PAT validation failed after {max_attempts} attempts")
+    return None
 
 
 def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
@@ -502,7 +648,6 @@ def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
             _debug_log("No authorization code received from Netlify.")
             return None
 
-        # Call your API to exchange the code
         response = requests.post(
             f"{API_BASE_URL}/netlify/exchange",
             json={
@@ -531,12 +676,10 @@ def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
         refresh_token = data.get("refresh_token")
         expires_in = data.get("expires_in")
         
-        # Get user info with retry logic
         user = get_netlify_user_info(token)
 
         if user:
             save_netlify_token(token, user, refresh_token, expires_in)
-            # ✅ FIX: No success message here — UI handles it
         else:
             save_netlify_token(token, {"email": "Unknown"}, refresh_token, expires_in)
             _debug_log("Connected, but couldn't load your profile details.")
@@ -573,7 +716,6 @@ def get_netlify_user_info(token: str, retries: int = 3, timeout: int = 15) -> Op
             if attempt > 0:
                 time.sleep(1.5 * attempt)
             
-            # Use Authorization header instead of query param
             response = requests.get(
                 f"{API_BASE_URL}/netlify/user",
                 headers={"Authorization": f"Bearer {token}"},
@@ -618,14 +760,11 @@ def get_netlify_user_info(token: str, retries: int = 3, timeout: int = 15) -> Op
     return None
 
 
-def is_netlify_authenticated() -> bool:
-    return get_netlify_token() is not None
-
-
 def logout_netlify() -> None:
     try:
         if TOKEN_FILE.exists():
             TOKEN_FILE.unlink()
+            _invalidate_cache()
             console.print("[green]✅ Logged out of Netlify.[/green]")
         else:
             console.print("[yellow]Not logged in.[/yellow]")
@@ -781,4 +920,5 @@ __all__ = [
     "save_pat_token",
     "get_pat_token",
     "clear_pat_token",
+    "refresh_if_needed",
 ]

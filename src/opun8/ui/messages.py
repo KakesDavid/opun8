@@ -2,19 +2,19 @@
 UI messages for Opun8.
 All user-facing messages in one place with a warm, friendly "partner" tone.
 
-Navigation between screens (welcome / help / detect menu / no-project menu)
-runs through a single iterative dispatcher (`_menu_loop`) instead of screens
-calling each other directly, so bouncing between menus doesn't grow the call
-stack.
+Navigation between screens runs through a single iterative dispatcher
+(`_menu_loop`) instead of screens calling each other directly, so
+bouncing between menus doesn't grow the call stack.
+
+Version: 0.1.6
 """
 
 import os
 import shutil
-import logging
 import webbrowser
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import typer
 from rich.console import Console
@@ -24,11 +24,7 @@ from rich.prompt import Prompt, Confirm
 from rich import box
 from rich.markup import escape
 
-from opun8.auth import is_authenticated, get_authenticated_user
-from opun8.services.recent_projects import get_recent_projects
-
 console = Console()
-logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
 # EMOJI / SYMBOL HANDLING
@@ -47,10 +43,6 @@ _SYMBOLS = {
     "party": "🎉" if not _NO_EMOJI else "",
     "heart": "💙" if not _NO_EMOJI else "",
     "star": "⭐" if not _NO_EMOJI else "*",
-    "crown": "🏆" if not _NO_EMOJI else "",
-    "badge": "🏅" if not _NO_EMOJI else "",
-    "verify": "🔑" if not _NO_EMOJI else "",
-    "lock": "🔐" if not _NO_EMOJI else "",
     "search": "🔍" if not _NO_EMOJI else "",
     "link": "🔗" if not _NO_EMOJI else "",
     "folder": "📁" if not _NO_EMOJI else "",
@@ -66,21 +58,25 @@ _SYMBOLS = {
     "wave": "👋" if not _NO_EMOJI else "",
     "smile": "😊" if not _NO_EMOJI else "",
     "joy": "🤗" if not _NO_EMOJI else "",
-    "spy": "🕵️" if not _NO_EMOJI else "",
-    "hooray": "🥳" if not _NO_EMOJI else "",
     "sparkles": "✨" if not _NO_EMOJI else "",
-    "handshake": "🤝" if not _NO_EMOJI else "",
     "home": "🏠" if not _NO_EMOJI else "",
-    "shield": "🛡️" if not _NO_EMOJI else "",
     "globe": "🌐" if not _NO_EMOJI else "",
     "construction": "🏗️" if not _NO_EMOJI else "",
-    "thumbsup": "👍" if not _NO_EMOJI else "",
-    "skip": "⏭️" if not _NO_EMOJI else ">>",
     "clipboard": "📋" if not _NO_EMOJI else "",
     "hammer": "🔨" if not _NO_EMOJI else "",
     "green_circle": "🟢" if not _NO_EMOJI else "",
     "grin": "😁" if not _NO_EMOJI else "",
     "thinking": "🤔" if not _NO_EMOJI else "",
+    "thumbsup": "👍" if not _NO_EMOJI else "",
+    "handshake": "🤝" if not _NO_EMOJI else "",
+    "shield": "🛡️" if not _NO_EMOJI else "",
+    "skip": "⏭️" if not _NO_EMOJI else ">>",
+    "verify": "🔑" if not _NO_EMOJI else "",
+    "lock": "🔐" if not _NO_EMOJI else "",
+    "hooray": "🥳" if not _NO_EMOJI else "",
+    "spy": "🕵️" if not _NO_EMOJI else "",
+    "badge": "🏅" if not _NO_EMOJI else "",
+    "crown": "🏆" if not _NO_EMOJI else "",
     # Platforms
     "triangle": "▲" if not _NO_EMOJI else "",
     "box": "📦" if not _NO_EMOJI else "",
@@ -90,9 +86,9 @@ _SYMBOLS = {
     "upgrade": "⬆️" if not _NO_EMOJI else "",
     "chart": "📊" if not _NO_EMOJI else "",
     "cycle": "🔄" if not _NO_EMOJI else "",
-    "brain": "🧠" if not _NO_EMOJI else "",
     "question": "❓" if not _NO_EMOJI else "?",
-    "owl": "🦉" if not _NO_EMOJI else "",
+    # ✅ FIX 12: Added 'pencil' symbol for rename URL flow
+    "pencil": "✏️" if not _NO_EMOJI else "",
 }
 
 _KEYCAPS = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
@@ -121,6 +117,26 @@ def _escape_text(value) -> str:
     return escape(str(value))
 
 
+def _safe_str(value) -> str:
+    """
+    Safely convert a value to string, handling None.
+    
+    ✅ FIX 3: Protects against None values in dict.get()
+    """
+    return str(value) if value is not None else ""
+
+
+def _safe_capitalize(value) -> str:
+    """
+    Safely capitalize a value, handling None.
+    
+    ✅ FIX 3: Protects against None values in .capitalize()
+    """
+    if value is None:
+        return "Unknown"
+    return str(value).capitalize()
+
+
 def _truncate(value, length: int) -> str:
     """Truncate string with ellipsis."""
     text = str(value) if value is not None else ""
@@ -129,7 +145,21 @@ def _truncate(value, length: int) -> str:
     return text
 
 
-def _safe_prompt(message: str, choices: list, default: str = "1") -> str:
+def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
+    """Calculate safe panel width based on terminal size."""
+    term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
+    return max(minimum, min(preferred, term_width - 4))
+
+
+# ──────────────────────────────────────────────────────────────
+# SAFE PROMPTS
+# ──────────────────────────────────────────────────────────────
+
+def _safe_prompt(
+    message: str,
+    choices: list,
+    default: str = "1",
+) -> str:
     """Prompt wrapper with Ctrl+C / Ctrl+D handling."""
     try:
         return Prompt.ask(
@@ -138,6 +168,22 @@ def _safe_prompt(message: str, choices: list, default: str = "1") -> str:
             default=default,
             show_choices=False,
         )
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n{_sym('wave')} Goodbye, friend!")
+        raise typer.Exit(0)
+
+
+def _safe_prompt_free(
+    message: str,
+    default: str = "",
+) -> Optional[str]:
+    """
+    Free-text prompt wrapper with Ctrl+C / Ctrl+D handling.
+    
+    ✅ FIX 6: Used for Render API key prompt and free-text inputs.
+    """
+    try:
+        return Prompt.ask(message, default=default)
     except (KeyboardInterrupt, EOFError):
         console.print(f"\n{_sym('wave')} Goodbye, friend!")
         raise typer.Exit(0)
@@ -153,28 +199,19 @@ def _safe_confirm(message: str, default: bool = True) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────
-# WIDTH / SCREEN HANDLING
-# ──────────────────────────────────────────────────────────────
-
-def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
-    term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
-    return max(minimum, min(preferred, term_width - 4))
-
-
-# ──────────────────────────────────────────────────────────────
 # CORE MESSAGES
 # ──────────────────────────────────────────────────────────────
 
 def success(message: str) -> None:
-    console.print(f"[bold green]{_sym('success')} {message}[/bold green]")
+    console.print(f"[bold green]{_sym('success')} {_escape_text(message)}[/bold green]")
 
 
 def info(message: str) -> None:
-    console.print(f"[bold blue]{_sym('info')} {message}[/bold blue]")
+    console.print(f"[bold blue]{_sym('info')} {_escape_text(message)}[/bold blue]")
 
 
 def warning(message: str) -> None:
-    console.print(f"[bold yellow]{_sym('warning')} {message}[/bold yellow]")
+    console.print(f"[bold yellow]{_sym('warning')} {_escape_text(message)}[/bold yellow]")
 
 
 def error(message: str, suggestion: str = "") -> None:
@@ -207,7 +244,11 @@ def goodbye() -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _run_action(action: str) -> None:
-    """Execute a terminal action."""
+    """
+    Execute a terminal action.
+    
+    ✅ FIX 11: Returns to welcome after actions complete.
+    """
     if action == "deploy":
         from opun8.commands.deploy import deploy
         deploy()
@@ -223,6 +264,10 @@ def _run_action(action: str) -> None:
     elif action == "exit":
         goodbye()
         raise typer.Exit()
+    
+    # ✅ FIX 11: After action completes, show welcome again
+    if action not in ("exit", "deploy"):  # deploy handles its own flow
+        show_welcome()
 
 
 def _menu_loop(start_screen: str) -> None:
@@ -255,10 +300,11 @@ def _menu_loop(start_screen: str) -> None:
 def _get_github_username() -> Optional[str]:
     """Get GitHub username if authenticated."""
     try:
+        from opun8.auth import is_authenticated, get_authenticated_user
         if is_authenticated():
             return get_authenticated_user()
-    except Exception as e:
-        logger.debug(f"Failed to get GitHub username: {e}")
+    except Exception:
+        return None
     return None
 
 
@@ -296,6 +342,7 @@ def _screen_welcome() -> Tuple[Optional[str], Optional[str]]:
     ))
     console.print()
 
+    from opun8.services.recent_projects import get_recent_projects
     recent = get_recent_projects()
     if recent:
         last_project = recent[0]
@@ -306,10 +353,9 @@ def _screen_welcome() -> Tuple[Optional[str], Optional[str]]:
     if not is_github_connected:
         console.print(f"[bold red]{_sym('error')} GITHUB IS NOT CONNECTED YET! {_sym('heart')}[/bold red]")
         console.print(f"[dim]{_emoji_or_empty('point')}Press button number {_keycap(3)} below to connect it with me![/dim]")
-        console.print()
     else:
         console.print(f"[bold green]{_sym('success')} GITHUB IS CONNECTED! Welcome back, {_escape_text(github_user)}! {_sym('party')}[/bold green]")
-        console.print()
+    console.print()
 
     console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON FOR ME TO HELP YOU:[/bold]")
     console.print()
@@ -328,11 +374,12 @@ def _screen_welcome() -> Tuple[Optional[str], Optional[str]]:
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Press a number or Enter",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Press a number or Enter",
         choices=["1", "2", "3", "4", "5"],
         default="1",
     )
 
+    # ✅ FIX 8: Removed dead code, all choices handled directly
     if choice == "1":
         return None, "deploy"
     elif choice == "2":
@@ -348,6 +395,30 @@ def _screen_welcome() -> Tuple[Optional[str], Optional[str]]:
 # ──────────────────────────────────────────────────────────────
 # HELP SCREEN
 # ──────────────────────────────────────────────────────────────
+
+_COMMANDS = [
+    ("opun8", "Show welcome screen"),
+    ("opun8 --version", "Show version"),
+    ("opun8 doctor", "Check environment"),
+    ("opun8 detect", "Detect project type"),
+    ("opun8 deploy", "Deploy your project"),
+    ("opun8 register", "Create an OPUN8 account"),
+    ("opun8 login", "Log in to your account"),
+    ("opun8 verify", "Verify email with OTP"),
+    ("opun8 resend-otp", "Resend verification code"),
+    ("opun8 status", "Check account status"),
+    ("opun8 logout", "Logout from all services"),
+    ("opun8 github", "Connect to GitHub"),
+    ("opun8 vercel", "Connect to Vercel"),
+    ("opun8 netlify", "Connect to Netlify"),
+    ("opun8 render", "Connect to Render"),
+    ("opun8 clone", "Clone any website"),
+    ("opun8 upgrade", "Upgrade subscription plan"),
+    ("opun8 history", "View deployment history"),
+    ("opun8 badges", "View badge progress"),
+    ("opun8 help", "Show this help"),
+]
+
 
 def show_help() -> None:
     """Display all commands."""
@@ -371,26 +442,8 @@ def _screen_help() -> Tuple[Optional[str], Optional[str]]:
     table.add_column("Command", style="bold green", width=22)
     table.add_column("Description", style="white", width=42)
 
-    table.add_row("opun8", "Show welcome screen")
-    table.add_row("opun8 --version", "Show version")
-    table.add_row("opun8 doctor", "Check environment")
-    table.add_row("opun8 detect", "Detect project type")
-    table.add_row("opun8 deploy", "Deploy your project")
-    table.add_row("opun8 register", "Create an OPUN8 account")
-    table.add_row("opun8 login", "Log in to your account")
-    table.add_row("opun8 verify", "Verify email with OTP")
-    table.add_row("opun8 resend-otp", "Resend verification code")
-    table.add_row("opun8 status", "Check account status")
-    table.add_row("opun8 logout", "Logout from all services")
-    table.add_row("opun8 github", "Connect to GitHub")
-    table.add_row("opun8 vercel", "Connect to Vercel")
-    table.add_row("opun8 netlify", "Connect to Netlify")
-    table.add_row("opun8 render", "Connect to Render")
-    table.add_row("opun8 clone", "Clone any website")
-    table.add_row("opun8 upgrade", "Upgrade subscription plan")
-    table.add_row("opun8 history", "View deployment history")
-    table.add_row("opun8 badges", "View badge progress")
-    table.add_row("opun8 help", "Show this help")
+    for cmd, desc in _COMMANDS:
+        table.add_row(cmd, desc)
 
     console.print(table)
     console.print()
@@ -404,15 +457,14 @@ def _screen_help() -> Tuple[Optional[str], Optional[str]]:
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
         choices=["1", "2"],
         default="1",
     )
 
     if choice == "1":
         return "welcome", None
-    else:
-        return None, "exit"
+    return None, "exit"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -449,6 +501,7 @@ def detection_complete(result: dict) -> None:
     ))
     console.print()
 
+    # ✅ FIX 3: Use _safe_str() and _safe_capitalize() to handle None values
     table = Table(
         title=f"{_emoji_or_empty('clipboard')}Project Details",
         box=box.ROUNDED,
@@ -459,30 +512,22 @@ def detection_complete(result: dict) -> None:
     table.add_column("Field", style="bold white", width=20)
     table.add_column("Value", style="white", width=35)
 
-    project_name = result.get("name", Path.cwd().name)
+    project_name = _safe_str(result.get("name", Path.cwd().name))
     framework = result.get("framework", "Unknown")
-    package_manager = result.get("package_manager", "Unknown")
+    package_manager = _safe_str(result.get("package_manager", "Unknown"))
     project_type = result.get("type", "Unknown")
 
     framework_display = {
-        "react": "React",
-        "nextjs": "Next.js",
-        "vue": "Vue",
-        "angular": "Angular",
-        "vite": "Vite",
-        "nodejs": "Node.js",
-        "django": "Django",
-        "flask": "Flask",
-        "fastapi": "FastAPI",
-        "python": "Python",
-        "static": "Static HTML",
-        "unknown": "Unknown",
-    }.get(framework, framework.capitalize())
+        "react": "React", "nextjs": "Next.js", "vue": "Vue",
+        "angular": "Angular", "vite": "Vite", "nodejs": "Node.js",
+        "django": "Django", "flask": "Flask", "fastapi": "FastAPI",
+        "python": "Python", "static": "Static HTML",
+    }.get(framework, _safe_capitalize(framework))
 
     table.add_row(f"{_sym('folder')} Project Name", _escape_text(project_name))
     table.add_row(f"{_sym('box')} Framework", _escape_text(framework_display))
     table.add_row(f"{_sym('box')} Package Manager", _escape_text(package_manager))
-    table.add_row(f"{_emoji_or_empty('clipboard')}Type", _escape_text(project_type.capitalize()))
+    table.add_row(f"{_emoji_or_empty('clipboard')}Type", _escape_text(_safe_capitalize(project_type)))
 
     console.print(table)
 
@@ -498,8 +543,8 @@ def detection_complete(result: dict) -> None:
     table2.add_column("Value", style="white", width=35)
 
     needs_build = result.get("needs_build", False)
-    build_command = result.get("build_command", "None")
-    output_dir = result.get("output_dir", ".")
+    build_command = _safe_str(result.get("build_command", "None"))
+    output_dir = _safe_str(result.get("output_dir", "."))
 
     table2.add_row(f"{_emoji_or_empty('hammer')}Needs Build", f"{_sym('success')} Yes" if needs_build else f"{_sym('error')} No (static)")
     table2.add_row(f"{_emoji_or_empty('clipboard')}Build Command", _escape_text(build_command))
@@ -527,7 +572,7 @@ def _screen_detect_menu() -> Tuple[Optional[str], Optional[str]]:
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Press a number or Enter",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Press a number or Enter",
         choices=["1", "2", "3"],
         default="1",
     )
@@ -536,8 +581,7 @@ def _screen_detect_menu() -> Tuple[Optional[str], Optional[str]]:
         return None, "deploy"
     elif choice == "2":
         return "welcome", None
-    else:
-        return None, "exit"
+    return None, "exit"
 
 
 def no_project_detected() -> None:
@@ -569,7 +613,7 @@ def _screen_no_project_menu() -> Tuple[Optional[str], Optional[str]]:
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
         choices=["1", "2", "3"],
         default="1",
     )
@@ -578,16 +622,88 @@ def _screen_no_project_menu() -> Tuple[Optional[str], Optional[str]]:
         return None, "go_to_folder"
     elif choice == "2":
         return "welcome", None
-    else:
-        return None, "exit"
+    return None, "exit"
 
 
 # ──────────────────────────────────────────────────────────────
-# PROJECT DETAILS / DEPLOY MENU
+# DEPLOY PLATFORM UI (NEW 4-Option Menu)
+# ──────────────────────────────────────────────────────────────
+
+def deploy_platform_start(platform: str) -> None:
+    """
+    Show platform-specific welcome with partner tone.
+
+    ✅ FIX 5: Now uses _sym() for emoji, respecting OPUN8_NO_EMOJI.
+    ✅ FIX 10: Fixed incorrect docstring example.
+
+    Example:
+        >>> deploy_platform_start("netlify")
+        (prints) "📦 Alright friend, let's get your project deployed to Netlify!"
+    """
+    # ✅ FIX 5: Use _sym() instead of hardcoded emoji
+    emoji_map = {
+        "vercel": "triangle",
+        "netlify": "box",
+        "render": "cloud",
+    }
+    emoji_key = emoji_map.get(platform.lower(), "rocket")
+    emoji = _sym(emoji_key)
+    
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{emoji} Alright friend, let's get your project deployed to [bold]{_escape_text(platform.capitalize())}[/bold]![/bold cyan]\n"
+        f"[dim]{_emoji_or_empty('heart')} I'm here to help you launch, partner![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+
+def deploy_platform_menu() -> Optional[str]:
+    """
+    Show the 4-option deploy menu and capture user input.
+
+    ✅ FIX 1: Now captures user input and returns the choice.
+
+    Returns:
+        "1" for Deploy Now, "2" for Select Different Project,
+        "3" for Deploy GitHub Repo, "4" for Exit, or None if cancelled.
+
+    Example:
+        >>> choice = deploy_platform_menu()
+        >>> if choice == "1":
+        ...     print("Deploying...")
+    """
+    console.print(f"[bold]{_emoji_or_empty('sparkles')} What would you like to do?[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]1[/] {_emoji_or_empty('rocket')}  [white]Deploy Now[/white]  [dim](Deploy this project)[/dim]")
+    console.print(f"  [bold cyan]2[/] {_emoji_or_empty('folder')}  [white]Select Different Project[/white]")
+    console.print(f"  [bold cyan]3[/] {_emoji_or_empty('clone')}  [white]Deploy GitHub Repo[/white]")
+    console.print(f"  [bold cyan]4[/] {_emoji_or_empty('door')}  [white]Exit[/white]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
+        choices=["1", "2", "3", "4"],
+        default="1",
+    )
+
+    return choice
+
+
+# ──────────────────────────────────────────────────────────────
+# DEPLOY MENU (DEPRECATED — Kept for backward compatibility)
 # ──────────────────────────────────────────────────────────────
 
 def show_deploy_menu() -> None:
-    """Show menu after detection with partner tone."""
+    """
+    Show menu after detection with partner tone.
+
+    ⚠️ DEPRECATED: This is the old menu that showed 5 options.
+    The new deploy flow uses deploy_platform_start() + deploy_platform_menu().
+    Kept for backward compatibility with any remaining old code.
+    """
     console.print()
     console.print(f"[bold]{_sym('party')} Nice! Your project is ready. What would you like to do?[/bold]")
     console.print()
@@ -613,15 +729,20 @@ def show_details(result: dict) -> None:
 
     for key in fields:
         value = result.get(key)
-        if value:
+        if value is not None:
             display_key = key.replace("_", " ").title()
             if isinstance(value, list):
                 value = ", ".join(value[:5]) + ("..." if len(value) > 5 else "")
             table.add_row(display_key, _escape_text(str(value)))
 
+    # ✅ FIX 2: Dependencies are now escaped
     deps = result.get("dependencies", [])
-    if deps:
-        table.add_row("Dependencies", ", ".join(deps[:5]) + ("..." if len(deps) > 5 else ""))
+    if deps and isinstance(deps, list):
+        escaped_deps = [_escape_text(str(d)) for d in deps[:5]]
+        deps_str = ", ".join(escaped_deps)
+        if len(deps) > 5:
+            deps_str += "..."
+        table.add_row("Dependencies", deps_str)
 
     console.print(table)
     console.print()
@@ -732,37 +853,46 @@ def history_detail(deployment: dict, badge_name: str, badge_emoji: str, next_bad
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
         choices=["1", "2"],
         default="1",
     )
 
     if choice == "1":
         from opun8.commands.deploy import deploy
+        # ✅ FIX 7: Specific exception handling
         try:
             deploy(project_folder=folder, platform=platform)
-        except TypeError:
-            logger.debug(
-                "deploy() does not accept project_folder/platform; "
-                "falling back to default deploy()."
-            )
-            deploy()
+        except TypeError as e:
+            if "'project_folder'" in str(e) or "got an unexpected keyword argument" in str(e):
+                # Old deploy signature — fall back to no arguments
+                deploy()
+            else:
+                # Real error, re-raise
+                raise
     else:
         from opun8.commands.history import history
         history()
 
 
 # ──────────────────────────────────────────────────────────────
-# GITHUB AUTH UI
+# SHARED AUTH UI HELPERS
 # ──────────────────────────────────────────────────────────────
 
-def github_auth_start() -> None:
-    """Show GitHub auth start with partner tone."""
+def _auth_screen(platform: str, emoji: str, login_func, skip_message: str) -> bool:
+    """
+    Generic auth screen for all platforms.
+
+    ✅ FIX 4: Returns True if authenticated, False otherwise.
+
+    Returns:
+        bool: True if authentication succeeded, False otherwise.
+    """
     console.print("\n")
 
     console.print(Panel(
-        f"[bold cyan]{_sym('lock')}{_sym('link')} LINKING OUR GITHUB BRIDGE[/bold cyan]\n"
-        f"[dim]Built with {_sym('heart')} by the Kakes David Team to secure your code![/dim]",
+        f"[bold cyan]{_sym(emoji)}{_sym('rocket')} PREPARING YOUR {_escape_text(platform.upper())} LAUNCHPAD[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
         border_style="cyan",
         padding=(1, 2),
         width=_panel_width(70),
@@ -770,11 +900,11 @@ def github_auth_start() -> None:
     console.print()
 
     console.print(Panel(
-        f"[bold yellow]{_sym('heart')} DON'T WORRY, MY FRIEND! This is completely safe! {_sym('thumbsup')}[/bold yellow]\n\n"
-        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with GitHub so I can:[/white]\n"
-        f"   • {_emoji_or_empty('home')}Create a safe home for your code files\n"
-        f"   • {_emoji_or_empty('rocket')}Automatically launch your updates to the web\n"
-        f"   • {_emoji_or_empty('shield')}Keep your work locked up securely",
+        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with {_escape_text(platform)} so I can:[/white]\n"
+        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
+        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
+        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
         border_style="yellow",
         padding=(1, 2),
         width=_panel_width(70),
@@ -783,29 +913,46 @@ def github_auth_start() -> None:
 
     console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
     console.print()
-    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH GITHUB NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
-    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without GitHub)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH {_escape_text(platform.upper())} NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without {_escape_text(platform)})[/dim]")
     console.print()
-    console.print(f"[green]{_sym('success')} READY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
-    console.print("[dim]   I will be right here waiting for you to finish![/dim]")
+    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
+    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
     console.print()
 
     choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
         choices=["1", "2"],
         default="1",
     )
 
     if choice == "1":
-        from opun8.auth import login_to_github, is_authenticated, get_authenticated_user
-        login_to_github()
-        if is_authenticated():
-            user = get_authenticated_user()
-            github_auth_success(user)
-        else:
-            error("GitHub login didn't complete.", "You can try again anytime with 'opun8 github'.")
+        login_func()
+        return True
     else:
-        console.print(f"[dim]{_sym('skip')} Skipping GitHub for now. You can connect later with 'opun8 github'[/dim]")
+        console.print(f"[dim]{_sym('skip')} {_escape_text(skip_message)}[/dim]")
+        return False
+
+
+# ──────────────────────────────────────────────────────────────
+# PLATFORM AUTH UI
+# ──────────────────────────────────────────────────────────────
+
+def github_auth_start() -> None:
+    """Show GitHub auth start with partner tone."""
+    from opun8.auth import login_to_github, is_authenticated, get_authenticated_user
+    
+    _auth_screen(
+        platform="GitHub",
+        emoji="lock",
+        login_func=login_to_github,
+        skip_message="Skipping GitHub for now. You can connect later with 'opun8 github'"
+    )
+    
+    if is_authenticated():
+        user = get_authenticated_user()
+        if user:
+            github_auth_success(user)
 
 
 def github_auth_success(username: str) -> None:
@@ -825,111 +972,49 @@ def github_auth_success(username: str) -> None:
     console.print()
 
 
-# ──────────────────────────────────────────────────────────────
-# VERCEL AUTH UI
-# ──────────────────────────────────────────────────────────────
-
 def vercel_auth_start() -> None:
-    """Show Vercel auth start with partner tone."""
-    console.print("\n")
-
-    console.print(Panel(
-        f"[bold cyan]{_sym('triangle')}{_sym('rocket')} PREPARING YOUR VERCEL LAUNCHPAD[/bold cyan]\n"
-        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=_panel_width(70),
-    ))
-    console.print()
-
-    console.print(Panel(
-        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
-        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with Vercel so I can:[/white]\n"
-        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
-        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
-        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
-        border_style="yellow",
-        padding=(1, 2),
-        width=_panel_width(70),
-    ))
-    console.print()
-
-    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
-    console.print()
-    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH VERCEL NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
-    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without Vercel)[/dim]")
-    console.print()
-    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
-    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
-    console.print()
-
-    choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
-        choices=["1", "2"],
-        default="1",
+    """
+    Show Vercel auth start with partner tone.
+    
+    ✅ FIX 4: Now shows success feedback after authentication.
+    """
+    from opun8.providers.vercel.auth import login_to_vercel, is_vercel_authenticated
+    
+    _auth_screen(
+        platform="Vercel",
+        emoji="triangle",
+        login_func=login_to_vercel,
+        skip_message="Skipping Vercel for now. You can connect later with 'opun8 vercel'"
     )
+    
+    # ✅ FIX 4: Show success feedback
+    if is_vercel_authenticated():
+        console.print()
+        console.print(f"[bold green]{_sym('party')} Vercel connected successfully! {_sym('party')}[/bold green]")
+        console.print("[dim]I can now deploy your projects to Vercel! 🚀[/dim]\n")
 
-    if choice == "1":
-        from opun8.providers.vercel.auth import login_to_vercel
-        login_to_vercel()
-    else:
-        console.print(f"[dim]{_sym('skip')} Skipping Vercel for now. You can connect later with 'opun8 vercel'[/dim]")
-
-
-# ──────────────────────────────────────────────────────────────
-# NETLIFY AUTH UI
-# ──────────────────────────────────────────────────────────────
 
 def netlify_auth_start() -> None:
-    """Show Netlify auth start with partner tone."""
-    console.print("\n")
-
-    console.print(Panel(
-        f"[bold cyan]{_sym('box')}{_sym('rocket')} PREPARING YOUR NETLIFY LAUNCHPAD[/bold cyan]\n"
-        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=_panel_width(70),
-    ))
-    console.print()
-
-    console.print(Panel(
-        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
-        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with Netlify so I can:[/white]\n"
-        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
-        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
-        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
-        border_style="yellow",
-        padding=(1, 2),
-        width=_panel_width(70),
-    ))
-    console.print()
-
-    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
-    console.print()
-    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH NETLIFY NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
-    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without Netlify)[/dim]")
-    console.print()
-    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
-    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
-    console.print()
-
-    choice = _safe_prompt(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
-        choices=["1", "2"],
-        default="1",
+    """
+    Show Netlify auth start with partner tone.
+    
+    ✅ FIX 4: Now shows success feedback after authentication.
+    """
+    from opun8.providers.netlify.auth import login_to_netlify, is_netlify_authenticated
+    
+    _auth_screen(
+        platform="Netlify",
+        emoji="box",
+        login_func=login_to_netlify,
+        skip_message="Skipping Netlify for now. You can connect later with 'opun8 netlify'"
     )
+    
+    # ✅ FIX 4: Show success feedback
+    if is_netlify_authenticated():
+        console.print()
+        console.print(f"[bold green]{_sym('party')} Netlify connected successfully! {_sym('party')}[/bold green]")
+        console.print("[dim]I can now deploy your projects to Netlify! 🚀[/dim]\n")
 
-    if choice == "1":
-        from opun8.providers.netlify.auth import login_to_netlify
-        login_to_netlify()
-    else:
-        console.print(f"[dim]{_sym('skip')} Skipping Netlify for now. You can connect later with 'opun8 netlify'[/dim]")
-
-
-# ──────────────────────────────────────────────────────────────
-# RENDER AUTH UI
-# ──────────────────────────────────────────────────────────────
 
 def render_auth_start() -> None:
     """Show Render auth start with partner tone."""
@@ -979,6 +1064,8 @@ def render_auth_start() -> None:
 
 def _render_api_key_prompt() -> None:
     """Handle the API key prompt flow with partner tone."""
+    from opun8.providers.render.auth import save_api_key, _verify_and_fetch_user
+
     console.print()
     console.print(Panel(
         f"[bold cyan]{_emoji_or_empty('verify')} Render API Key[/bold cyan]\n\n"
@@ -1002,22 +1089,22 @@ def _render_api_key_prompt() -> None:
         console.print()
         console.print(f"[dim]Attempt {attempt} of {max_attempts}[/dim]")
         
-        api_key = Prompt.ask(
-            f"[bold cyan]{_emoji_or_empty('arrow')}[/] Paste your Render API key"
-        ).strip()
+        # ✅ FIX 6: Use _safe_prompt_free() instead of raw Prompt.ask
+        api_key = _safe_prompt_free(
+            f"[bold cyan]{_emoji_or_empty('arrow')}[/] Paste your Render API key",
+            default="",
+        )
 
-        if not api_key:
+        if not api_key or not api_key.strip():
             console.print("[yellow]No API key provided. Skipping Render authentication.[/yellow]")
             return
 
         console.print("[dim]Verifying API key...[/dim]")
-
-        from opun8.providers.render.auth import save_api_key, _verify_and_fetch_user
         
-        user_info, owner_id = _verify_and_fetch_user(api_key)
+        user_info, owner_id = _verify_and_fetch_user(api_key.strip())
 
         if user_info:
-            save_api_key(api_key)
+            save_api_key(api_key.strip())
             console.print()
             console.print(f"[bold green]{_sym('party')} WELCOME ABOARD, {_escape_text(user_info.get('name', 'Unknown'))}! {_sym('party')}[/bold green]")
             console.print(f"[dim]{_emoji_or_empty('handshake')}Your Render account is now connected![/dim]")
@@ -1026,13 +1113,12 @@ def _render_api_key_prompt() -> None:
 
         console.print(f"[red]{_sym('error')} Invalid API key or insufficient permissions. (attempt {attempt} of {max_attempts})[/red]")
         if attempt < max_attempts:
-            retry = Prompt.ask(
-                f"[bold cyan]{_emoji_or_empty('arrow')}[/] Try again?",
-                choices=["y", "n"],
-                default="y",
-                show_choices=False,
+            # ✅ FIX 6: Use _safe_confirm instead of raw Prompt.ask
+            retry = _safe_confirm(
+                f"{_emoji_or_empty('arrow')} Try again?",
+                default=True,
             )
-            if retry.lower() != "y":
+            if not retry:
                 break
 
     console.print()
@@ -1107,31 +1193,44 @@ def doctor_nodejs_success(version: str) -> None:
 # ──────────────────────────────────────────────────────────────
 
 __all__ = [
+    # Core messages
     "success",
     "info",
     "warning",
     "error",
     "goodbye",
+    # Screens
     "show_welcome",
     "show_help",
+    # Detection
     "detection_start",
     "scanning_spinner",
     "detection_complete",
     "no_project_detected",
+    # Deploy (NEW)
+    "deploy_platform_start",
+    "deploy_platform_menu",
+    # Deploy (DEPRECATED — kept for backward compatibility)
     "show_deploy_menu",
     "show_details",
+    # History
     "history_header",
     "history_list",
     "history_detail",
+    # Auth
     "github_auth_start",
     "github_auth_success",
     "vercel_auth_start",
     "netlify_auth_start",
     "render_auth_start",
+    # Deployment
     "deploy_success",
+    # Doctor
     "doctor_nodejs_missing",
     "doctor_nodejs_download",
     "doctor_nodejs_success",
+    # Safe prompts
     "_safe_prompt",
+    "_safe_prompt_free",
     "_safe_confirm",
 ]

@@ -18,17 +18,13 @@ Why This File Exists:
 Supported Platforms:
     - Vercel: estimate_vercel()
     - Render: estimate_render()
-    - Netlify: estimate_netlify() ✅ NEW
+    - Netlify: estimate_netlify()
 
-Usage:
-    from opun8.services.cost_estimator import CostEstimator
-
-    estimator = CostEstimator()
-    estimate = estimator.estimate("vercel", project_info)
-    print(estimate["total"])
+✅ FIX: Render plan name mapping (individual→hobby, team→pro, organization→scale)
+✅ FIX: Proper display names for Render plans
 
 Author: OPUN8 Team
-Version: 0.1.5
+Version: 0.1.6
 """
 
 from typing import Dict, Any, Optional
@@ -46,7 +42,7 @@ from opun8.providers.render.pricing import (
     calculate_total_render_cost,
 )
 
-# ✅ NEW: Netlify imports
+# Netlify imports
 from opun8.providers.netlify.pricing import (
     get_plan as get_netlify_plan,
     get_framework_resources as get_netlify_resources,
@@ -82,6 +78,14 @@ class CostEstimate:
     error: Optional[str] = None
     is_custom_pricing: bool = False
 
+    # Extra attributes for Netlify
+    credits_used: Optional[float] = None
+    plan_credits: Optional[int] = None
+    overage_credits: Optional[float] = None
+    recharge_available: Optional[bool] = None
+    credits_breakdown: Optional[Dict[str, float]] = None
+    usage: Optional[Dict[str, Any]] = None
+
     @property
     def is_valid(self) -> bool:
         """Check if the estimate is valid."""
@@ -93,6 +97,32 @@ class CostEstimate:
         if self.total is None:
             return "N/A"
         return f"${self.total:.2f}/month"
+
+
+# =============================================================================
+# RENDER PLAN MAPPING
+# =============================================================================
+
+# ✅ FIX: Map display plan names (from deploy.py) to pricing module plan names
+RENDER_PLAN_MAPPING = {
+    "individual": "hobby",      # Individual (free) → maps to hobby pricing
+    "team": "pro",              # Team (Pro) → maps to pro pricing
+    "organization": "scale",    # Organization (Scale) → maps to scale pricing
+    "enterprise": "enterprise", # Enterprise (custom)
+    "hobby": "hobby",           # Already correct
+    "pro": "pro",               # Already correct
+    "scale": "scale",           # Already correct
+}
+
+RENDER_PLAN_DISPLAY_NAMES = {
+    "individual": "Individual (free)",
+    "team": "Team (Pro)",
+    "organization": "Organization (Scale)",
+    "enterprise": "Enterprise",
+    "hobby": "Hobby (free)",
+    "pro": "Pro",
+    "scale": "Scale",
+}
 
 
 # =============================================================================
@@ -260,7 +290,7 @@ class CostEstimator:
         )
 
     # =========================================================================
-    # RENDER ESTIMATION
+    # RENDER ESTIMATION  ✅ FIXED
     # =========================================================================
 
     def estimate_render(
@@ -270,28 +300,33 @@ class CostEstimator:
         database_gb: float = 1,
         bandwidth_gb: Optional[float] = None,
         redis_plan: Optional[str] = None,
+        database_instance_tier: str = "basic_256mb",
+        disk_gb: float = 0,
+        build_minutes: int = 0,
     ) -> CostEstimate:
         """
         Estimate Render deployment cost.
 
+        ✅ FIX: Maps "individual" → "hobby", "team" → "pro", "organization" → "scale"
+
         Args:
-            workspace_plan: Workspace plan name (hobby, pro, scale)
+            workspace_plan: Workspace plan name (individual, team, organization, hobby, pro, scale)
             compute_tiers: Dictionary of compute tier counts
             database_gb: Postgres storage in GB
             bandwidth_gb: Bandwidth used in GB (auto-detected if not provided)
             redis_plan: Redis plan name
+            database_instance_tier: Postgres instance tier
+            disk_gb: Persistent disk storage in GB
+            build_minutes: Build pipeline minutes used
 
         Returns:
             CostEstimate object
 
         Example:
             >>> estimator = CostEstimator()
-            >>> estimate = estimator.estimate_render(
-            ...     "pro",
-            ...     {"starter": 2, "standard": 1}
-            ... )
+            >>> estimate = estimator.estimate_render("individual")
             >>> print(estimate.formatted_total)
-            $64.00/month
+            $0.00/month
         """
         if compute_tiers is None:
             compute_tiers = {"starter": 1}
@@ -301,12 +336,29 @@ class CostEstimator:
             resources = self._get_framework_resources()
             bandwidth_gb = resources.get("bandwidth_gb", 10)
 
+        # ✅ FIX: Map display plan name to internal pricing plan name
+        plan_lower = workspace_plan.lower()
+        mapped_plan = RENDER_PLAN_MAPPING.get(plan_lower, plan_lower)
+        display_name = RENDER_PLAN_DISPLAY_NAMES.get(plan_lower, workspace_plan)
+
+        # Handle enterprise special case
+        if plan_lower == "enterprise" or mapped_plan == "enterprise":
+            return CostEstimate(
+                platform="render",
+                plan="Enterprise",
+                is_custom_pricing=True,
+                warning="Enterprise pricing is custom — contact Render sales for accurate pricing."
+            )
+
         try:
             result = calculate_total_render_cost(
-                workspace_plan=workspace_plan,
+                workspace_plan=mapped_plan,
                 compute_tiers=compute_tiers,
                 database_gb=database_gb,
+                database_instance_tier=database_instance_tier,
                 bandwidth_gb=bandwidth_gb,
+                disk_gb=disk_gb,
+                build_minutes=build_minutes,
                 redis_plan=redis_plan,
             )
         except Exception as e:
@@ -321,16 +373,6 @@ class CostEstimator:
                 error=result["error"]
             )
 
-        # Check if custom pricing
-        is_custom = workspace_plan.lower() == "enterprise"
-        if is_custom:
-            return CostEstimate(
-                platform="render",
-                plan="Enterprise",
-                is_custom_pricing=True,
-                warning="Enterprise pricing is custom — contact Render sales for accurate pricing."
-            )
-
         # Build breakdown
         breakdown = {}
         if result.get("workspace_cost", 0) > 0:
@@ -341,6 +383,10 @@ class CostEstimator:
             breakdown["Database"] = result.get("database_cost", 0)
         if result.get("bandwidth_cost", 0) > 0:
             breakdown["Bandwidth"] = result.get("bandwidth_cost", 0)
+        if result.get("disk_cost", 0) > 0:
+            breakdown["Disk Storage"] = result.get("disk_cost", 0)
+        if result.get("build_minutes_cost", 0) > 0:
+            breakdown["Build Minutes"] = result.get("build_minutes_cost", 0)
         if result.get("redis_cost", 0) > 0:
             breakdown["Redis"] = result.get("redis_cost", 0)
 
@@ -350,12 +396,12 @@ class CostEstimator:
             platform="render",
             total=total,
             breakdown=breakdown,
-            plan=workspace_plan,
-            is_custom_pricing=is_custom,
+            plan=display_name,
+            is_custom_pricing=False,
         )
 
     # =========================================================================
-    # NETLIFY ESTIMATION  ✅ NEW
+    # NETLIFY ESTIMATION
     # =========================================================================
 
     def estimate_netlify(
@@ -469,7 +515,7 @@ class CostEstimator:
             is_custom_pricing=is_custom,
         )
 
-        # Add extra metadata as attributes (optional)
+        # Add extra metadata as attributes
         result.credits_used = credits_used
         result.plan_credits = plan_obj.credits
         result.overage_credits = overage_credits
@@ -566,4 +612,6 @@ __all__ = [
     "CostEstimate",
     "CostEstimator",
     "get_cost_estimator",
+    "RENDER_PLAN_MAPPING",
+    "RENDER_PLAN_DISPLAY_NAMES",
 ]

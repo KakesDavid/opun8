@@ -1,369 +1,176 @@
-## 📝 **Full Updated Content for `README.md`:**
+# OPUN8
 
-```markdown
-# 🦉 Opun8
+**Universal deployment platform for modern web applications.**
 
-<div align="center">
-
-**Universal Deployment Platform — One Command. Zero Friction.**
+Deploy to Vercel, Netlify, or Render from a single CLI — no provider-specific tooling, no context switching.
 
 [![PyPI version](https://img.shields.io/pypi/v/opun8.svg)](https://pypi.org/project/opun8/)
-[![Python Version](https://img.shields.io/pypi/pyversions/opun8.svg)](https://pypi.org/project/opun8/)
+[![Python versions](https://img.shields.io/pypi/pyversions/opun8.svg)](https://pypi.org/project/opun8/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub stars](https://img.shields.io/github/stars/KakesDavid/opun8.svg)](https://github.com/KakesDavid/opun8/stargazers)
-
-Deploy to **Vercel**, **Netlify**, **Render**, and **GitHub** with a single command. Works on Windows, macOS, Linux, and Termux on Android.
-
-[📖 Documentation](https://opun8.dev/docs) · [🐛 Report Bug](https://github.com/KakesDavid/opun8/issues) · [💡 Request Feature](https://github.com/KakesDavid/opun8/issues)
-
-</div>
 
 ---
 
-## ✨ Why Opun8?
+## Overview
 
-Stop wrestling with different deployment workflows for every hosting provider. Opun8 brings Vercel, Render, Netlify, and GitHub into a single, unified CLI experience.
+OPUN8 is a command-line tool that unifies deployment across multiple hosting providers. It detects your project type, estimates cost before you commit, and ships your app with a single command — regardless of which provider you're targeting.
 
-| Feature | Description |
-|---------|-------------|
-| 🚀 **One command** | Deploy with `opun8 deploy vercel`, `netlify`, or `render` — same shape every time |
-| 🧠 **Smart detection** | Auto-detects React, Next.js, Vue, Node.js, Python, and static HTML projects |
-| 🔐 **Secure auth** | OAuth 2.0 + PKCE by default, with personal access token fallback for CI |
-| 💰 **Cost estimator** | See what a deployment will cost before you commit to it |
-| 📱 **Works anywhere** | Windows, macOS, Linux, and Termux on Android — same binary, same commands |
-| 🏅 **History & badges** | Every deployment is logged. Ship enough of them and you'll earn it |
-| 📂 **Native folder picker** | A real file browser dialog — no more typing paths by hand |
-| 🔑 **Interactive env vars** | Scans your source, detects required variables, prompts you for values |
+## Features
 
----
+- **Multi-provider deployment** — Deploy to Vercel, Netlify, or Render from local files or a connected GitHub repository
+- **Unified authentication** — OAuth for GitHub, Vercel, and Netlify; API key support for Render
+- **Automatic project detection** — Identifies framework and build configuration without manual setup
+- **Cost estimation** — Preview provider costs before deploying
+- **Environment variable management** — Detects required variables and prompts interactively
+- **Website cloning** — Clone static sites, React applications, or fully JS-rendered pages
+- **Deployment history** — Local tracking of past deployments
+- **Full-stack orchestration** *(coming soon)* — Deploy frontend and backend together in a single command
 
-## 📦 Installation
+## Installation
 
-### Prerequisites
-- Python 3.8 or higher
-
-### Install via pip
 ```bash
+# Standard installation
 pip install opun8
-```
 
-### Install with extras
-```bash
-# For clipboard support
+# With clipboard support
 pip install opun8[clipboard]
 
-# For all features
+# Full installation (testing + clipboard)
 pip install opun8[all]
 ```
 
-### Verify installation
+## Quick Start
+
 ```bash
-opun8 --version
-```
+# View available commands
+opun8
 
----
-
-## 🚀 Quick Start
-
-### 1. Navigate to your project
-```bash
-cd my-project
-```
-
-### 2. Detect your project
-```bash
+# Detect your project type
 opun8 detect
-```
-```
-✅ Detected: Next.js project
-📦 Package manager: npm
-🛠️ Build command: npm run build
-📁 Output directory: .next
-```
 
-### 3. Authenticate with your provider
-```bash
-# For Vercel
-opun8 vercel
+# Deploy interactively
+opun8 deploy
 
-# For Netlify
-opun8 netlify
-
-# For Render
-opun8 render
-
-# For GitHub (needed for Render deployments)
-opun8 github
-```
-
-### 4. Deploy!
-```bash
-# Deploy to Vercel
+# Or target a specific provider
 opun8 deploy vercel
-
-# Deploy to Netlify
 opun8 deploy netlify
-
-# Deploy to Render
 opun8 deploy render
 ```
-```
-🚀 Deploying...
-✅ Deployment complete!
-🌐 Live at: https://my-project.vercel.app
-```
 
----
+## Command Reference
 
-## 🔑 Interactive Environment Variables
-
-Opun8 scans your source code to detect environment variables your project needs.
-
-```bash
-opun8 deploy netlify
-```
-```
-🔐 Environment Variables Detected
-
-Select variables to include:
-  [x] DATABASE_URL     → used in app/config.py:15, models/db.py:22
-  [x] API_KEY          → used in services/api.py:42
-  [ ] SECRET_KEY       → used in app/settings.py:8
-
-Commands:
-  <number>  Toggle selection
-  a         Select all
-  n         Select none
-  d         Done — proceed with selected
-  q         Cancel
-
-Enter value for DATABASE_URL: postgres://...
-Enter value for API_KEY: ********
-
-✅ Selected 2 environment variable(s) for deployment
-🔒 1 sensitive value(s) hidden from display
-```
-
----
-
-## 📚 Commands
-
-### Core Commands
 | Command | Description |
-|---------|-------------|
-| `opun8` | Show welcome screen |
-| `opun8 --version` | Show version |
-| `opun8 doctor` | Check environment |
-| `opun8 detect` | Detect project type |
-| `opun8 deploy` | Deploy your project |
-| `opun8 help` | Show all commands |
-
-### Platform Commands
-| Command | Description |
-|---------|-------------|
-| `opun8 github` | Connect to GitHub |
-| `opun8 vercel` | Connect to Vercel |
-| `opun8 netlify` | Connect to Netlify |
-| `opun8 render` | Connect to Render |
-| `opun8 vercel --logout` | Disconnect from Vercel |
-| `opun8 netlify --logout` | Disconnect from Netlify |
-| `opun8 render --logout` | Disconnect from Render |
-
-### Deployment Commands
-| Command | Description |
-|---------|-------------|
-| `opun8 deploy vercel` | Deploy to Vercel |
-| `opun8 deploy netlify` | Deploy to Netlify |
-| `opun8 deploy render` | Deploy to Render |
-
-### Account Commands
-| Command | Description |
-|---------|-------------|
+|---|---|
+| `opun8` | Display welcome screen and available commands |
+| `opun8 --version` | Show installed version |
+| `opun8 doctor` | Check environment; auto-installs Node.js if required |
+| `opun8 detect` | Detect project type and framework |
+| `opun8 deploy` | Deploy the current project (interactive) |
+| `opun8 deploy vercel` | Deploy directly to Vercel |
+| `opun8 deploy netlify` | Deploy directly to Netlify |
+| `opun8 deploy render` | Deploy directly to Render |
 | `opun8 register` | Create an OPUN8 account |
-| `opun8 login` | Log in to your account |
-| `opun8 verify` | Verify email with OTP |
-| `opun8 resend-otp` | Resend verification code |
-| `opun8 status` | Check account status |
+| `opun8 login` | Authenticate with an existing account |
+| `opun8 verify` | Verify email via one-time password |
+| `opun8 resend-otp` | Resend the verification code |
+| `opun8 status` | Check current account status |
+| `opun8 logout` | Sign out of all connected services |
+| `opun8 github` | Connect a GitHub account |
+| `opun8 vercel` | Connect a Vercel account |
+| `opun8 netlify` | Connect a Netlify account |
+| `opun8 render` | Connect a Render account |
+| `opun8 clone` | Clone an existing website |
 | `opun8 upgrade` | Upgrade subscription plan |
-| `opun8 logout` | Logout from all services |
+| `opun8 history` | View past deployments |
+| `opun8 badges` | View achievement progress |
+| `opun8 help` | List all available commands |
 
-### Advanced Commands
-| Command | Description |
-|---------|-------------|
-| `opun8 clone` | Clone any website |
-| `opun8 history` | View deployment history |
-| `opun8 badges` | View badge progress |
+## Configuration
 
----
+### Environment Variables
 
-## 🎖️ Badge System
+| Variable | Description |
+|---|---|
+| `OPUN8_NO_EMOJI=1` | Disable emoji in CLI output |
+| `OPUN8_DEBUG=1` | Enable verbose debug logging |
+| `OPUN8_API_URL=<url>` | Override the default API endpoint (`https://opun8-api.onrender.com`) |
 
-| Level | Badge | Name | Deployments |
-|-------|-------|------|-------------|
-| 1 | 🌱 | First Clone | 1 |
-| 2 | 🔍 | Curious Explorer | 3 |
-| 3 | 🧩 | Pattern Finder | 5 |
-| 4 | 📚 | Archivist | 10 |
-| 5 | 🚀 | Speed Runner | 25 |
-| 6 | 🏆 | Master Archiver | 50 |
-| 7 | 👑 | Clone King | 100 |
+### Credential Storage
 
----
+Authentication tokens are stored using the OS-native credential store:
 
-## ☁️ Provider Support
+| Platform | Storage Backend |
+|---|---|
+| Windows | Windows Credential Manager |
+| macOS | Keychain |
+| Linux | Secret Service (libsecret) |
 
-### ▲ Vercel
-- OAuth 2.0 + PKCE authentication
-- Project creation and management
-- File upload and deployment
-- Environment variable management
-- Cost estimation
-- URL renaming
+A local cache is also maintained in `~/.opun8/` for faster access.
 
-### 📦 Netlify *(NEW in v0.1.5)*
-- OAuth 2.0 authentication
-- Site creation and management
-- File upload and deployment
-- Environment variable management
-- Credit-based cost estimation
-- Interactive name conflict resolution
-- Personal Access Token support
+## Supported Platforms
 
-### ☁️ Render
-- GitHub repository deployment
-- Service creation and management
-- Environment variable management
-- Deployment status polling
-- Interactive name conflict resolution
+| Provider | Status | Best For |
+|---|---|---|
+| Vercel | ✅ Supported | Frontend, Next.js, React |
+| Netlify | ✅ Supported | Static sites, JAMstack |
+| Render | ✅ Supported | Full-stack apps, Python, Node.js |
+| Railway | ⬜ Planned | — |
 
-### 🐙 GitHub
-- Repository listing
-- Repository cloning
-- Push to GitHub
+## Project Structure
 
----
-
-## 💰 Cost Estimator
-
-Opun8 shows you deployment costs before you deploy.
-
-### Vercel
 ```
-┌──────────────────────────────────────────────────────────┐
-│ ▲ Vercel Cost Estimate                                  │
-│ Plan: Pro                                               │
-│                                                          │
-│ Seats           $20.00                                  │
-│ Bandwidth       $0.00                                   │
-│ Build Minutes   $0.00                                   │
-│ Functions       $0.00                                   │
-│ ─────────────────────────────────────────────────────── │
-│ Total           $20.00/month                           │
-└──────────────────────────────────────────────────────────┘
+opun8/
+├── src/opun8/
+│   ├── cli.py              # CLI entry point
+│   ├── commands/           # Command implementations
+│   ├── core/                # Core application logic
+│   ├── providers/           # Vercel, Netlify, Render integrations
+│   ├── services/            # Business logic layer
+│   └── ui/                  # Terminal UI components
+├── tests/                   # Unit tests
+├── pyproject.toml           # Project configuration
+└── README.md
 ```
 
-### Netlify
-```
-┌──────────────────────────────────────────────────────────┐
-│ 📦 Netlify Cost Estimate                                │
-│ Plan: Pro                                               │
-│ Credit-based pricing                                    │
-│                                                          │
-│ Plan               $20.00                               │
-│ ─────────────────────────────────────────────────────── │
-│ Bandwidth          300 credits                          │
-│ Compute            300 credits                          │
-│ Web Requests       20 credits                           │
-│ Production Deploys 75 credits                           │
-│ ─────────────────────────────────────────────────────── │
-│ Total Credits Used 695 credits                          │
-│ Plan Credits       3,000 credits                        │
-│ ─────────────────────────────────────────────────────── │
-│ Total              $20.00/month                        │
-│ 23% of plan credits used                                │
-└──────────────────────────────────────────────────────────┘
-```
+## Development
 
----
+### Setup
 
-## 🔧 Development
-
-### Clone the repository
 ```bash
 git clone https://github.com/KakesDavid/opun8.git
 cd opun8
-```
 
-### Create a virtual environment
-```bash
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+
+pip install -e ".[all]"
 ```
 
-### Install in editable mode
-```bash
-pip install -e .
-```
+### Testing
 
-### Run tests
 ```bash
 pytest
 ```
 
----
+### Building & Publishing
 
-## 🤝 Contributing
-
-We welcome contributions! Here's how you can help:
-
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit your changes: `git commit -m 'Add amazing feature'`
-4. Push to the branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
-
-### Areas we need help with:
-- Adding Railway provider
-- Improving documentation
-- Writing tests
-- Bug fixes
-- UI/UX improvements
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-Built with ❤️ by [Kakes David](https://github.com/KakesDavid) and the Opun8 community.
-
-<div align="center">
-
-**Star us on GitHub ★ — It helps more developers discover Opun8**
-
-[![GitHub stars](https://img.shields.io/github/stars/KakesDavid/opun8.svg?style=social)](https://github.com/KakesDavid/opun8/stargazers)
-
-</div>
+```bash
+python -m build
+twine upload dist/*
 ```
 
+## Contributing
+
+Contributions are welcome. To submit a change:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes and add tests where applicable
+4. Open a pull request with a clear description of the change
+
+## License
+
+Released under the [MIT License](LICENSE).
+
 ---
 
-## 📋 **Summary:**
-
-| Section | Content |
-|---------|---------|
-| **Badges** | PyPI, Python, License, Stars |
-| **Why Opun8** | Feature table with emojis |
-| **Installation** | pip, extras, verification |
-| **Quick Start** | 4 steps with examples |
-| **Interactive Env Vars** | Full UI example |
-| **Commands** | Tables organized by category |
-| **Badge System** | All 7 levels with emojis |
-| **Provider Support** | Vercel, Netlify, Render, GitHub |
-| **Cost Estimator** | Vercel + Netlify examples |
-| **Development** | Clone, setup, tests |
-| **Contributing** | PR process + help areas |
+Maintained by the Kakes David Team. If OPUN8 is useful to you, consider starring the repository.

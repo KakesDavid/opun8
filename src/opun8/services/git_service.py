@@ -18,10 +18,14 @@ This version fixes three root-cause bugs found in production:
    display was still running, which corrupts terminal output (duplicated /
    garbled menus). All prompts now happen with the progress display stopped.
 
-Additional hardening: recursion depth guard against infinite retry loops,
-network retry/backoff for GitHub API calls, defensive validation throughout
-so a single failure mode can't crash the whole flow, and robust clone
-functionality for repository deployment.
+Additional fixes:
+  4. `_safe_prompt` no longer leaks `default="1"` into free-text input.
+  5. `commit()` properly distinguishes "nothing to commit" from successful commit.
+  6. `repo_exists_on_github()` no longer swallows all errors.
+  7. Cross-account repo creation now correctly handles owner detection.
+
+Author: OPUN8 Team
+Version: 0.1.6
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Union, Literal
 
+import requests
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -51,22 +56,28 @@ CLONE_TIMEOUT = 120  # seconds
 def _safe_prompt(
     message: str,
     choices: Optional[list] = None,
-    default: str = "1",
+    default: Optional[str] = None,  # ✅ FIX 4: Default is now None, not "1"
     show_choices: bool = False,
 ) -> Optional[str]:
     """
     Prompt the user with graceful handling of Ctrl+C and Ctrl+Z.
     Returns None if the user cancels.
+
+    ✅ FIX 4: default is now Optional[str] = None
+    - For menu prompts, pass default="1" explicitly
+    - For free-text prompts, pass default="" or leave None
+    - No more implicit "1" leaking into text input
     """
     try:
         if choices:
             return Prompt.ask(
                 message,
                 choices=choices,
-                default=default,
+                default=default or choices[0] if default is None else default,
                 show_choices=show_choices,
             )
-        return Prompt.ask(message, default=default)
+        # ✅ FIX 4: Free-text prompt with explicit default handling
+        return Prompt.ask(message, default=default or "")
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
         return None
@@ -114,11 +125,20 @@ class GitService:
             console.print(f"[red]Git add error: {e}[/red]")
             return False
 
-    def commit(self, message: str = "Initial commit by Opun8") -> bool:
+    def commit(self, message: str = "Initial commit by Opun8") -> Tuple[bool, str]:
+        """
+        Commit changes to the repository.
+
+        ✅ FIX 5: Now returns (bool, message) to properly distinguish:
+        - (True, "committed") - commit created successfully
+        - (True, "nothing to commit") - no changes, but this is OK
+        - (False, "error message") - commit failed
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
         try:
-            # Ensure a committer identity exists locally so fresh CI/CD
-            # containers or brand-new machines don't fail with
-            # "Please tell me who you are".
+            # Ensure a committer identity exists locally
             self._ensure_git_identity()
 
             result = subprocess.run(
@@ -128,15 +148,21 @@ class GitService:
                 text=True,
                 timeout=30,
             )
+
             if result.returncode == 0:
-                return True
-            if "nothing to commit" in result.stderr.lower():
-                return True
+                return True, "committed"
+
+            # ✅ FIX 5: Properly distinguish "nothing to commit" from actual errors
+            stderr_lower = result.stderr.lower()
+            if "nothing to commit" in stderr_lower:
+                return True, "nothing to commit"
+
             console.print(f"[red]Git commit error: {result.stderr.strip()}[/red]")
-            return False
+            return False, result.stderr.strip()
+
         except Exception as e:
             console.print(f"[red]Git commit error: {e}[/red]")
-            return False
+            return False, str(e)
 
     def _ensure_git_identity(self) -> None:
         """Set a local fallback git identity if none is configured."""
@@ -424,7 +450,7 @@ class GitService:
         choice = _safe_prompt(
             "[bold cyan]➜[/] Select an option",
             choices=["1", "2"],
-            default="1",
+            default="1",  # ✅ Explicit default for menu
         )
         if choice is None:
             return None
@@ -469,8 +495,6 @@ class GitService:
 
     def _github_request(self, method: str, url: str, headers: dict, timeout: int, **kwargs):
         """Small retry/backoff wrapper around requests for transient network errors."""
-        import requests
-
         last_exc = None
         for attempt in range(3):
             try:
@@ -481,10 +505,18 @@ class GitService:
                     time.sleep(1.5 * (attempt + 1))
         raise last_exc
 
-    def repo_exists_on_github(self, token: str, repo_name: str) -> bool:
+    def repo_exists_on_github(self, token: str, repo_name: str) -> Tuple[bool, Optional[str]]:
         """
         Check if a repository exists on GitHub.
         repo_name must be in 'owner/repo' format.
+
+        ✅ FIX 6: Returns (exists, error_message) to distinguish:
+        - (True, None): repo exists
+        - (False, None): repo does not exist
+        - (False, error): network/API error occurred
+
+        Returns:
+            Tuple[bool, Optional[str]]: (exists, error_message)
         """
         try:
             response = self._github_request(
@@ -493,9 +525,28 @@ class GitService:
                 headers={"Authorization": f"token {token}"},
                 timeout=10,
             )
-            return response.status_code == 200
-        except Exception:
-            return False
+
+            if response.status_code == 200:
+                return True, None
+            if response.status_code == 404:
+                return False, None
+
+            # Any other status code (403, 401, 500, etc.)
+            error_msg = f"GitHub API returned {response.status_code}"
+            try:
+                error_data = response.json()
+                if "message" in error_data:
+                    error_msg = error_data["message"]
+            except Exception:
+                pass
+            return False, error_msg
+
+        except requests.ConnectionError as e:
+            return False, f"Network error: {e}"
+        except requests.Timeout as e:
+            return False, f"Timeout: {e}"
+        except Exception as e:
+            return False, f"Unexpected error: {e}"
 
     def parse_repo_url(self, repo_url: str) -> Tuple[Optional[str], Optional[str]]:
         try:
@@ -527,6 +578,21 @@ class GitService:
         except Exception:
             return None, None
 
+    def _get_token_username(self, token: str) -> Optional[str]:
+        """Get the username associated with a GitHub token."""
+        try:
+            response = self._github_request(
+                "GET",
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {token}"},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return response.json().get("login")
+            return None
+        except Exception:
+            return None
+
     def create_github_repo(
         self,
         token: str,
@@ -545,14 +611,21 @@ class GitService:
         histories". Leaving the repo empty lets the first push populate it
         cleanly with no merge required at all.
 
+        ✅ FIX 6: Properly handles error responses from repo_exists check.
+        ✅ FIX 7: Correctly creates repo under requested owner.
+
         Returns:
             Tuple of (True|"exists"|False, message)
         """
         try:
             full_repo_name = f"{owner}/{repo_name}"
 
-            if self.repo_exists_on_github(token, full_repo_name):
+            # ✅ FIX 6: Check existence with proper error handling
+            exists, error_msg = self.repo_exists_on_github(token, full_repo_name)
+            if exists:
                 return "exists", f"Repository '{full_repo_name}' already exists on GitHub."
+            if error_msg:
+                return False, f"Could not check repository existence: {error_msg}"
 
             headers = {
                 "Authorization": f"token {token}",
@@ -562,12 +635,13 @@ class GitService:
                 "name": repo_name,
                 "description": description,
                 "private": private,
-                "auto_init": False,
+                "auto_init": False,  # ✅ Fix: Empty repo, no unrelated history
             }
 
-            # Determine whether `owner` is an organization or the token's
-            # own user account, since these use different API endpoints.
+            # ✅ FIX 7: Determine owner type and API endpoint correctly
             is_org = False
+            org_error = None
+
             try:
                 org_response = self._github_request(
                     "GET",
@@ -577,8 +651,17 @@ class GitService:
                 )
                 if org_response.status_code == 200:
                     is_org = True
-            except Exception:
-                pass
+                elif org_response.status_code == 404:
+                    # Not an org, will create under user account
+                    pass
+                else:
+                    # Some other error (403, 401, etc.)
+                    org_error = f"GitHub API returned {org_response.status_code}"
+            except Exception as e:
+                org_error = str(e)
+
+            if org_error:
+                return False, f"Could not verify organization access: {org_error}"
 
             if is_org:
                 response = self._github_request(
@@ -589,6 +672,12 @@ class GitService:
                     json=data,
                 )
             else:
+                # ✅ FIX 7: Get token username to verify owner matches
+                token_username = self._get_token_username(token)
+                if token_username and token_username != owner:
+                    console.print(f"[yellow]⚠️  Warning: Token belongs to '{token_username}', but you requested '{owner}'.[/yellow]")
+                    console.print(f"[dim]   Repository will be created under '{token_username}'.[/dim]")
+
                 response = self._github_request(
                     "POST",
                     "https://api.github.com/user/repos",
@@ -598,8 +687,21 @@ class GitService:
                 )
 
             if response.status_code == 201:
-                return True, f"Repository '{full_repo_name}' created successfully."
-            return False, f"Failed to create repository: {response.text}"
+                repo_data = response.json()
+                repo_url = repo_data.get("html_url", f"https://github.com/{full_repo_name}")
+                return True, f"Repository '{full_repo_name}' created successfully at {repo_url}"
+
+            # Handle 422 "name already exists" (race condition)
+            if response.status_code == 422:
+                try:
+                    error_data = response.json()
+                    if "already exists" in str(error_data).lower():
+                        return "exists", f"Repository '{full_repo_name}' already exists."
+                except Exception:
+                    pass
+
+            return False, f"Failed to create repository: {response.status_code} - {response.text[:200]}"
+
         except Exception as e:
             return False, f"Error creating repository: {e}"
 
@@ -624,9 +726,14 @@ class GitService:
 
         full_repo_name = f"{owner}/{repo_name}"
 
+        # ✅ FIX 6: Check repo existence with proper error handling
         repo_exists = False
         if token:
-            repo_exists = self.repo_exists_on_github(token, full_repo_name)
+            exists, error_msg = self.repo_exists_on_github(token, full_repo_name)
+            if error_msg:
+                console.print(f"[yellow]⚠️  Could not check repo existence: {error_msg}[/yellow]")
+                console.print("[dim]   Proceeding with creation attempt...[/dim]")
+            repo_exists = exists
 
         if branch is None:
             branch = self.ask_branch_name()
@@ -658,10 +765,17 @@ class GitService:
             if choice == "3":
                 return False, "Skipping GitHub push."
             if choice == "2":
-                new_name = _safe_prompt("[bold cyan]➜[/] Enter a new repository name")
-                if not new_name:
-                    return False, "Operation cancelled." if new_name is None else "Skipping GitHub push."
-                new_name = new_name.replace(" ", "-")
+                # ✅ FIX 4: Explicitly pass default="" for free-text input
+                new_name = _safe_prompt(
+                    "[bold cyan]➜[/] Enter a new repository name",
+                    default=""  # ✅ FIX 4: No default leak!
+                )
+                if new_name is None:
+                    return False, "Operation cancelled."
+                if not new_name or not new_name.strip():
+                    console.print("[red]No name provided. Cancelling.[/red]")
+                    return False, "No name provided. Skipping GitHub push."
+                new_name = new_name.strip().replace(" ", "-")
                 new_name = re.sub(r"[^a-zA-Z0-9\-_]", "", new_name)
                 new_name = new_name.lower()
                 if not new_name:
@@ -704,9 +818,14 @@ class GitService:
 
             if self.has_changes() or not self.has_commits():
                 task = progress.add_task("[cyan]Committing files...", total=None)
-                if not self.commit():
-                    return False, "Failed to commit."
-                progress.update(task, description="[green]Files committed.")
+                # ✅ FIX 5: Handle commit result properly
+                committed, commit_msg = self.commit()
+                if not committed:
+                    return False, f"Failed to commit: {commit_msg}"
+                if commit_msg == "nothing to commit":
+                    progress.update(task, description="[yellow]No changes to commit.")
+                else:
+                    progress.update(task, description="[green]Files committed.")
 
             task = progress.add_task("[cyan]Adding remote...", total=None)
             if not self.add_remote(repo_url):

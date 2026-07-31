@@ -8,7 +8,8 @@ This module provides:
     - Formatted tables for cost breakdowns
     - Color-coded warnings and alerts
     - Interactive confirmation prompts
-    - Netlify credit-based pricing support ✅ NEW
+    - Netlify credit-based pricing support
+    - Free tier detection and messaging ✅ NEW
 
 Usage:
     from opun8.ui.cost_display import display_cost_estimate
@@ -19,7 +20,7 @@ Usage:
         deploy()
 
 Author: OPUN8 Team
-Version: 0.1.5
+Version: 0.1.6
 """
 
 from typing import Optional
@@ -50,6 +51,8 @@ def display_cost_estimate(estimate: CostEstimate) -> bool:
     Display a cost estimate and ask for confirmation.
 
     Supports Vercel, Render, and Netlify cost estimates.
+    
+    ✅ FIX: Now shows free tier message when estimate.free_tier is True
 
     Args:
         estimate: CostEstimate object
@@ -87,6 +90,30 @@ def display_cost_estimate(estimate: CostEstimate) -> bool:
     console.print()
     _print_cost_table(estimate)
     console.print()
+    
+    # ✅ FIX: Show free tier message if applicable
+    if hasattr(estimate, 'free_tier') and estimate.free_tier is True:
+        console.print()
+        console.print(Panel(
+            "[bold green]✨ You're on the free tier![/bold green]\n"
+            "[dim]Your services will spin down after inactivity.[/dim]\n"
+            "[dim]Upgrade to keep them always-on and get more resources.[/dim]",
+            border_style="green",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
+        console.print()
+    elif estimate.total is not None and estimate.total == 0:
+        # Fallback: if total is 0 but free_tier flag isn't set
+        console.print()
+        console.print(Panel(
+            "[bold green]✨ This deployment is free![/bold green]\n"
+            "[dim]No charges will be incurred.[/dim]",
+            border_style="green",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
+        console.print()
 
     # Show warning if total is high
     if estimate.total and estimate.total > HIGH_COST_THRESHOLD:
@@ -444,7 +471,7 @@ def display_free_tier_info(estimate: CostEstimate) -> None:
         console.print()
         console.print(Panel(
             "[bold green]✅ You're on the free tier![/bold green]\n"
-            "[dim]No charges will be incurred for this deployment.[/dim]",
+            "[dim]Your services will spin down after inactivity Upgrade to keep them always-on and get more resources.[/dim]",
             border_style="green",
             padding=(1, 2),
             width=PANEL_WIDTH,

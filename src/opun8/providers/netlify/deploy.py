@@ -11,14 +11,24 @@ Error handling philosophy (matches Vercel):
     OPUN8_DEBUG=1 to also echo these live in the terminal.
   - Every network call and file operation is wrapped so failures degrade
     to a friendly message instead of a crash.
+
+FIXES APPLIED:
+  1. File paths are now URL-encoded before upload (handles spaces, #, %, non-ASCII)
+  2. Site-name conflict retry cap now tracks ALL attempts (not just auto-suffix)
+  3. Removed dead _coerce_session() function
+  4. Removed unused datetime import
+  5. Unified duplicate _show_error / _safe_show_error into one thread-safe function
+  6. Added user-visible countdown timers during retry waits (no more "hung" CLI)
+  7. Fixed stale UI text after conflict resolution (shows actual site name)
+  8. Added .gitignore support (respects patterns, no accidental secrets upload)
 """
 
-import datetime
 import os
 import hashlib
 import re
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Callable
@@ -38,25 +48,39 @@ from rich.progress import (
     MofNCompleteColumn,
 )
 
-# ✅ FIX: import the module itself instead of cherry-picking names that
-# don't exist in env_service.py (prompt_env_files_selection, parse_env_file
-# were never defined there — that was causing an ImportError at load time,
-# which is why deployment "wasn't working at all": this file couldn't even
-# be imported). Importing the module and qualifying calls (env_service.x)
-# also avoids colliding with the local prompt_for_env_vars() defined below.
 from opun8.services import env_service
+
+# ============================================================================
+# CONSTANTS & CONFIGURATION
+# ============================================================================
 
 console = Console()
 _console_lock = threading.Lock()
 
 DEBUG_LOG_FILE = Path.home() / ".opun8" / "debug.log"
 
+NETLIFY_API_BASE = "https://api.netlify.com/api/v1"
+SITES_ENDPOINT = f"{NETLIFY_API_BASE}/sites"
+DEPLOYS_ENDPOINT = f"{NETLIFY_API_BASE}/deploys"
+ENV_ENDPOINT_TMPL = f"{NETLIFY_API_BASE}/sites/{{site_id}}/env"
 
-def _safe_print(*args, **kwargs) -> None:
-    """Thread-safe console printing."""
-    with _console_lock:
-        console.print(*args, **kwargs)
+MAX_CONCURRENT_UPLOADS = 8
+MAX_SITE_NAME_ATTEMPTS = 5
 
+# Hardcoded exclusions (will be combined with .gitignore)
+EXCLUDE_DIR_NAMES = {
+    "node_modules", ".git", "__pycache__", ".venv", "venv",
+    ".pytest_cache", ".next", ".netlify", ".turbo",
+    "dist", "build", "out", ".cache", "coverage",
+    ".idea", ".vscode",
+}
+EXCLUDE_FILE_NAMES = {".DS_Store"}
+EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".tmp"}
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def _debug_log(message: str) -> None:
     """Record technical detail for later troubleshooting."""
@@ -68,11 +92,16 @@ def _debug_log(message: str) -> None:
     except Exception:
         pass
     if os.environ.get("OPUN8_DEBUG"):
-        _safe_print(f"[dim]debug: {message}[/dim]")
+        with _console_lock:
+            console.print(f"[dim]debug: {message}[/dim]")
 
 
 def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
-    """Single place non-threaded code prints an error to the terminal UI."""
+    """
+    Thread-safe error display with consistent behavior.
+    
+    Fixes Issue #5: Unified duplicate functions into one.
+    """
     with _console_lock:
         console.print(f"[red]❌ {message}[/red]")
         if hint:
@@ -81,36 +110,38 @@ def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional
         _debug_log(debug_detail)
 
 
-def _safe_show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
-    """Thread-safe version of _show_error."""
+def _safe_print(*args, **kwargs) -> None:
+    """Thread-safe console printing."""
     with _console_lock:
-        console.print(f"[red]❌ {message}[/red]")
-        if hint:
-            console.print(f"[dim]{hint}[/dim]")
-    if debug_detail:
-        _debug_log(debug_detail)
+        console.print(*args, **kwargs)
 
 
-# ──────────────────────────────────────────────────────────────
-# CONSTANTS
-# ──────────────────────────────────────────────────────────────
+def _strip_scheme(url: str) -> str:
+    """Strip http:// or https:// from the beginning of a URL only."""
+    if not url:
+        return url
+    return re.sub(r'^https?://', '', url)
 
-NETLIFY_API_BASE = "https://api.netlify.com/api/v1"
-SITES_ENDPOINT = f"{NETLIFY_API_BASE}/sites"
-DEPLOYS_ENDPOINT = f"{NETLIFY_API_BASE}/deploys"
-ENV_ENDPOINT_TMPL = f"{NETLIFY_API_BASE}/sites/{{site_id}}/env"
 
-MAX_CONCURRENT_UPLOADS = 8
-MAX_SITE_NAME_ATTEMPTS = 5
-
-EXCLUDE_DIR_NAMES = {
-    "node_modules", ".git", "__pycache__", ".venv", "venv",
-    ".pytest_cache", ".next", ".netlify", ".turbo",
-    "dist", "build", "out", ".cache", "coverage",
-    ".idea", ".vscode",
-}
-EXCLUDE_FILE_NAMES = {".DS_Store"}
-EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".log", ".tmp"}
+def _sanitize_project_name(name: str) -> str:
+    """
+    Sanitize project name for Netlify.
+    
+    - Converts to lowercase
+    - Replaces spaces with hyphens
+    - Removes invalid characters
+    - Truncates to 100 characters
+    - Strips trailing hyphens
+    """
+    name = name.lower()
+    name = name.replace(" ", "-")
+    name = re.sub(r'[^a-z0-9._-]', '-', name)
+    name = re.sub(r'-{2,}', '-', name)
+    name = name.strip('-')
+    if len(name) > 100:
+        name = name[:100]
+        name = name.strip('-')  # Fixes Issue #2: Strip trailing hyphens after truncation
+    return name
 
 
 def _is_env_file(name: str) -> bool:
@@ -118,23 +149,78 @@ def _is_env_file(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
-def _strip_scheme(url: str) -> str:
+def _load_gitignore(project_path: Path) -> List[str]:
     """
-    Strip http:// or https:// from the beginning of a URL only.
+    Load .gitignore patterns from project root.
+    
+    Fixes Issue #8: Adds .gitignore support.
+    """
+    gitignore_path = project_path / ".gitignore"
+    patterns = []
+    try:
+        if gitignore_path.exists():
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        patterns.append(line)
+            _debug_log(f"Loaded {len(patterns)} patterns from .gitignore")
+    except Exception as e:
+        _debug_log(f"Could not load .gitignore: {e}")
+    return patterns
 
-    ✅ FIX: Uses regex to remove scheme only from the start,
-    not from anywhere in the string.
 
+def _should_ignore_file(file_path: Path, project_path: Path, gitignore_patterns: Optional[List[str]] = None) -> bool:
+    """
+    Check if a file should be ignored based on hardcoded exclusions and .gitignore.
+    
+    Fixes Issue #8: Respects .gitignore patterns.
+    
     Args:
-        url: The URL to strip
-
+        file_path: Path to the file
+        project_path: Root project path
+        gitignore_patterns: List of .gitignore patterns (optional)
+    
     Returns:
-        URL without scheme prefix
+        True if file should be ignored, False otherwise
     """
-    if not url:
-        return url
-    return re.sub(r'^https?://', '', url)
+    rel_path = file_path.relative_to(project_path)
+    rel_str = rel_path.as_posix()
+    
+    # Check hardcoded exclusions first
+    if any(part in EXCLUDE_DIR_NAMES for part in rel_path.parts[:-1]):
+        return True
+    if file_path.name in EXCLUDE_FILE_NAMES:
+        return True
+    if _is_env_file(file_path.name):
+        return True
+    if file_path.suffix in EXCLUDE_SUFFIXES:
+        return True
+    
+    # Check .gitignore patterns if provided
+    if gitignore_patterns:
+        import fnmatch
+        for pattern in gitignore_patterns:
+            # Root-relative pattern (starts with /)
+            if pattern.startswith('/'):
+                if fnmatch.fnmatch(rel_str, pattern[1:]):
+                    return True
+            else:
+                # Anywhere in tree
+                if fnmatch.fnmatch(rel_str, pattern):
+                    return True
+                # Check if any parent directory matches
+                for part in rel_path.parents:
+                    if fnmatch.fnmatch(part.as_posix(), pattern):
+                        return True
+    
+    return False
 
+
+# ============================================================================
+# ENVIRONMENT VARIABLE HANDLING
+# ============================================================================
 
 def prompt_for_env_vars(
     project_path: Path,
@@ -145,11 +231,8 @@ def prompt_for_env_vars(
     the user which variables, if any, should be uploaded to Netlify as
     environment variables.
 
-    ✅ FIX: previously imported `prompt_env_files_selection` and
-    `parse_env_file` from env_service.py — neither exists there, which
-    raised an ImportError as soon as this module was loaded. Now calls
-    the real env_service API: `prompt_for_env_vars` (full interactive
-    detection + prompt flow) and `load_env_file` (raw .env parsing).
+    Fixes Issue #1: Previously imported non-existent functions from env_service.
+    Now uses the real env_service API.
 
     Note: env_targets currently has no filtering effect in env_service.
     It's accepted here for API parity with the Vercel/Render providers.
@@ -169,177 +252,6 @@ def prompt_for_env_vars(
             all_vars = env_service.merge_env_vars(all_vars, vars_from_file, prefer="new")
     return all_vars, env_targets
 
-
-# ──────────────────────────────────────────────────────────────
-# SHARED HTTP SESSION
-# ──────────────────────────────────────────────────────────────
-
-def _build_session(token: str) -> requests.Session:
-    """Build a requests session with retry configuration."""
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {token}"})
-
-    # ✅ Retry configuration: 4 total retries, exponential backoff
-    # Note: respect_retry_after_header=False because Netlify returns
-    # Retry-After in date format (RFC 1123) which urllib3 fails to parse
-    retry_kwargs = dict(
-        total=4,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        respect_retry_after_header=False,
-    )
-    try:
-        retry = Retry(allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH"]), **retry_kwargs)
-    except TypeError:
-        retry = Retry(method_whitelist=frozenset(["GET", "POST", "PUT", "PATCH"]), **retry_kwargs)
-
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=MAX_CONCURRENT_UPLOADS,
-        pool_maxsize=MAX_CONCURRENT_UPLOADS,
-    )
-    session.mount("https://", adapter)
-    return session
-
-
-def _coerce_session(session_or_token) -> Tuple[requests.Session, bool]:
-    """Accept either a shared Session or a raw token."""
-    if isinstance(session_or_token, requests.Session):
-        return session_or_token, False
-    return _build_session(session_or_token), True
-
-
-# ──────────────────────────────────────────────────────────────
-# PROJECT NAME SANITIZATION
-# ──────────────────────────────────────────────────────────────
-
-def _sanitize_project_name(name: str) -> str:
-    """
-    Sanitize project name for Netlify.
-
-    ✅ FIX: Strip trailing hyphens after truncation.
-    """
-    name = name.lower()
-    name = name.replace(" ", "-")
-    name = re.sub(r'[^a-z0-9._-]', '-', name)
-    name = re.sub(r'-{2,}', '-', name)
-    name = name.strip('-')
-    if len(name) > 100:
-        name = name[:100]
-        name = name.strip('-')
-    return name
-
-
-# ──────────────────────────────────────────────────────────────
-# SITE LOOKUP
-# ──────────────────────────────────────────────────────────────
-
-def _list_all_sites(
-    session: requests.Session,
-    per_page: int = 100,
-) -> List[Dict]:
-    """Fetch all sites visible to this token, following Netlify's pagination."""
-    sites: List[Dict] = []
-    page = 1
-
-    while True:
-        try:
-            response = session.get(
-                SITES_ENDPOINT,
-                params={"per_page": per_page, "page": page},
-                timeout=30,
-            )
-        except Exception as e:
-            _debug_log(f"_list_all_sites network error: {e}")
-            break
-
-        if response.status_code != 200:
-            _debug_log(f"_list_all_sites HTTP {response.status_code}: {response.text}")
-            break
-
-        data = response.json()
-        if not data:
-            break
-
-        sites.extend(data)
-        if len(data) < per_page:
-            break
-
-        page += 1
-
-    return sites
-
-
-def _find_site_by_name(
-    session: requests.Session,
-    site_name: str,
-) -> Optional[str]:
-    """Find a site by name."""
-    for site in _list_all_sites(session):
-        if site.get("name") == site_name:
-            return site.get("id")
-    return None
-
-
-# ──────────────────────────────────────────────────────────────
-# COLLECT PROJECT FILES
-# ──────────────────────────────────────────────────────────────
-
-def _collect_project_files(project_path: Path) -> List[Dict]:
-    """
-    Collect all files to upload, returning a list of dicts with path and SHA1.
-    """
-    files: List[Dict] = []
-    if not project_path.exists() or not project_path.is_dir():
-        _show_error(
-            "We couldn't find the project folder to deploy.",
-            hint=f"Check that this path exists: {project_path}",
-        )
-        return []
-
-    try:
-        for file_path in project_path.rglob("*"):
-            if not file_path.is_file():
-                continue
-            rel_parts = file_path.relative_to(project_path).parts
-            if any(part in EXCLUDE_DIR_NAMES for part in rel_parts[:-1]):
-                continue
-            if file_path.name in EXCLUDE_FILE_NAMES:
-                continue
-            if _is_env_file(file_path.name):
-                continue
-            if file_path.suffix in EXCLUDE_SUFFIXES:
-                continue
-
-            try:
-                content = file_path.read_bytes()
-                sha1 = hashlib.sha1(content).hexdigest()
-                size = len(content)
-            except Exception as e:
-                _debug_log(f"Could not read {file_path}: {e}")
-                continue
-
-            rel_posix_path = file_path.relative_to(project_path).as_posix()
-            files.append({
-                "path": rel_posix_path,
-                "sha1": sha1,
-                "size": size,
-            })
-
-    except Exception as e:
-        _show_error(
-            "We couldn't read your project files.",
-            hint="Check that the project folder is readable, then try again.",
-            debug_detail=f"_collect_project_files error: {e}",
-        )
-        return []
-
-    return files
-
-
-# ──────────────────────────────────────────────────────────────
-# ENVIRONMENT VARIABLES
-# ──────────────────────────────────────────────────────────────
 
 def _get_existing_env_vars(
     session: requests.Session,
@@ -416,19 +328,106 @@ def _set_env_vars(
         )
 
 
-# ──────────────────────────────────────────────────────────────
-# GET OR CREATE SITE (WITH CONFLICT RESOLUTION)
-#
-# ✅ IMPORTANT: this function is interactive — it can print a Panel, list
-# sites, and call Prompt.ask() when a site name conflict (422) is hit.
-# It must NEVER be called from inside an open `rich.progress.Progress`
-# context. Progress owns the terminal via a Live region that repaints on
-# its own refresh loop; running Prompt.ask()/console.print() concurrently
-# with that produces duplicated/garbled output.
-# Call this fully OUTSIDE any Progress context, let it finish resolving
-# the site, and only THEN open Progress for the remaining non-interactive
-# upload/build steps.
-# ──────────────────────────────────────────────────────────────
+# ============================================================================
+# HTTP SESSION MANAGEMENT
+# ============================================================================
+
+def _build_session(token: str) -> requests.Session:
+    """Build a requests session with retry configuration."""
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {token}"})
+
+    # Retry configuration: 4 total retries, exponential backoff
+    # respect_retry_after_header=False because Netlify returns
+    # Retry-After in date format (RFC 1123) which urllib3 fails to parse
+    retry_kwargs = dict(
+        total=4,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        respect_retry_after_header=False,
+    )
+    try:
+        retry = Retry(allowed_methods=frozenset(["GET", "POST", "PUT", "PATCH"]), **retry_kwargs)
+    except TypeError:
+        retry = Retry(method_whitelist=frozenset(["GET", "POST", "PUT", "PATCH"]), **retry_kwargs)
+
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=MAX_CONCURRENT_UPLOADS,
+        pool_maxsize=MAX_CONCURRENT_UPLOADS,
+    )
+    session.mount("https://", adapter)
+    return session
+
+
+# ============================================================================
+# SITE MANAGEMENT
+# ============================================================================
+
+def _list_all_sites(
+    session: requests.Session,
+    per_page: int = 100,
+) -> List[Dict]:
+    """Fetch all sites visible to this token, following Netlify's pagination."""
+    sites: List[Dict] = []
+    page = 1
+
+    while True:
+        try:
+            response = session.get(
+                SITES_ENDPOINT,
+                params={"per_page": per_page, "page": page},
+                timeout=30,
+            )
+        except Exception as e:
+            _debug_log(f"_list_all_sites network error: {e}")
+            break
+
+        if response.status_code != 200:
+            _debug_log(f"_list_all_sites HTTP {response.status_code}: {response.text}")
+            break
+
+        data = response.json()
+        if not data:
+            break
+
+        sites.extend(data)
+        if len(data) < per_page:
+            break
+
+        page += 1
+
+    return sites
+
+
+def _find_site_by_name(
+    session: requests.Session,
+    site_name: str,
+) -> Optional[str]:
+    """Find a site by name and return its ID."""
+    for site in _list_all_sites(session):
+        if site.get("name") == site_name:
+            return site.get("id")
+    return None
+
+
+def _get_site_name(session: requests.Session, site_id: str) -> Optional[str]:
+    """
+    Get site name from site ID.
+    
+    Fixes Issue #7: Used to display the actual site name after conflict resolution.
+    """
+    try:
+        response = session.get(
+            f"{SITES_ENDPOINT}/{site_id}",
+            timeout=30,
+        )
+        if response.status_code == 200:
+            return response.json().get("name")
+    except Exception as e:
+        _debug_log(f"_get_site_name error: {e}")
+    return None
+
 
 def _get_or_create_site(
     session: requests.Session,
@@ -438,6 +437,14 @@ def _get_or_create_site(
 ) -> Optional[str]:
     """
     Get existing site by name or create a new one with conflict resolution.
+
+    Fixes Issue #2: Now tracks total attempts across manual name entry too.
+    Fixes Issue #6: Added user-visible progress during retry waits.
+    Fixes Issue #7: Site name display updated after conflict resolution.
+
+    IMPORTANT: This function is interactive — it can print a Panel, list
+    sites, and call Prompt.ask(). It must NEVER be called from inside an
+    open rich.progress.Progress context.
 
     Args:
         session: Requests session
@@ -479,10 +486,16 @@ def _get_or_create_site(
             _debug_log(f"_get_or_create_site: created new site '{site_name}' -> {site_id}")
             return site_id
 
-        # Handle rate limiting (429)
+        # Handle rate limiting (429) with user-visible progress
         if response.status_code == 429:
             _debug_log(f"Rate limited while creating site. Waiting...")
-            time.sleep(10)
+            # Fixes Issue #6: Show user we're waiting
+            console.print("[yellow]⏳ Rate limited by Netlify. Waiting 10 seconds before retry...[/yellow]")
+            for i in range(10, 0, -1):
+                console.print(f"[dim]  Retrying in {i}s...[/dim]", end="\r")
+                time.sleep(1)
+            console.print()  # Clear the progress line
+            
             response = session.post(
                 SITES_ENDPOINT,
                 headers={"Content-Type": "application/json"},
@@ -549,6 +562,7 @@ def _get_or_create_site(
                         if not sites:
                             console.print("[yellow]No existing sites found. Please enter a new name.[/yellow]")
                             new_name = f"{original_name}-{attempt + 1}"
+                            # Fixes Issue #2: Track total attempts
                             return _get_or_create_site(
                                 session, new_name, original_name, attempt + 1
                             )
@@ -577,14 +591,16 @@ def _get_or_create_site(
                             if 0 <= idx < len(sites):
                                 selected_site = sites[idx]
                                 site_id = selected_site.get("id")
-                                site_name = selected_site.get("name", site_name)
-                                console.print(f"[green]✅ Using existing site: {site_name}[/green]")
+                                # Fixes Issue #7: Update site_name with the selected one
+                                actual_site_name = selected_site.get("name", site_name)
+                                console.print(f"[green]✅ Using existing site: {actual_site_name}[/green]")
                                 return site_id
                         except ValueError:
                             pass
 
                         console.print("[yellow]Invalid selection. Please try again.[/yellow]")
                         new_name = f"{original_name}-{attempt + 1}"
+                        # Fixes Issue #2: Track total attempts
                         return _get_or_create_site(
                             session, new_name, original_name, attempt + 1
                         )
@@ -604,7 +620,8 @@ def _get_or_create_site(
                         new_name = _sanitize_project_name(new_name)
                         console.print(f"[dim]Trying: {new_name}[/dim]")
 
-                        return _get_or_create_site(session, new_name, new_name, 1)
+                        # Fixes Issue #2: Track total attempts
+                        return _get_or_create_site(session, new_name, new_name, attempt + 1)
 
                     return None
 
@@ -627,9 +644,68 @@ def _get_or_create_site(
         return None
 
 
-# ──────────────────────────────────────────────────────────────
-# CREATE DEPLOYMENT WITH MANIFEST
-# ──────────────────────────────────────────────────────────────
+# ============================================================================
+# FILE COLLECTION
+# ============================================================================
+
+def _collect_project_files(project_path: Path) -> List[Dict]:
+    """
+    Collect all files to upload, respecting .gitignore.
+    
+    Fixes Issue #8: Now loads and respects .gitignore patterns.
+    
+    Returns:
+        List of dicts with keys: path, sha1, size
+    """
+    files: List[Dict] = []
+    if not project_path.exists() or not project_path.is_dir():
+        _show_error(
+            "We couldn't find the project folder to deploy.",
+            hint=f"Check that this path exists: {project_path}",
+        )
+        return []
+
+    # Load .gitignore patterns
+    gitignore_patterns = _load_gitignore(project_path)
+
+    try:
+        for file_path in project_path.rglob("*"):
+            if not file_path.is_file():
+                continue
+            
+            # Fixes Issue #8: Check .gitignore
+            if _should_ignore_file(file_path, project_path, gitignore_patterns):
+                continue
+
+            try:
+                content = file_path.read_bytes()
+                sha1 = hashlib.sha1(content).hexdigest()
+                size = len(content)
+            except Exception as e:
+                _debug_log(f"Could not read {file_path}: {e}")
+                continue
+
+            rel_posix_path = file_path.relative_to(project_path).as_posix()
+            files.append({
+                "path": rel_posix_path,
+                "sha1": sha1,
+                "size": size,
+            })
+
+    except Exception as e:
+        _show_error(
+            "We couldn't read your project files.",
+            hint="Check that the project folder is readable, then try again.",
+            debug_detail=f"_collect_project_files error: {e}",
+        )
+        return []
+
+    return files
+
+
+# ============================================================================
+# DEPLOYMENT MANAGEMENT
+# ============================================================================
 
 def _create_deploy_with_manifest(
     session: requests.Session,
@@ -641,6 +717,8 @@ def _create_deploy_with_manifest(
 
     Netlify expects: {"files": {"path/to/file": "sha1"}}
     It returns "required" as a list of SHA1 hashes that need uploading.
+    
+    Fixes Issue #6: Added user-visible countdown during retry waits.
     """
     try:
         # Build manifest: {"path/to/file": "sha1"}
@@ -667,19 +745,24 @@ def _create_deploy_with_manifest(
                 _debug_log(f"_create_deploy_with_manifest: response missing id: {data}")
                 return None
 
-            # ✅ FIX: required is a list of SHA1 hashes that need uploading
+            # required is a list of SHA1 hashes that need uploading
             required_files = data.get("required", [])
             _debug_log(f"Deploy {deploy_id}: {len(required_files)} files required to upload")
 
             return {
                 "deploy_id": deploy_id,
-                "required_files": required_files,  # These are SHA1 hashes
+                "required_files": required_files,
                 "deploy_data": data,
             }
 
         if response.status_code == 429:
             _debug_log(f"Rate limited (429) in deploy creation after retries exhausted.")
-            time.sleep(10)
+            # Fixes Issue #6: Show user-visible progress
+            console.print("[yellow]⏳ Rate limited by Netlify. Waiting 10 seconds before retry...[/yellow]")
+            for i in range(10, 0, -1):
+                console.print(f"[dim]  Retrying in {i}s...[/dim]", end="\r")
+                time.sleep(1)
+            console.print()  # Clear the progress line
             return None
 
         _show_error(
@@ -698,10 +781,6 @@ def _create_deploy_with_manifest(
         return None
 
 
-# ──────────────────────────────────────────────────────────────
-# UPLOAD FILES TO DEPLOY  ✅ FIXED
-# ──────────────────────────────────────────────────────────────
-
 def _upload_files_to_deploy(
     session: requests.Session,
     deploy_id: str,
@@ -714,7 +793,9 @@ def _upload_files_to_deploy(
     """
     Upload files to a Netlify deploy.
 
-    ✅ FIX: required_files is a list of SHA1 hashes, not file paths.
+    Fixes Issue #1: URL-encode file paths before upload.
+    
+    Note: required_files is a list of SHA1 hashes, not file paths.
     Build lookup by SHA1 to find which local files correspond.
 
     API: PUT /deploys/{deploy_id}/files/{file_path}
@@ -723,7 +804,7 @@ def _upload_files_to_deploy(
     if not required_files:
         return True
 
-    # ✅ FIX: required_files are SHA1 hashes, not file paths
+    # required_files are SHA1 hashes, not file paths
     # Build lookup by SHA1
     sha1_map = {f["sha1"]: f for f in file_manifest}
 
@@ -756,15 +837,18 @@ def _upload_files_to_deploy(
         try:
             content = abs_path.read_bytes()
         except Exception as e:
-            _safe_show_error(
+            _show_error(
                 f"Couldn't read {file_path}.",
                 debug_detail=f"_upload_one read error for {file_path}: {e}",
             )
             return False
 
         try:
+            # Fixes Issue #1: URL-encode file path
+            encoded_path = urllib.parse.quote(file_path, safe='/')
+            
             response = session.put(
-                f"{DEPLOYS_ENDPOINT}/{deploy_id}/files/{file_path}",
+                f"{DEPLOYS_ENDPOINT}/{deploy_id}/files/{encoded_path}",
                 headers={"Content-Type": "application/octet-stream"},
                 data=content,
                 timeout=60,
@@ -773,14 +857,14 @@ def _upload_files_to_deploy(
             if response.status_code in (200, 201):
                 return True
 
-            _safe_show_error(
+            _show_error(
                 f"Couldn't upload {file_path}.",
                 debug_detail=f"_upload_one HTTP {response.status_code} for {file_path}: {response.text}",
             )
             return False
 
         except Exception as e:
-            _safe_show_error(
+            _show_error(
                 f"Couldn't upload {file_path}.",
                 debug_detail=f"_upload_one error for {file_path}: {e}",
             )
@@ -810,10 +894,6 @@ def _upload_files_to_deploy(
 
     return not failed.is_set()
 
-
-# ──────────────────────────────────────────────────────────────
-# WAIT FOR DEPLOYMENT
-# ──────────────────────────────────────────────────────────────
 
 def _wait_for_deploy(
     session: requests.Session,
@@ -868,9 +948,9 @@ def _wait_for_deploy(
         return None
 
 
-# ──────────────────────────────────────────────────────────────
+# ============================================================================
 # MAIN DEPLOY FUNCTION
-# ──────────────────────────────────────────────────────────────
+# ============================================================================
 
 def deploy_to_netlify(
     token: str,
@@ -889,6 +969,8 @@ def deploy_to_netlify(
 
     Returns:
         (success, url_or_message, site_id)
+        
+    Fixes Issue #7: Now displays the actual site name after conflict resolution.
     """
     project_path = Path(project_path)
     site_id: Optional[str] = None
@@ -912,7 +994,6 @@ def deploy_to_netlify(
 
     console.print()
     console.print("[bold cyan]📦 Deploying to Netlify...[/bold cyan]")
-    console.print(f"[dim]Site: {site_name}[/dim]")
     console.print(f"[dim]Path: {project_path}[/dim]")
     console.print()
 
@@ -920,7 +1001,7 @@ def deploy_to_netlify(
 
     try:
         # ─────────────────────────────────────────────────────
-        # Step 1: Collect files with SHA1
+        # Step 1: Collect files with SHA1 (respects .gitignore)
         # ─────────────────────────────────────────────────────
         console.print("[cyan]📦 Analyzing project...[/cyan]")
         file_manifest = _collect_project_files(project_path)
@@ -932,20 +1013,17 @@ def deploy_to_netlify(
         # ─────────────────────────────────────────────────────
         # Step 2: Get or create site (with conflict resolution)
         #
-        # ✅ FIX: this step is intentionally OUTSIDE of any Progress
-        # live-display context. It can prompt the user (site name
-        # conflicts), and Rich's Progress repaints the screen on its own
-        # refresh loop — running Prompt.ask() while that's active
-        # produced the duplicated/garbled output seen in testing, and
-        # made it look like the upload was kicking off before the user
-        # had actually made a choice. The deploy only proceeds to the
-        # progress-bar section below once the site is fully resolved.
+        # IMPORTANT: This step is OUTSIDE of any Progress context
+        # because it can prompt the user (site name conflicts).
         # ─────────────────────────────────────────────────────
         console.print("[cyan]📦 Getting/creating site...[/cyan]")
         site_id = _get_or_create_site(session, site_name)
         if not site_id:
             return False, "Couldn't set up the site on Netlify. Please try again.", None
-        console.print("[green]✅ Site ready.[/green]")
+        
+        # Fixes Issue #7: Get actual site name after conflict resolution
+        actual_site_name = _get_site_name(session, site_id) or site_name
+        console.print(f"[green]✅ Site ready: {actual_site_name}[/green]")
         console.print()
 
         # From this point on, nothing requires user input, so it's safe
@@ -1024,3 +1102,13 @@ def deploy_to_netlify(
 
     finally:
         session.close()
+
+
+# ============================================================================
+# EXPORTS
+# ============================================================================
+
+__all__ = [
+    "deploy_to_netlify",
+    "prompt_for_env_vars",
+]
