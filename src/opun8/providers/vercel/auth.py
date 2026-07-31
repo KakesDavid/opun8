@@ -1,6 +1,9 @@
 """
 Vercel OAuth authentication for Opun8.
 Now uses the Opun8 API backend instead of local .env file.
+
+✅ FIX: UI has been removed from this file. All UI is now handled by
+`ui/messages.py` -> `vercel_auth_start()` to avoid duplicate flows.
 """
 
 import os
@@ -19,7 +22,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Dict, Callable
 from rich.console import Console
-from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -93,9 +95,8 @@ def _fetch_vercel_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
     for attempt in range(retries):
         try:
             if attempt > 0:
-                # Show a subtle message that we're retrying
                 console.print(f"[dim]⏳ Connecting to API (attempt {attempt + 1}/{retries})...[/dim]")
-                time.sleep(1.5 * attempt)  # Increasing backoff
+                time.sleep(1.5 * attempt)
             
             response = requests.get(
                 f"{API_BASE_URL}/vercel/config",
@@ -113,13 +114,11 @@ def _fetch_vercel_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
                     _debug_log(f"Vercel config response missing client_id: {response.text}")
                     continue
             
-            # If we got a 404 or 5xx, the API might be waking up
             if response.status_code >= 500 or response.status_code == 404:
                 last_error = f"API returned {response.status_code}"
                 _debug_log(f"Vercel config failed: {response.status_code} - {response.text}")
                 continue
             
-            # 4xx errors other than 404 are likely permanent
             if response.status_code >= 400:
                 last_error = f"API returned {response.status_code}"
                 _debug_log(f"Vercel config failed: {response.status_code} - {response.text}")
@@ -129,7 +128,6 @@ def _fetch_vercel_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
             last_error = str(e)
             _debug_log(f"Connection error to API: {e}")
             if attempt < retries - 1:
-                # Render free tier might be waking up
                 if "ConnectionError" in str(e) or "timeout" in str(e).lower():
                     console.print("[dim]⏳ API is waking up (Render free tier sleep)...[/dim]")
             continue
@@ -146,7 +144,6 @@ def _fetch_vercel_config(retries: int = 3, timeout: int = 15) -> Optional[str]:
             _debug_log(f"Error fetching Vercel config: {e}")
             break
     
-    # If we got here, all attempts failed
     _debug_log(f"Failed to fetch Vercel config after {retries} attempts: {last_error}")
     return None
 
@@ -426,35 +423,25 @@ def clear_pat_token() -> None:
         _write_token_file(data)
 
 
-def login_to_vercel() -> Optional[str]:
-    console.print()
-    console.print(Panel(
-        "[bold cyan]▲ Vercel Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to Vercel to:\n"
-        "  • Create projects\n"
-        "  • Deploy your code\n"
-        "  • Get deployment URLs\n\n"
-        "[dim]Your browser will open for authorization.[/dim]",
-        border_style="cyan", padding=(1, 2), width=60,
-    ))
-    console.print()
-    console.print("[bold]1[/] 🔑  [white]Login with Vercel[/white]  [dim](opens browser)[/dim]")
-    console.print("[bold]2[/] ⏭️  [white]Skip[/white]  [dim](deploy without Vercel)[/dim]")
-    console.print()
-    choice = Prompt.ask("[bold cyan]➜[/] Select an option", choices=["1", "2"], default="1", show_choices=False)
-    if choice == "2":
-        console.print("\n[yellow]Skipping Vercel authentication.[/yellow]")
-        return None
+# ──────────────────────────────────────────────────────────────
+# LOGIN TO VERCEL — SILENT (No UI)
+# ✅ FIX: All UI is now handled by ui/messages.py -> vercel_auth_start()
+# ──────────────────────────────────────────────────────────────
 
+def login_to_vercel() -> Optional[str]:
+    """
+    Authenticate with Vercel using OAuth.
+    
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> vercel_auth_start().
+    
+    Returns:
+        Access token if successful, None otherwise.
+    """
     # Get client_id from API with retry logic
-    console.print("[dim]⏳ Connecting to Opun8 API...[/dim]")
     client_id = _fetch_vercel_config()
     if not client_id:
-        _show_error(
-            "Vercel login isn't available right now.",
-            hint="This is a setup issue on our end, not something you need to fix.",
-            debug_detail="Vercel OAuth misconfigured: could not fetch client_id from API",
-        )
+        _debug_log("Vercel OAuth misconfigured: could not fetch client_id from API")
         return None
 
     code_verifier, code_challenge = _generate_pkce_pair()
@@ -462,46 +449,36 @@ def login_to_vercel() -> Optional[str]:
     nonce = secrets.token_urlsafe(32)
     authorize_url = _build_authorize_url(state, nonce, code_challenge, client_id)
 
-    console.print()
-    console.print("[dim]🌐 Opening browser for Vercel authorization...[/dim]")
+    # Open browser silently
     webbrowser.open(authorize_url)
-    console.print("[bold]Waiting for Vercel to redirect back...[/bold]")
-    console.print()
 
+    # Wait for callback
     result = _wait_for_callback()
 
     if result.error and not result.code:
-        _show_error(
-            "We couldn't complete the Vercel login.",
-            hint="You can try again, or use a Personal Access Token instead.",
-            debug_detail=f"OAuth callback error: {result.error}",
-        )
+        _debug_log(f"OAuth callback error: {result.error}")
         return None
 
     if not secrets.compare_digest(result.state or "", state):
-        _show_error(
-            "Something looked wrong with the login response, so we stopped here for your safety.",
-            hint="Please try logging in again.",
-            debug_detail="OAuth state mismatch on callback — possible CSRF, aborting login.",
-        )
+        _debug_log("OAuth state mismatch on callback — possible CSRF, aborting login.")
         return None
 
-    token = exchange_code_for_token(result.code, code_verifier, nonce)
+    token = _exchange_code_for_token(result.code, code_verifier)
     if not token:
-        _show_error(
-            "We couldn't finish connecting your Vercel account.",
-            hint="Please try again.",
-        )
-    else:
-        prompt_team_or_pat(token)
-        show_vercel_projects()
+        _debug_log("Failed to exchange code for token.")
+        return None
+
+    # Show team selection (this is NOT a UI prompt — it's a silent config save)
+    _prompt_team_or_pat(token)
+    
     return token
 
 
-def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] = None) -> Optional[str]:
+def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
+    """Exchange code for token using your API."""
     try:
         if not code:
-            _show_error("We didn't receive an authorization code from Vercel.", hint="Please try logging in again.")
+            _debug_log("No authorization code received from Vercel.")
             return None
 
         # Call your API to exchange the code
@@ -517,20 +494,12 @@ def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] 
 
         if response.status_code != 200:
             error_msg = response.json().get("detail", "Unknown error")
-            _show_error(
-                "Vercel didn't accept the login request.",
-                hint="Please try again in a moment.",
-                debug_detail=f"Token exchange API error: {error_msg}",
-            )
+            _debug_log(f"Token exchange API error: {error_msg}")
             return None
 
         data = response.json()
         if "access_token" not in data:
-            _show_error(
-                "We couldn't finish connecting your Vercel account.",
-                hint="Please try again.",
-                debug_detail=f"Token exchange response missing access_token: {data}",
-            )
+            _debug_log(f"Token exchange response missing access_token: {data}")
             return None
 
         token = data["access_token"]
@@ -540,34 +509,21 @@ def exchange_code_for_token(code: str, code_verifier: str, nonce: Optional[str] 
 
         if user:
             save_vercel_token(token, user, refresh_token, expires_in)
-            console.print()
-            console.print(f"[bold green]✅ Connected to Vercel as: {user.get('name', 'Unknown')}[/bold green]")
+            # ✅ FIX: No success message here — UI handles it
         else:
             save_vercel_token(token, {"name": "Unknown"}, refresh_token, expires_in)
-            console.print("[yellow]Connected, but couldn't load your profile details.[/yellow]")
+            _debug_log("Connected, but couldn't load your profile details.")
 
         return token
 
     except requests.exceptions.ConnectionError:
-        _show_error(
-            "Could not connect to Opun8 API.",
-            hint="Make sure the API server is running.",
-            debug_detail=f"Connection error to {API_BASE_URL}",
-        )
+        _debug_log(f"Connection error to {API_BASE_URL}")
         return None
     except requests.RequestException as e:
-        _show_error(
-            "We couldn't reach the Opun8 API to finish logging in.",
-            hint="Check your internet connection and try again.",
-            debug_detail=f"Token exchange network error: {e}",
-        )
+        _debug_log(f"Token exchange network error: {e}")
         return None
     except Exception as e:
-        _show_error(
-            "Something went wrong finishing the Vercel login.",
-            hint="Please try again.",
-            debug_detail=f"Token exchange unexpected error: {e}",
-        )
+        _debug_log(f"Token exchange unexpected error: {e}")
         return None
 
 
@@ -695,7 +651,7 @@ def prompt_team_selection(token: str) -> None:
         console.print(f"[green]✅ Using team: {label}[/green]")
 
 
-def prompt_team_or_pat(token: str) -> None:
+def _prompt_team_or_pat(token: str) -> None:
     teams = list_vercel_teams(token, silent=True)
     if teams is not None:
         prompt_team_selection(token)
@@ -789,7 +745,7 @@ def switch_vercel_team() -> None:
     if not token:
         console.print("[yellow]Not connected to Vercel yet. Run the login flow first.[/yellow]")
         return
-    prompt_team_or_pat(token)
+    _prompt_team_or_pat(token)
 
 
 PROJECTS_ENDPOINT = "https://api.vercel.com/v9/projects"

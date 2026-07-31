@@ -1,25 +1,34 @@
 """
 UI messages for Opun8.
-All user-facing messages in one place.
+All user-facing messages in one place with a warm, friendly "partner" tone.
+
+Navigation between screens (welcome / help / detect menu / no-project menu)
+runs through a single iterative dispatcher (`_menu_loop`) instead of screens
+calling each other directly, so bouncing between menus doesn't grow the call
+stack.
 """
 
 import os
 import shutil
+import logging
+import webbrowser
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.prompt import Prompt
+from rich.prompt import Prompt, Confirm
+from rich import box
+from rich.markup import escape
 
 from opun8.auth import is_authenticated, get_authenticated_user
 from opun8.services.recent_projects import get_recent_projects
 
 console = Console()
-
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
 # EMOJI / SYMBOL HANDLING
@@ -28,155 +37,128 @@ console = Console()
 _NO_EMOJI = os.environ.get("OPUN8_NO_EMOJI", "").lower() in ("1", "true", "yes")
 
 _SYMBOLS = {
+    # Status
     "success": "✅" if not _NO_EMOJI else "[OK]",
     "info": "ℹ️" if not _NO_EMOJI else "[i]",
     "warning": "⚠️" if not _NO_EMOJI else "[!]",
     "error": "❌" if not _NO_EMOJI else "[ERR]",
-    "wave": "👋" if not _NO_EMOJI else "",
+    # Actions
+    "rocket": "🚀" if not _NO_EMOJI else "",
+    "party": "🎉" if not _NO_EMOJI else "",
+    "heart": "💙" if not _NO_EMOJI else "",
     "star": "⭐" if not _NO_EMOJI else "*",
-    "owl": "🦉" if not _NO_EMOJI else "",
-    "folder": "📁" if not _NO_EMOJI else "",
+    "crown": "🏆" if not _NO_EMOJI else "",
+    "badge": "🏅" if not _NO_EMOJI else "",
+    "verify": "🔑" if not _NO_EMOJI else "",
+    "lock": "🔐" if not _NO_EMOJI else "",
     "search": "🔍" if not _NO_EMOJI else "",
     "link": "🔗" if not _NO_EMOJI else "",
+    "folder": "📁" if not _NO_EMOJI else "",
+    "browse": "📂" if not _NO_EMOJI else "",
+    "history": "📜" if not _NO_EMOJI else "",
     "books": "📚" if not _NO_EMOJI else "",
     "door": "🚪" if not _NO_EMOJI else "",
-    "bulb": "💡" if not _NO_EMOJI else "*",
-    "brain": "🧠" if not _NO_EMOJI else "",
-    "rocket": "🚀" if not _NO_EMOJI else "",
-    "chart": "📊" if not _NO_EMOJI else "",
-    "cycle": "🔄" if not _NO_EMOJI else "",
     "back": "🔙" if not _NO_EMOJI else "<",
     "arrow": "➜" if not _NO_EMOJI else ">",
     "point": "👉" if not _NO_EMOJI else "->",
-    "party": "🎉" if not _NO_EMOJI else "",
-    "browse": "📂" if not _NO_EMOJI else "",
-    "history": "📜" if not _NO_EMOJI else "",
-    "badge": "🏅" if not _NO_EMOJI else "",
-    "cloud": "☁️" if not _NO_EMOJI else "",
+    "point_down": "👇" if not _NO_EMOJI else "",
+    "bulb": "💡" if not _NO_EMOJI else "*",
+    "wave": "👋" if not _NO_EMOJI else "",
+    "smile": "😊" if not _NO_EMOJI else "",
+    "joy": "🤗" if not _NO_EMOJI else "",
+    "spy": "🕵️" if not _NO_EMOJI else "",
+    "hooray": "🥳" if not _NO_EMOJI else "",
+    "sparkles": "✨" if not _NO_EMOJI else "",
+    "handshake": "🤝" if not _NO_EMOJI else "",
+    "home": "🏠" if not _NO_EMOJI else "",
+    "shield": "🛡️" if not _NO_EMOJI else "",
+    "globe": "🌐" if not _NO_EMOJI else "",
+    "construction": "🏗️" if not _NO_EMOJI else "",
+    "thumbsup": "👍" if not _NO_EMOJI else "",
+    "skip": "⏭️" if not _NO_EMOJI else ">>",
+    "clipboard": "📋" if not _NO_EMOJI else "",
+    "hammer": "🔨" if not _NO_EMOJI else "",
+    "green_circle": "🟢" if not _NO_EMOJI else "",
+    "grin": "😁" if not _NO_EMOJI else "",
+    "thinking": "🤔" if not _NO_EMOJI else "",
+    # Platforms
     "triangle": "▲" if not _NO_EMOJI else "",
+    "box": "📦" if not _NO_EMOJI else "",
+    "cloud": "☁️" if not _NO_EMOJI else "",
+    # Misc
     "clone": "📦" if not _NO_EMOJI else "",
     "upgrade": "⬆️" if not _NO_EMOJI else "",
-    "verify": "🔑" if not _NO_EMOJI else "",
-    "box": "📦" if not _NO_EMOJI else "",
+    "chart": "📊" if not _NO_EMOJI else "",
+    "cycle": "🔄" if not _NO_EMOJI else "",
+    "brain": "🧠" if not _NO_EMOJI else "",
+    "question": "❓" if not _NO_EMOJI else "?",
+    "owl": "🦉" if not _NO_EMOJI else "",
 }
+
+_KEYCAPS = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
 
 
 def _sym(key: str) -> str:
+    """Get symbol by key."""
     return _SYMBOLS.get(key, "")
 
 
+def _emoji_or_empty(key: str) -> str:
+    """Return 'emoji ' with trailing space, or '' if empty."""
+    emoji = _sym(key)
+    return f"{emoji} " if emoji else ""
+
+
+def _keycap(n: int) -> str:
+    """Return keycap emoji or plain fallback in no-emoji mode."""
+    if _NO_EMOJI:
+        return f"{n})"
+    return _KEYCAPS.get(n, f"{n}.")
+
+
+def _escape_text(value) -> str:
+    """Escape rich markup in dynamic values."""
+    return escape(str(value))
+
+
+def _truncate(value, length: int) -> str:
+    """Truncate string with ellipsis."""
+    text = str(value) if value is not None else ""
+    if len(text) > length:
+        return text[: max(length - 1, 0)] + "…"
+    return text
+
+
+def _safe_prompt(message: str, choices: list, default: str = "1") -> str:
+    """Prompt wrapper with Ctrl+C / Ctrl+D handling."""
+    try:
+        return Prompt.ask(
+            message,
+            choices=choices,
+            default=default,
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n{_sym('wave')} Goodbye, friend!")
+        raise typer.Exit(0)
+
+
+def _safe_confirm(message: str, default: bool = True) -> bool:
+    """Confirm wrapper with Ctrl+C / Ctrl+D handling."""
+    try:
+        return Confirm.ask(message, default=default)
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n{_sym('wave')} Goodbye, friend!")
+        raise typer.Exit(0)
+
+
 # ──────────────────────────────────────────────────────────────
-# WIDTH HANDLING
+# WIDTH / SCREEN HANDLING
 # ──────────────────────────────────────────────────────────────
 
 def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
     term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
     return max(minimum, min(preferred, term_width - 4))
-
-
-# ──────────────────────────────────────────────────────────────
-# FOLDER DIALOG  ✅ FIXED
-# ──────────────────────────────────────────────────────────────
-
-def open_folder_dialog(title: str = "Select a project folder") -> Optional[Path]:
-    """
-    Open a native folder browser dialog for the user to select a folder.
-    
-    Returns:
-        Path of the selected folder, or None if cancelled.
-    """
-    # Try tkinter first (built-in on Windows/macOS/Linux)
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        
-        try:
-            folder_path = filedialog.askdirectory(
-                title=title,
-                mustexist=True
-            )
-        except Exception:
-            # No display available or other Tk error
-            folder_path = None
-        finally:
-            root.destroy()
-        
-        if folder_path:
-            return Path(folder_path)
-        return None
-        
-    except Exception:
-        # Fallback: try PyQt5
-        try:
-            from PyQt5.QtWidgets import QApplication, QFileDialog
-            from PyQt5.QtCore import QCoreApplication
-            
-            app = QApplication.instance()
-            if app is None:
-                app = QApplication([])
-            
-            try:
-                folder_path = QFileDialog.getExistingDirectory(
-                    None,
-                    title,
-                    os.path.expanduser("~"),
-                    QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-                )
-            except Exception:
-                folder_path = None
-            
-            if folder_path:
-                return Path(folder_path)
-            return None
-            
-        except Exception:
-            # Fallback: try easygui
-            try:
-                import easygui
-                folder_path = easygui.diropenbox(
-                    title=title,
-                    default=os.path.expanduser("~")
-                )
-                if folder_path:
-                    return Path(folder_path)
-                return None
-                
-            except Exception:
-                # Last resort: use input prompt
-                console.print("[yellow]⚠️ Could not open folder dialog. Please enter path manually.[/yellow]")
-                folder_path = Prompt.ask(
-                    f"[bold cyan]{_sym('arrow')}[/] Project folder path (leave blank to cancel)"
-                )
-                if folder_path:
-                    path = Path(folder_path).expanduser().resolve()
-                    if path.exists():
-                        return path
-                    console.print(f"[red]❌ Path does not exist: {folder_path}[/red]")
-                    return None
-                return None
-
-
-def prompt_select_folder_with_dialog(title: str = "Select a project folder") -> Optional[Path]:
-    """
-    Wrapper for open_folder_dialog with user-friendly messages.
-    """
-    console.print()
-    console.print(f"[bold cyan]{_sym('browse')} {title}[/bold cyan]")
-    console.print("[dim]A file browser will open. Select the folder containing your project.[/dim]")
-    console.print()
-    
-    folder = open_folder_dialog(title)
-    
-    if folder:
-        console.print(f"[green]{_sym('success')} Selected: {folder}[/green]")
-        return folder
-    else:
-        console.print("[yellow]Folder selection cancelled.[/yellow]")
-        return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -198,8 +180,8 @@ def warning(message: str) -> None:
 def error(message: str, suggestion: str = "") -> None:
     console.print()
     console.print(Panel(
-        f"[bold red]{_sym('error')} {message}[/bold red]\n\n"
-        f"[dim]{_sym('bulb')} {suggestion or 'Try again, or run opun8 --help to see all commands.'}[/dim]",
+        f"[bold red]{_sym('error')} {_escape_text(message)}[/bold red]\n\n"
+        f"[dim]{_sym('bulb')} {_escape_text(suggestion or 'Try again, or run opun8 --help to see all commands.')}[/dim]",
         border_style="red",
         padding=(1, 2),
         width=_panel_width(60),
@@ -210,10 +192,9 @@ def error(message: str, suggestion: str = "") -> None:
 def goodbye() -> None:
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('wave')} Thanks for stopping by![/bold cyan]\n\n"
+        f"[bold cyan]{_sym('wave')} Thanks for stopping by, friend![/bold cyan]\n\n"
         "[dim]Come back anytime — I'll be right here when you're ready to ship.[/dim]\n"
-        "[dim]Built with care by the Kakes David team.[/dim]\n"
-        f"[dim]{_sym('star')} Enjoying Opun8? Star us on GitHub: github.com/KakesDavid/opun8[/dim]",
+        f"[dim]{_sym('heart')} Built with love by the Kakes David Team[/dim]",
         border_style="cyan",
         padding=(1, 2),
         width=_panel_width(60),
@@ -222,100 +203,161 @@ def goodbye() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# WELCOME & MAIN MENU
+# NAVIGATION DISPATCHER
 # ──────────────────────────────────────────────────────────────
 
-def show_welcome():
-    """Display the welcome screen and route to the chosen action."""
-    _run_menu_loop("welcome")
-
-
-def show_help():
-    """Display all commands."""
-    _run_menu_loop("help")
-
-
-def _run_menu_loop(start_screen: str) -> None:
-    screen = start_screen
-    while screen in ("welcome", "help"):
-        if screen == "welcome":
-            screen = _render_welcome_and_get_next()
-        else:
-            screen = _render_help_and_get_next()
-
-
-def _render_welcome_and_get_next() -> str:
-    console.print("\n" * 2)
-    console.print(Panel(
-        f"[bold cyan]{_sym('owl')} Welcome to Opun8[/bold cyan]\n"
-        "[dim]Your friendly guide from idea to live website — no DevOps degree required.[/dim]\n\n"
-        "I'll walk you through everything step by step. Ready when you are!\n\n"
-        f"[bold]{_sym('point')} Pick an option below to get started.[/bold]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=_panel_width(65),
-    ))
-    console.print()
-
-    if is_authenticated():
-        user = get_authenticated_user()
-        console.print(f"[dim]{_sym('link')} Connected to GitHub as [green]{user}[/green] — you're all set to deploy.[/dim]")
-    else:
-        console.print(f"[dim]{_sym('link')} Not connected to GitHub yet. Run 'opun8 github' anytime to connect.[/dim]")
-
-    recent = get_recent_projects()
-    if recent:
-        console.print()
-        console.print("[bold]📁 Recent Projects:[/bold]")
-        console.print()
-        for i, project in enumerate(recent[:5], 1):
-            # ✅ FIX: Use .get() defensively
-            name = project.get("name", "Unnamed")
-            path = project.get("path", "Unknown")
-            console.print(f"  [bold cyan]{i}[/]  [white]{name}[/white]  [dim]({path})[/dim]")
-        if len(recent) > 5:
-            console.print(f"  [dim]... and {len(recent) - 5} more[/dim]")
-
-    console.print()
-    console.print("[bold]What would you like to do?[/bold]")
-    console.print()
-    console.print(f"  [bold cyan]1[/] {_sym('folder')}  [white]Detect my project[/white]  [dim](Recommended)[/dim]")
-    console.print(f"  [bold cyan]2[/] {_sym('search')}  [white]Check my environment[/white]")
-    console.print(f"  [bold cyan]3[/] {_sym('link')}  [white]Connect GitHub[/white]")
-    console.print(f"  [bold cyan]4[/] {_sym('books')}  [white]View all commands[/white]")
-    console.print(f"  [bold cyan]5[/] {_sym('door')}  [white]Exit[/white]")
-    console.print()
-    console.print(f"[dim]{_sym('bulb')} Tip: Not sure where to start? Just press Enter — I'll detect your project for you.[/dim]")
-    console.print()
-
-    choice = Prompt.ask(
-        f"[bold cyan]{_sym('arrow')}[/] Select an option",
-        choices=["1", "2", "3", "4", "5"],
-        default="1",
-        show_choices=False,
-    )
-
-    if choice == "1":
-        from opun8.commands.detect import detect
-        detect()
-        return "done"
-    elif choice == "2":
+def _run_action(action: str) -> None:
+    """Execute a terminal action."""
+    if action == "deploy":
+        from opun8.commands.deploy import deploy
+        deploy()
+    elif action == "doctor":
         from opun8.commands.doctor import doctor
         doctor()
-        return "done"
-    elif choice == "3":
+    elif action == "github":
         from opun8.cli import github
         github()
-        return "done"
-    elif choice == "4":
-        return "help"
-    else:
+    elif action == "go_to_folder":
+        from opun8.commands.detect import go_to_folder
+        go_to_folder()
+    elif action == "exit":
         goodbye()
         raise typer.Exit()
 
 
-def _render_help_and_get_next() -> str:
-    console.print("\n" * 2)
+def _menu_loop(start_screen: str) -> None:
+    """Iterative screen dispatcher — no recursion."""
+    screen = start_screen
+    while True:
+        if screen == "welcome":
+            next_screen, action = _screen_welcome()
+        elif screen == "help":
+            next_screen, action = _screen_help()
+        elif screen == "detect_menu":
+            next_screen, action = _screen_detect_menu()
+        elif screen == "no_project_menu":
+            next_screen, action = _screen_no_project_menu()
+        else:
+            return
+
+        if action is not None:
+            _run_action(action)
+            return
+        if next_screen is None:
+            return
+        screen = next_screen
+
+
+# ──────────────────────────────────────────────────────────────
+# WELCOME SCREEN
+# ──────────────────────────────────────────────────────────────
+
+def _get_github_username() -> Optional[str]:
+    """Get GitHub username if authenticated."""
+    try:
+        if is_authenticated():
+            return get_authenticated_user()
+    except Exception as e:
+        logger.debug(f"Failed to get GitHub username: {e}")
+    return None
+
+
+def show_welcome() -> None:
+    """Display the warm, friendly welcome screen."""
+    _menu_loop("welcome")
+
+
+def _screen_welcome() -> Tuple[Optional[str], Optional[str]]:
+    """Render welcome screen."""
+    console.print("\n")
+
+    github_user = _get_github_username()
+    is_github_connected = github_user is not None
+
+    if is_github_connected:
+        greeting = (
+            f"{_emoji_or_empty('wave')}{_emoji_or_empty('smile')}"
+            f"HELLO, {_escape_text(github_user.upper())}! I am Opun8, your Deployment Partner!"
+        )
+    else:
+        greeting = (
+            f"{_emoji_or_empty('wave')}{_emoji_or_empty('smile')}"
+            "HELLO FRIEND! I am Opun8, your Deployment Assistant!"
+        )
+
+    console.print(Panel(
+        f"[bold cyan]{greeting}[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to launch your site![/dim]\n\n"
+        f"[white]{_emoji_or_empty('heart')}I am your partner! Let's launch your website together![/white]\n"
+        f"[dim]{_emoji_or_empty('point_down')}Look at the big numbers below and pick one![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    recent = get_recent_projects()
+    if recent:
+        last_project = recent[0]
+        console.print(f"[bold]{_sym('folder')} YOUR LAST WORKED PROJECT:[/bold]")
+        console.print(f"   {_emoji_or_empty('point')}[cyan]{_escape_text(last_project.get('name', 'Unknown'))}[/cyan]")
+        console.print()
+
+    if not is_github_connected:
+        console.print(f"[bold red]{_sym('error')} GITHUB IS NOT CONNECTED YET! {_sym('heart')}[/bold red]")
+        console.print(f"[dim]{_emoji_or_empty('point')}Press button number {_keycap(3)} below to connect it with me![/dim]")
+        console.print()
+    else:
+        console.print(f"[bold green]{_sym('success')} GITHUB IS CONNECTED! Welcome back, {_escape_text(github_user)}! {_sym('party')}[/bold green]")
+        console.print()
+
+    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON FOR ME TO HELP YOU:[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('rocket')} [white]LAUNCH MY WEBSITE NOW![/white] [dim](Recommended)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('search')} [white]Check my system health[/white]")
+    if not is_github_connected:
+        console.print(f"  [bold cyan]{_keycap(3)}[/] {_sym('lock')} [bold yellow]CONNECT MY GITHUB PROFILE NOW! {_sym('verify')}[/bold yellow]")
+    else:
+        console.print(f"  [bold cyan]{_keycap(3)}[/] {_sym('link')} [white]Manage GitHub connection[/white]")
+    console.print(f"  [bold cyan]{_keycap(4)}[/] {_sym('books')} [white]See all options[/white]")
+    console.print(f"  [bold cyan]{_keycap(5)}[/] {_sym('door')} [white]Close app[/white]")
+    console.print()
+
+    console.print(f"[green]{_sym('success')} STUCK OR NOT SURE? Just smash the ENTER key on your keyboard! {_sym('joy')}[/green]")
+    console.print(f"[dim]   I will automatically handle everything and make it live for you! {_sym('party')}[/dim]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Press a number or Enter",
+        choices=["1", "2", "3", "4", "5"],
+        default="1",
+    )
+
+    if choice == "1":
+        return None, "deploy"
+    elif choice == "2":
+        return None, "doctor"
+    elif choice == "3":
+        return None, "github"
+    elif choice == "4":
+        return "help", None
+    else:
+        return None, "exit"
+
+
+# ──────────────────────────────────────────────────────────────
+# HELP SCREEN
+# ──────────────────────────────────────────────────────────────
+
+def show_help() -> None:
+    """Display all commands."""
+    _menu_loop("help")
+
+
+def _screen_help() -> Tuple[Optional[str], Optional[str]]:
+    """Render help screen."""
+    console.print("\n")
+
     console.print(Panel(
         f"[bold cyan]{_sym('books')} Opun8 Commands[/bold cyan]\n"
         "[dim]Everything you can do, all in one place.[/dim]",
@@ -329,28 +371,21 @@ def _render_help_and_get_next() -> str:
     table.add_column("Command", style="bold green", width=22)
     table.add_column("Description", style="white", width=42)
 
-    # Core Commands
     table.add_row("opun8", "Show welcome screen")
     table.add_row("opun8 --version", "Show version")
     table.add_row("opun8 doctor", "Check environment")
     table.add_row("opun8 detect", "Detect project type")
     table.add_row("opun8 deploy", "Deploy your project")
-
-    # Authentication Commands
     table.add_row("opun8 register", "Create an OPUN8 account")
     table.add_row("opun8 login", "Log in to your account")
     table.add_row("opun8 verify", "Verify email with OTP")
     table.add_row("opun8 resend-otp", "Resend verification code")
     table.add_row("opun8 status", "Check account status")
     table.add_row("opun8 logout", "Logout from all services")
-
-    # Platform Commands
     table.add_row("opun8 github", "Connect to GitHub")
     table.add_row("opun8 vercel", "Connect to Vercel")
-    table.add_row("opun8 render", "Connect to Render")
     table.add_row("opun8 netlify", "Connect to Netlify")
-
-    # Advanced Commands
+    table.add_row("opun8 render", "Connect to Render")
     table.add_row("opun8 clone", "Clone any website")
     table.add_row("opun8 upgrade", "Upgrade subscription plan")
     table.add_row("opun8 history", "View deployment history")
@@ -368,29 +403,28 @@ def _render_help_and_get_next() -> str:
     console.print(f"  [bold cyan]2[/] {_sym('door')}  [white]Exit[/white]")
     console.print()
 
-    choice = Prompt.ask(
+    choice = _safe_prompt(
         f"[bold cyan]{_sym('arrow')}[/] Select an option",
         choices=["1", "2"],
         default="1",
-        show_choices=False,
     )
 
     if choice == "1":
-        return "welcome"
+        return "welcome", None
     else:
-        goodbye()
-        raise typer.Exit()
+        return None, "exit"
 
 
 # ──────────────────────────────────────────────────────────────
 # DETECTION UI
 # ──────────────────────────────────────────────────────────────
 
-def detection_start():
+def detection_start() -> None:
+    """Show detection start with partner tone."""
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('folder')} Detecting Your Project[/bold cyan]\n"
-        "[dim]Give me a second to look around...[/dim]",
+        f"[bold cyan]{_sym('spy')} PROJECT SCOUTED! I found your files![/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to help you![/dim]",
         border_style="cyan",
         padding=(1, 2),
         width=_panel_width(60),
@@ -403,39 +437,157 @@ def scanning_spinner(message: str = "Scanning your current folder..."):
         yield
 
 
-def detection_complete(result: dict):
+def detection_complete(result: dict) -> None:
+    """Show detection results with partner tone."""
     console.print()
-    console.print(f"[bold green]{_sym('success')} Nice! I found your project.[/bold green]")
-    console.print()
-    console.print(f"[bold]{_sym('brain')} Here's what I detected:[/bold]")
+    console.print(Panel(
+        f"[bold green]{_sym('hooray')} HOORAY! Everything looks perfect and healthy! {_sym('heart')}[/bold green]\n"
+        f"[dim]{_emoji_or_empty('point_down')}Here is the structural data I found for us, partner:[/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
     console.print()
 
-    table = Table(show_header=False, box=None, padding=(0, 2))
-    table.add_column(style="bold white", width=16)
-    table.add_column(style="white", width=40)
+    table = Table(
+        title=f"{_emoji_or_empty('clipboard')}Project Details",
+        box=box.ROUNDED,
+        border_style="cyan",
+        title_style="bold cyan",
+        width=_panel_width(60),
+    )
+    table.add_column("Field", style="bold white", width=20)
+    table.add_column("Value", style="white", width=35)
 
-    table.add_row("Type", result.get("type", "Unknown"))
-    table.add_row("Framework", result.get("framework", "Unknown"))
-    table.add_row("Package Manager", result.get("package_manager", "Unknown"))
-    table.add_row("Build Command", result.get("build_command", "Not found"))
-    table.add_row("Output Directory", result.get("output_dir", "Unknown"))
+    project_name = result.get("name", Path.cwd().name)
+    framework = result.get("framework", "Unknown")
+    package_manager = result.get("package_manager", "Unknown")
+    project_type = result.get("type", "Unknown")
+
+    framework_display = {
+        "react": "React",
+        "nextjs": "Next.js",
+        "vue": "Vue",
+        "angular": "Angular",
+        "vite": "Vite",
+        "nodejs": "Node.js",
+        "django": "Django",
+        "flask": "Flask",
+        "fastapi": "FastAPI",
+        "python": "Python",
+        "static": "Static HTML",
+        "unknown": "Unknown",
+    }.get(framework, framework.capitalize())
+
+    table.add_row(f"{_sym('folder')} Project Name", _escape_text(project_name))
+    table.add_row(f"{_sym('box')} Framework", _escape_text(framework_display))
+    table.add_row(f"{_sym('box')} Package Manager", _escape_text(package_manager))
+    table.add_row(f"{_emoji_or_empty('clipboard')}Type", _escape_text(project_type.capitalize()))
 
     console.print(table)
 
-
-def no_project_detected():
     console.print()
-    console.print(f"[yellow]{_sym('warning')} Hmm, I couldn't find a project here.[/yellow]")
-    console.print()
-    console.print("[dim]I'm looking for one of these in your current folder:[/dim]")
-    console.print("[dim]  • package.json (Node.js/React/Next.js)[/dim]")
-    console.print("[dim]  • index.html (Static HTML)[/dim]")
-    console.print("[dim]  • requirements.txt (Python)[/dim]")
+    table2 = Table(
+        title=f"{_emoji_or_empty('hammer')}Build Configuration",
+        box=box.ROUNDED,
+        border_style="cyan",
+        title_style="bold cyan",
+        width=_panel_width(60),
+    )
+    table2.add_column("Field", style="bold white", width=20)
+    table2.add_column("Value", style="white", width=35)
+
+    needs_build = result.get("needs_build", False)
+    build_command = result.get("build_command", "None")
+    output_dir = result.get("output_dir", ".")
+
+    table2.add_row(f"{_emoji_or_empty('hammer')}Needs Build", f"{_sym('success')} Yes" if needs_build else f"{_sym('error')} No (static)")
+    table2.add_row(f"{_emoji_or_empty('clipboard')}Build Command", _escape_text(build_command))
+    table2.add_row(f"{_sym('folder')} Output Directory", _escape_text(output_dir))
+
+    build_folder_exists = f"{_sym('success')} Exists" if Path(output_dir).exists() else f"{_sym('error')} Not found"
+    table2.add_row(f"{_sym('browse')} Build Folder", build_folder_exists)
+
+    console.print(table2)
     console.print()
 
+    _menu_loop("detect_menu")
 
-def show_deploy_menu():
-    """Show menu after detection with 5 options."""
+
+def _screen_detect_menu() -> Tuple[Optional[str], Optional[str]]:
+    """Render post-detection menu."""
+    console.print(f"[bold green]{_sym('point')} WHAT SHOULD WE DO NEXT, PARTNER? {_sym('smile')}[/bold green]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('rocket')} [white]LAUNCH THIS WEBSITE TO THE INTERNET NOW![/white] [dim](Recommended)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('folder')} [white]Go back to the main menu[/white]")
+    console.print(f"  [bold cyan]{_keycap(3)}[/] {_sym('door')} [white]Close app[/white]")
+    console.print()
+    console.print(f"[green]{_sym('success')} STUCK OR NOT SURE? Just smash the ENTER key! {_sym('joy')}[/green]")
+    console.print(f"[dim]   I will automatically choose {_keycap(1)} and put your site live! {_sym('party')}[/dim]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Press a number or Enter",
+        choices=["1", "2", "3"],
+        default="1",
+    )
+
+    if choice == "1":
+        return None, "deploy"
+    elif choice == "2":
+        return "welcome", None
+    else:
+        return None, "exit"
+
+
+def no_project_detected() -> None:
+    """Show no project detected message with follow-up menu."""
+    console.print()
+    _menu_loop("no_project_menu")
+
+
+def _screen_no_project_menu() -> Tuple[Optional[str], Optional[str]]:
+    """Render no-project menu."""
+    console.print(Panel(
+        f"[bold yellow]{_sym('warning')} Hmm, I couldn't find a project here, partner! {_sym('thinking')}[/bold yellow]\n\n"
+        "[dim]I'm looking for one of these in your current folder:[/dim]\n"
+        "[dim]  • package.json (Node.js/React/Next.js)[/dim]\n"
+        "[dim]  • index.html (Static HTML)[/dim]\n"
+        "[dim]  • requirements.txt (Python)[/dim]\n\n"
+        f"[dim]{_emoji_or_empty('bulb')}Not in the right folder? I can help you navigate![/dim]",
+        border_style="yellow",
+        padding=(1, 2),
+        width=_panel_width(60),
+    ))
+    console.print()
+
+    console.print("[bold]What would you like to do?[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]1[/] {_sym('folder')}  [white]Select a different folder[/white]")
+    console.print(f"  [bold cyan]2[/] {_sym('back')}  [white]Go back to main menu[/white]")
+    console.print(f"  [bold cyan]3[/] {_sym('door')}  [white]Exit[/white]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        choices=["1", "2", "3"],
+        default="1",
+    )
+
+    if choice == "1":
+        return None, "go_to_folder"
+    elif choice == "2":
+        return "welcome", None
+    else:
+        return None, "exit"
+
+
+# ──────────────────────────────────────────────────────────────
+# PROJECT DETAILS / DEPLOY MENU
+# ──────────────────────────────────────────────────────────────
+
+def show_deploy_menu() -> None:
+    """Show menu after detection with partner tone."""
     console.print()
     console.print(f"[bold]{_sym('party')} Nice! Your project is ready. What would you like to do?[/bold]")
     console.print()
@@ -447,7 +599,8 @@ def show_deploy_menu():
     console.print()
 
 
-def show_details(result: dict):
+def show_details(result: dict) -> None:
+    """Show project details."""
     console.print()
     console.print(f"[bold cyan]{_sym('chart')} Project Details[/bold cyan]")
     console.print()
@@ -464,7 +617,7 @@ def show_details(result: dict):
             display_key = key.replace("_", " ").title()
             if isinstance(value, list):
                 value = ", ".join(value[:5]) + ("..." if len(value) > 5 else "")
-            table.add_row(display_key, str(value))
+            table.add_row(display_key, _escape_text(str(value)))
 
     deps = result.get("dependencies", [])
     if deps:
@@ -478,278 +631,507 @@ def show_details(result: dict):
 # HISTORY UI
 # ──────────────────────────────────────────────────────────────
 
-def prompt_select_folder(title: str = "Select a project folder") -> Optional[Path]:
-    """
-    Prompt the user to select a folder using the native file browser.
-    This is the main function called from history.py and other commands.
-    """
-    return prompt_select_folder_with_dialog(title)
+def history_header(deployment_count: int, badge_name: str, badge_emoji: str) -> None:
+    """Show history header with partner tone."""
+    console.print("\n")
 
-
-# ──────────────────────────────────────────────────────────────
-# RENDER-SPECIFIC MESSAGES
-# ──────────────────────────────────────────────────────────────
-
-def render_auth_start() -> None:
-    """Show Render authentication start message."""
-    console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('cloud')} Render Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to Render to:\n"
-        "  • Create services\n"
-        "  • Deploy your code\n"
-        "  • Get deployment URLs\n\n"
-        "[dim]Your browser will open for authorization if using OAuth.[/dim]"
-        "\n[dim]Or paste your Render API key as an alternative.[/dim]",
+        f"[bold cyan]{_sym('history')}{_sym('crown')} DEPLOYMENT HISTORY LOG[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to track your wins![/dim]",
         border_style="cyan",
         padding=(1, 2),
-        width=_panel_width(60),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(Panel(
+        f"[bold green]{_sym('hooray')} LOOK AT YOU GO, PARTNER! You are building great things! {_sym('heart')}[/bold green]\n"
+        f"[dim]{_sym('badge')} Your current rank badge: {_escape_text(badge_emoji)} {_escape_text(badge_name)} ({deployment_count} deployments)[/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=_panel_width(70),
     ))
     console.print()
 
 
-def render_auth_success(username: str) -> None:
-    """Show Render authentication success message."""
-    console.print()
-    console.print(f"[bold green]{_sym('success')} Connected to Render as: [white]{username}[/white][/bold green]")
-    console.print("[dim]Token saved securely for future use.[/dim]")
-
-
-def render_auth_failed() -> None:
-    """Show Render authentication failure message."""
-    error(
-        "Render authentication failed.",
-        suggestion="Run `opun8 render` to try again, or use an API key.",
-    )
-
-
-def render_deploy_start(project_name: str, region: str) -> None:
-    """Show Render deployment start message."""
-    console.print()
-    console.print(f"[bold cyan]{_sym('cloud')} Deploying to Render[/bold cyan]")
-    console.print(f"[dim]Project: {project_name}[/dim]")
-    console.print(f"[dim]Region: {region}[/dim]")
-    console.print()
-
-
-def render_deploy_success(url: str) -> None:
-    """Show Render deployment success message."""
-    console.print()
-    console.print(f"[bold green]{_sym('success')} Deployment successful![/bold green]")
-    console.print(f"[dim]🌐 {url}[/dim]")
-
-
-def render_deploy_failed(message: str) -> None:
-    """Show Render deployment failure message."""
-    error(
-        f"Deployment failed: {message}",
-        suggestion="Check your project for build errors and try again.",
-    )
-
-
-def render_services_list(services: list) -> None:
-    """Show Render services list."""
-    if not services:
-        console.print("[yellow]No services found on Render.[/yellow]")
-        console.print("[dim]Run [cyan]opun8 deploy[/cyan] to create your first service.[/dim]")
+def history_list(deployments: list) -> None:
+    """Show history list with partner tone."""
+    if not deployments:
+        console.print(f"[yellow]No deployments found yet, partner! {_sym('smile')}[/yellow]")
+        console.print(f"[dim]Let's fix that — run 'opun8 deploy' to launch your first site! {_sym('rocket')}[/dim]")
         return
 
-    console.print()
-    console.print(Panel(
-        f"[bold cyan]{_sym('cloud')} Render Services[/bold cyan]\n"
-        f"[dim]{len(services)} service(s) found[/dim]",
+    table = Table(
+        title=f"Deployments ({len(deployments)})",
+        box=box.ROUNDED,
         border_style="cyan",
-        padding=(1, 2),
-        width=_panel_width(60),
-    ))
-    console.print()
-
-    table = Table(border_style="cyan")
-    table.add_column("#", style="bold white", width=4)
-    table.add_column("Name", style="bold white", width=20)
-    table.add_column("Type", style="dim", width=12)
-    table.add_column("Status", style="dim", width=12)
+        title_style="bold cyan",
+        width=_panel_width(70),
+    )
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Project", style="bold white", width=18)
+    table.add_column("Platform", style="dim", width=12)
     table.add_column("URL", style="cyan", width=25)
+    table.add_column("Date", style="dim", width=12)
 
-    for idx, service in enumerate(services, 1):
-        # ✅ FIX: Handle None values with (value or "Unknown") pattern
-        name = (service.get("name") or "Unknown")[:20]
-        service_type = (service.get("type") or "unknown")[:12]
-        status = (service.get("status") or "unknown")[:12]
-        url = (service.get("url") or "N/A")[:25]
+    for idx, deploy in enumerate(deployments, 1):
+        project = _truncate(deploy.get("project_name") or "Unknown", 18)
+        platform = _truncate(deploy.get("platform") or "Unknown", 12)
+        url = _truncate(deploy.get("url") or "N/A", 25)
+        date = _truncate(deploy.get("date") or "Unknown", 12)
 
-        table.add_row(str(idx), name, service_type, status, url)
+        table.add_row(str(idx), _escape_text(project), _escape_text(platform), _escape_text(url), _escape_text(date))
 
     console.print(table)
     console.print()
 
 
-def render_api_key_prompt() -> None:
-    """Show Render API key prompt message."""
-    # ✅ FIX: Use _sym('verify') instead of _sym('key')
+def history_detail(deployment: dict, badge_name: str, badge_emoji: str, next_badge: str) -> None:
+    """Show history detail with partner tone."""
+    project = deployment.get("project_name") or "Unknown"
+    platform = deployment.get("platform") or "Unknown"
+    url = deployment.get("url") or "N/A"
+    deploy_id = deployment.get("deploy_id") or "N/A"
+    folder = deployment.get("folder") or "Unknown"
+    date = deployment.get("date") or "Unknown"
+    env_vars = deployment.get("env_vars") or []
+
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('verify')} Render API Key[/bold cyan]\n\n"
-        "You can get your API key from:\n"
-        "[dim]https://dashboard.render.com/settings/keys[/dim]\n\n"
-        "Create a new key with 'read' and 'write' permissions.\n"
-        "This is useful for CI/CD and team deployments.",
+        f"[bold cyan]▲ {_escape_text(project)}[/bold cyan]\n\n"
+        f"[dim]Platform:[/dim] {_escape_text(platform)}\n"
+        f"[dim]URL:[/dim] [cyan]{_escape_text(url)}[/cyan]\n"
+        f"[dim]Deployment ID:[/dim] {_escape_text(deploy_id)}\n"
+        f"[dim]Project folder:[/dim] {_escape_text(folder)}\n"
+        f"[dim]Date:[/dim] {_escape_text(date)}\n"
+        f"[dim]Status:[/dim] [green]{_emoji_or_empty('green_circle')}SUCCESS! {_sym('party')}{_emoji_or_empty('grin')}[/green]\n"
+        f"[dim]Environment Variables:[/dim] {', '.join(_escape_text(v) for v in env_vars) if env_vars else 'None'}",
         border_style="cyan",
         padding=(1, 2),
-        width=_panel_width(60),
+        width=_panel_width(70),
     ))
     console.print()
-    console.print("[dim]🌐 Opening Render API keys page in your browser...[/dim]")
+
+    console.print(Panel(
+        f"[bold green]{_sym('crown')} WE ARE DOING GREAT, PARTNER! Here is our record! {_sym('heart')}[/bold green]\n"
+        f"[dim]{_sym('badge')} Current Badge: {_escape_text(badge_emoji)} {_escape_text(badge_name)}[/dim]\n"
+        f"[dim]{_sym('rocket')} {_escape_text(next_badge)}[/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(f"[bold green]{_sym('point')} WHAT SHOULD WE DO WITH THIS PROJECT, FRIEND? {_sym('smile')}[/bold green]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('rocket')} [white]REDEPLOY NOW![/white] [dim](Update the website live)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('back')} [white]Go back to the list[/white]")
+    console.print()
+    console.print(f"[green]{_sym('success')} CLUELESS? Just press the ENTER key on your keyboard! {_sym('joy')}[/green]")
+    console.print(f"[dim]   I will automatically choose {_keycap(1)} and safely redeploy it for you![/dim]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
+    )
+
+    if choice == "1":
+        from opun8.commands.deploy import deploy
+        try:
+            deploy(project_folder=folder, platform=platform)
+        except TypeError:
+            logger.debug(
+                "deploy() does not accept project_folder/platform; "
+                "falling back to default deploy()."
+            )
+            deploy()
+    else:
+        from opun8.commands.history import history
+        history()
 
 
 # ──────────────────────────────────────────────────────────────
-# NETLIFY-SPECIFIC MESSAGES
+# GITHUB AUTH UI
+# ──────────────────────────────────────────────────────────────
+
+def github_auth_start() -> None:
+    """Show GitHub auth start with partner tone."""
+    console.print("\n")
+
+    console.print(Panel(
+        f"[bold cyan]{_sym('lock')}{_sym('link')} LINKING OUR GITHUB BRIDGE[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to secure your code![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(Panel(
+        f"[bold yellow]{_sym('heart')} DON'T WORRY, MY FRIEND! This is completely safe! {_sym('thumbsup')}[/bold yellow]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with GitHub so I can:[/white]\n"
+        f"   • {_emoji_or_empty('home')}Create a safe home for your code files\n"
+        f"   • {_emoji_or_empty('rocket')}Automatically launch your updates to the web\n"
+        f"   • {_emoji_or_empty('shield')}Keep your work locked up securely",
+        border_style="yellow",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH GITHUB NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without GitHub)[/dim]")
+    console.print()
+    console.print(f"[green]{_sym('success')} READY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
+    console.print("[dim]   I will be right here waiting for you to finish![/dim]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
+    )
+
+    if choice == "1":
+        from opun8.auth import login_to_github, is_authenticated, get_authenticated_user
+        login_to_github()
+        if is_authenticated():
+            user = get_authenticated_user()
+            github_auth_success(user)
+        else:
+            error("GitHub login didn't complete.", "You can try again anytime with 'opun8 github'.")
+    else:
+        console.print(f"[dim]{_sym('skip')} Skipping GitHub for now. You can connect later with 'opun8 github'[/dim]")
+
+
+def github_auth_success(username: str) -> None:
+    """Show GitHub auth success with partner tone."""
+    console.print()
+    console.print(Panel(
+        f"[bold green]{_sym('party')} WELCOME ABOARD, {_escape_text(username.upper())}! {_sym('party')}[/bold green]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}Your GitHub profile is now connected! Here's what this means:[/white]\n"
+        f"   • {_emoji_or_empty('home')}I can create homes for your code files\n"
+        f"   • {_emoji_or_empty('rocket')}I'll launch your updates automatically\n"
+        f"   • {_emoji_or_empty('shield')}Your work is locked up securely\n\n"
+        f"[dim]{_sym('heart')} Built with love by the Kakes David Team[/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+
+# ──────────────────────────────────────────────────────────────
+# VERCEL AUTH UI
+# ──────────────────────────────────────────────────────────────
+
+def vercel_auth_start() -> None:
+    """Show Vercel auth start with partner tone."""
+    console.print("\n")
+
+    console.print(Panel(
+        f"[bold cyan]{_sym('triangle')}{_sym('rocket')} PREPARING YOUR VERCEL LAUNCHPAD[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(Panel(
+        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with Vercel so I can:[/white]\n"
+        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
+        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
+        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
+        border_style="yellow",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH VERCEL NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without Vercel)[/dim]")
+    console.print()
+    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
+    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
+    )
+
+    if choice == "1":
+        from opun8.providers.vercel.auth import login_to_vercel
+        login_to_vercel()
+    else:
+        console.print(f"[dim]{_sym('skip')} Skipping Vercel for now. You can connect later with 'opun8 vercel'[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────
+# NETLIFY AUTH UI
 # ──────────────────────────────────────────────────────────────
 
 def netlify_auth_start() -> None:
-    """Show Netlify authentication start message."""
-    console.print()
+    """Show Netlify auth start with partner tone."""
+    console.print("\n")
+
     console.print(Panel(
-        f"[bold cyan]{_sym('box')} Netlify Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to Netlify to:\n"
-        "  • Create sites\n"
-        "  • Deploy your code\n"
-        "  • Get deployment URLs\n\n"
-        "[dim]Your browser will open for OAuth authorization.[/dim]"
-        "\n[dim]Or paste a Personal Access Token as an alternative.[/dim]",
+        f"[bold cyan]{_sym('box')}{_sym('rocket')} PREPARING YOUR NETLIFY LAUNCHPAD[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
         border_style="cyan",
         padding=(1, 2),
-        width=_panel_width(60),
+        width=_panel_width(70),
     ))
     console.print()
 
-
-def netlify_auth_success(username: str) -> None:
-    """Show Netlify authentication success message."""
+    console.print(Panel(
+        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with Netlify so I can:[/white]\n"
+        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
+        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
+        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
+        border_style="yellow",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
     console.print()
-    console.print(f"[bold green]{_sym('success')} Connected to Netlify as: [white]{username}[/white][/bold green]")
-    console.print("[dim]Token saved securely for future use.[/dim]")
 
+    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
+    console.print()
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]LOGIN WITH NETLIFY NOW! {_sym('joy')}[/white] [dim](Opens your web browser)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without Netlify)[/dim]")
+    console.print()
+    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to open the login page! {_sym('rocket')}[/green]")
+    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
+    console.print()
 
-def netlify_auth_failed() -> None:
-    """Show Netlify authentication failure message."""
-    error(
-        "Netlify authentication failed.",
-        suggestion="Run `opun8 netlify` to try again, or use a Personal Access Token.",
+    choice = _safe_prompt(
+        f"[bold cyan]{_sym('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
     )
 
+    if choice == "1":
+        from opun8.providers.netlify.auth import login_to_netlify
+        login_to_netlify()
+    else:
+        console.print(f"[dim]{_sym('skip')} Skipping Netlify for now. You can connect later with 'opun8 netlify'[/dim]")
 
-def netlify_already_authenticated(username: str) -> None:
-    """Show Netlify already authenticated message."""
+
+# ──────────────────────────────────────────────────────────────
+# RENDER AUTH UI
+# ──────────────────────────────────────────────────────────────
+
+def render_auth_start() -> None:
+    """Show Render auth start with partner tone."""
+    console.print("\n")
+
+    console.print(Panel(
+        f"[bold cyan]{_sym('cloud')}{_sym('rocket')} PREPARING YOUR RENDER LAUNCHPAD[/bold cyan]\n"
+        f"[dim]Built with {_sym('heart')} by the Kakes David Team to host your site![/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
     console.print()
-    console.print(f"[bold green]{_sym('success')} Already connected to Netlify as: [white]{username}[/white][/bold green]")
-    console.print("[dim]To disconnect, run: [cyan]opun8 netlify --logout[/cyan][/dim]")
+
+    console.print(Panel(
+        f"[bold yellow]{_sym('heart')} WE ARE ALMOST THERE, PARTNER! This is the exciting part! {_sym('party')}[/bold yellow]\n\n"
+        f"[white]{_emoji_or_empty('handshake')}I just need a quick handshake with Render so I can:[/white]\n"
+        f"   • {_emoji_or_empty('construction')}Build a beautiful platform for your website\n"
+        f"   • {_emoji_or_empty('globe')}Put your project live on the internet worldwide\n"
+        f"   • {_emoji_or_empty('link')}Grab a clickable web link to share with your friends",
+        border_style="yellow",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
     console.print()
 
-
-def netlify_deploy_start(site_name: str) -> None:
-    """Show Netlify deployment start message."""
+    console.print(f"[bold]{_emoji_or_empty('sparkles')}CHOOSE A BUTTON BELOW TO START:[/bold]")
     console.print()
-    console.print(f"[bold cyan]{_sym('box')} Deploying to Netlify[/bold cyan]")
-    console.print(f"[dim]Site: {site_name}[/dim]")
+    console.print(f"  [bold cyan]{_keycap(1)}[/] {_sym('verify')} [white]USE API KEY! {_sym('joy')}[/white] [dim](Recommended — paste your Render API key)[/dim]")
+    console.print(f"  [bold cyan]{_keycap(2)}[/] {_sym('skip')} [white]Skip this step for now[/white] [dim](Deploy without Render)[/dim]")
+    console.print()
+    console.print(f"[green]{_sym('success')} READY TO FLY? Just smash the ENTER key to paste your API key! {_sym('rocket')}[/green]")
+    console.print("[dim]   Go ahead, I am sitting right here waiting for you to get back![/dim]")
     console.print()
 
-
-def netlify_deploy_success(url: str) -> None:
-    """Show Netlify deployment success message."""
-    console.print()
-    console.print(f"[bold green]{_sym('success')} Deployment successful![/bold green]")
-    console.print(f"[dim]🌐 {url}[/dim]")
-
-
-def netlify_deploy_failed(message: str) -> None:
-    """Show Netlify deployment failure message."""
-    error(
-        f"Deployment failed: {message}",
-        suggestion="Check your project for build errors and try again.",
+    choice = _safe_prompt(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
     )
 
-
-def netlify_site_created(site_name: str) -> None:
-    """Show Netlify site created message."""
-    console.print(f"[green]{_sym('success')} Site created: [white]{site_name}[/white][/green]")
-
-
-def netlify_site_conflict(site_name: str) -> None:
-    """Show Netlify site conflict message."""
-    console.print()
-    console.print(f"[bold yellow]{_sym('warning')} Site name conflict[/bold yellow]")
-    console.print(f"[dim]The site name [cyan]{site_name}[/cyan] is already taken on Netlify.[/dim]")
+    if choice == "1":
+        _render_api_key_prompt()
+    else:
+        console.print(f"[dim]{_sym('skip')} Skipping Render for now. You can connect later with 'opun8 render'[/dim]")
 
 
-def netlify_site_selected(site_name: str) -> None:
-    """Show Netlify site selected message."""
-    console.print(f"[green]{_sym('success')} Using existing site: [white]{site_name}[/white][/green]")
-
-
-def netlify_sites_list(sites: list) -> None:
-    """Show Netlify sites list."""
-    if not sites:
-        console.print("[yellow]No sites found on Netlify.[/yellow]")
-        console.print("[dim]Run [cyan]opun8 deploy netlify[/cyan] to create your first site.[/dim]")
-        return
-
+def _render_api_key_prompt() -> None:
+    """Handle the API key prompt flow with partner tone."""
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('box')} Netlify Sites[/bold cyan]\n"
-        f"[dim]{len(sites)} site(s) found[/dim]",
+        f"[bold cyan]{_emoji_or_empty('verify')} Render API Key[/bold cyan]\n\n"
+        f"[white]To get your Render API key:[/white]\n"
+        f"   • Go to [dim]https://dashboard.render.com/settings/keys[/dim]\n"
+        f"   • Click [bold]Create API Key[/bold]\n"
+        f"   • Give it a name (e.g., [dim]opun8-cli[/dim])\n"
+        f"   • Click [bold]Create API Key[/bold]\n"
+        f"   • [bold]Copy the key[/bold] immediately (it's only shown once)\n\n"
+        f"[dim]{_emoji_or_empty('globe')}Your browser will open to the API keys page.[/dim]",
         border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    webbrowser.open("https://dashboard.render.com/settings/keys")
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        console.print()
+        console.print(f"[dim]Attempt {attempt} of {max_attempts}[/dim]")
+        
+        api_key = Prompt.ask(
+            f"[bold cyan]{_emoji_or_empty('arrow')}[/] Paste your Render API key"
+        ).strip()
+
+        if not api_key:
+            console.print("[yellow]No API key provided. Skipping Render authentication.[/yellow]")
+            return
+
+        console.print("[dim]Verifying API key...[/dim]")
+
+        from opun8.providers.render.auth import save_api_key, _verify_and_fetch_user
+        
+        user_info, owner_id = _verify_and_fetch_user(api_key)
+
+        if user_info:
+            save_api_key(api_key)
+            console.print()
+            console.print(f"[bold green]{_sym('party')} WELCOME ABOARD, {_escape_text(user_info.get('name', 'Unknown'))}! {_sym('party')}[/bold green]")
+            console.print(f"[dim]{_emoji_or_empty('handshake')}Your Render account is now connected![/dim]")
+            console.print("[dim]   I can now launch your projects on Render! 🚀[/dim]\n")
+            return
+
+        console.print(f"[red]{_sym('error')} Invalid API key or insufficient permissions. (attempt {attempt} of {max_attempts})[/red]")
+        if attempt < max_attempts:
+            retry = Prompt.ask(
+                f"[bold cyan]{_emoji_or_empty('arrow')}[/] Try again?",
+                choices=["y", "n"],
+                default="y",
+                show_choices=False,
+            )
+            if retry.lower() != "y":
+                break
+
+    console.print()
+    console.print("[yellow]Skipping Render authentication for now.[/yellow]")
+    console.print("[dim]You can connect later with 'opun8 render'[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────
+# DEPLOYMENT SUCCESS
+# ──────────────────────────────────────────────────────────────
+
+def deploy_success(url: str, platform: str, project_name: str) -> None:
+    """Show deployment success with partner tone."""
+    console.print()
+    console.print(Panel(
+        f"[bold green]{_sym('party')} WE DID IT, PARTNER! {_sym('party')}[/bold green]\n\n"
+        f"[white]{_emoji_or_empty('globe')}Your site is now live on [bold]{_escape_text(platform.capitalize())}[/bold]![/white]\n"
+        f"[cyan]{_escape_text(url)}[/cyan]\n\n"
+        f"[dim]Project: {_escape_text(project_name)}[/dim]\n"
+        f"[dim]Share this link with the world! {_sym('rocket')}[/dim]\n\n"
+        f"[dim]{_sym('heart')} Built with love by the Kakes David Team[/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+
+# ──────────────────────────────────────────────────────────────
+# DOCTOR UI (Node.js download)
+# ──────────────────────────────────────────────────────────────
+
+def doctor_nodejs_missing() -> None:
+    """Show Node.js missing message with partner tone."""
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]{_sym('warning')} Hmm, Node.js is missing, partner! {_sym('thinking')}[/bold yellow]\n\n"
+        f"[white]I need Node.js to build and deploy your project.[/white]\n"
+        f"[dim]Don't worry — I can download it for you automatically![/dim]",
+        border_style="yellow",
         padding=(1, 2),
         width=_panel_width(60),
     ))
     console.print()
 
-    table = Table(border_style="cyan")
-    table.add_column("#", style="bold white", width=4)
-    table.add_column("Name", style="bold white", width=20)
-    table.add_column("URL", style="cyan", width=30)
-    table.add_column("Created", style="dim", width=15)
 
-    for idx, site in enumerate(sites, 1):
-        # ✅ FIX: Handle None values with (value or "Unknown") pattern
-        name = (site.get("name") or "Unknown")[:20]
-        url = (site.get("url") or "N/A")[:30]
-        created = (site.get("created_at") or "Unknown")[:15]
-
-        table.add_row(str(idx), name, url, created)
-
-    console.print(table)
-    console.print()
-
-
-def netlify_pat_prompt() -> None:
-    """Show Netlify Personal Access Token prompt message."""
+def doctor_nodejs_download() -> None:
+    """Show Node.js download prompt with partner tone."""
     console.print()
     console.print(Panel(
-        f"[bold cyan]{_sym('verify')} Netlify Personal Access Token[/bold cyan]\n\n"
-        "You can get a Personal Access Token from:\n"
-        "[dim]https://app.netlify.com/user/applications[/dim]\n\n"
-        "1. Click [bold]Create Access Token[/bold]\n"
-        "2. Give it a name, e.g. [dim]\"Opun8 CLI\"[/dim]\n"
-        "3. Click [bold]Generate Token[/bold]\n"
-        "4. Copy the token (it's only shown once)\n\n"
-        "This is useful for automation and CI/CD.",
-        border_style="cyan",
+        f"[bold green]{_sym('heart')} LET'S GET YOU SET UP, PARTNER! {_sym('rocket')}[/bold green]\n\n"
+        f"[white]I'll download Node.js and put it in:[/white]\n"
+        f"[dim]~/.opun8/bin/node[/dim]\n"
+        f"[white]This is completely safe and requires no admin rights![/white]",
+        border_style="green",
         padding=(1, 2),
         width=_panel_width(60),
     ))
     console.print()
-    console.print("[dim]🌐 Opening Netlify tokens page in your browser...[/dim]")
 
 
-def netlify_pat_verified() -> None:
-    """Show Netlify PAT verified message."""
+def doctor_nodejs_success(version: str) -> None:
+    """Show Node.js install success with partner tone."""
     console.print()
-    console.print(f"[bold green]{_sym('success')} Personal Access Token verified![/bold green]")
-
-
-def netlify_pat_invalid() -> None:
-    """Show Netlify PAT invalid message."""
+    console.print(f"[bold green]{_sym('party')} Node.js {_escape_text(version)} is ready to roll, partner![/bold green]")
+    console.print(f"[dim]I've installed it at ~/.opun8/bin/node[/dim]")
     console.print()
-    console.print(f"[red]{_sym('error')} Invalid Personal Access Token.[/red]")
-    console.print("[dim]Please check the token and try again.[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────
+# MODULE EXPORTS
+# ──────────────────────────────────────────────────────────────
+
+__all__ = [
+    "success",
+    "info",
+    "warning",
+    "error",
+    "goodbye",
+    "show_welcome",
+    "show_help",
+    "detection_start",
+    "scanning_spinner",
+    "detection_complete",
+    "no_project_detected",
+    "show_deploy_menu",
+    "show_details",
+    "history_header",
+    "history_list",
+    "history_detail",
+    "github_auth_start",
+    "github_auth_success",
+    "vercel_auth_start",
+    "netlify_auth_start",
+    "render_auth_start",
+    "deploy_success",
+    "doctor_nodejs_missing",
+    "doctor_nodejs_download",
+    "doctor_nodejs_success",
+    "_safe_prompt",
+    "_safe_confirm",
+]

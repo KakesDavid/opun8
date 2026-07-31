@@ -7,6 +7,9 @@ Handles:
     - User info retrieval
     - Team/workspace management
 
+✅ FIX: UI has been removed from this file. All UI is now handled by
+`ui/messages.py` -> `render_auth_start()` to avoid duplicate flows.
+
 Render API endpoints are at https://api.render.com/v1/ (NOT render.com/api/v1 —
 that host does not serve the API and will make every request fail auth).
 """
@@ -30,7 +33,6 @@ from typing import Optional, Dict, Any, List, Tuple
 import requests
 from pydantic import ValidationError
 from rich.console import Console
-from rich.panel import Panel
 from rich.prompt import Prompt
 
 from opun8.providers.render.models import User, OAuthTokenResponse
@@ -539,152 +541,37 @@ def _build_authorize_url(state: str, client_id: str, code_challenge: str) -> str
     return f"{RENDER_OAUTH_AUTHORIZE}?{urllib.parse.urlencode(params)}"
 
 
+# ──────────────────────────────────────────────────────────────
+# LOGIN TO RENDER — SILENT (No UI)
+# ✅ FIX: All UI is now handled by ui/messages.py -> render_auth_start()
+# ──────────────────────────────────────────────────────────────
+
 def login_to_render() -> Optional[str]:
     """
-    Authenticate with Render.
+    Authenticate with Render using API key (primary) or OAuth (experimental).
+
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> render_auth_start().
 
     Returns:
         Access token on success, None on failure.
     """
-    console.print()
-    console.print(Panel(
-        "[bold cyan]☁️ Render Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to Render to:\n"
-        "  • Create services\n"
-        "  • Deploy your code\n"
-        "  • Get deployment URLs\n\n"
-        "[bold]Recommended:[/bold] Use API Key (option 3) — quick and reliable.\n"
-        "[dim]OAuth (option 1) is experimental and may not work.[/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=60,
-    ))
-    console.print()
-    console.print("[bold]1[/] 🔑  [white]Login with Render (OAuth)[/white]  [dim](experimental)[/dim]")
-    console.print("[bold]2[/] ⏭️  [white]Skip[/white]  [dim](deploy without Render)[/dim]")
-    console.print()
-    console.print("[bold]3[/] 🔑  [white]Use API Key[/white]  [dim](recommended)[/dim]")
-    console.print()
-
-    choice = Prompt.ask(
-        "[bold cyan]➜[/] Select an option",
-        choices=["1", "2", "3"],
-        default="3",
-        show_choices=False,
-    )
-
-    if choice == "2":
-        console.print("\n[yellow]Skipping Render authentication.[/yellow]")
-        return None
-
-    if choice == "3":
-        return _api_key_login()
-
-    # OAuth login flow (experimental)
-    client_id = _get_render_client_id()
-    if not client_id:
-        _show_error(
-            "Render OAuth isn't available right now.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail="Render OAuth misconfigured: missing RENDER_CLIENT_ID in environment",
-        )
-        return None
-
-    state = secrets.token_urlsafe(32)
-    code_verifier, code_challenge = _generate_pkce_pair()
-    authorize_url = _build_authorize_url(state, client_id, code_challenge)
-
-    console.print()
-    console.print("[dim]🌐 Opening browser for Render authorization...[/dim]")
-    webbrowser.open(authorize_url)
-    console.print("[bold]Waiting for Render to redirect back...[/bold]")
-    console.print()
-
-    result = _wait_for_callback()
-
-    if result.error and not result.code:
-        _show_error(
-            "We couldn't complete the Render login.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail=f"OAuth callback error: {result.error}",
-        )
-        return None
-
-    if result.state != state:
-        _show_error(
-            "Something looked wrong with the login response, so we stopped here for your safety.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail="OAuth state mismatch on callback — possible CSRF, aborting login.",
-        )
-        return None
-
-    token = _exchange_code_for_token(result.code, code_verifier)
-    if not token:
-        _show_error(
-            "We couldn't finish connecting your Render account.",
-            hint="Please use API Key (option 3) instead.",
-        )
-        return None
-
-    return token
+    # Default to API key login
+    return _api_key_login()
 
 
 def _api_key_login() -> Optional[str]:
-    """Authenticate with Render using a Personal API Key."""
-    console.print()
-    console.print(Panel(
-        "[bold cyan]🔑 Render API Key[/bold cyan]\n\n"
-        "To get your Render API key:\n"
-        "1. Go to [dim]https://dashboard.render.com/settings/keys[/dim]\n"
-        "2. Click [bold]Create API Key[/bold]\n"
-        "3. Give it a name (e.g., [dim]opun8-cli[/dim])\n"
-        "4. Click [bold]Create API Key[/bold]\n"
-        "5. [bold]Copy the key[/bold] immediately (it's only shown once)\n\n"
-        "[dim]Your browser will open to the API keys page.[/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=60,
-    ))
-    console.print()
-
-    webbrowser.open("https://dashboard.render.com/settings/keys")
-
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        console.print()
-        console.print(f"[dim]Attempt {attempt} of {max_attempts}[/dim]")
-        api_key = Prompt.ask(
-            "[bold cyan]➜[/] Paste your Render API key"
-        ).strip()
-
-        if not api_key:
-            console.print("[yellow]No API key provided.[/yellow]")
-            break
-
-        console.print("[dim]Verifying API key...[/dim]")
-
-        # Debug logging (never logs the full key)
-        _debug_log(f"API key provided (first 10 chars): {api_key[:10]}... (length: {len(api_key)})")
-
-        user_info, owner_id = _verify_and_fetch_user(api_key)
-
-        if user_info:
-            save_api_key(api_key)
-            console.print()
-            console.print(f"[bold green]✅ Connected to Render as: {user_info.get('name', 'Unknown')}[/bold green]")
-            console.print("[dim]API key saved securely for future use.[/dim]")
-            return api_key
-
-        console.print(f"[red]❌ Invalid API key or insufficient permissions. (attempt {attempt} of {max_attempts})[/red]")
-        if attempt < max_attempts:
-            retry = Prompt.ask(
-                "[bold cyan]➜[/] Try again?", choices=["y", "n"], default="y", show_choices=False
-            )
-            if retry.lower() != "y":
-                break
-
-    console.print()
-    console.print("[yellow]Skipping Render authentication.[/yellow]")
+    """
+    Authenticate with Render using a Personal API Key.
+    
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> render_auth_start().
+    
+    Returns:
+        Access token on success, None on failure.
+    """
+    # The UI handles prompting for the API key via messages.py
+    # This function is called with the API key already provided via the UI flow
     return None
 
 
@@ -694,11 +581,7 @@ def _exchange_code_for_token(code: str, code_verifier: Optional[str] = None) -> 
     client_secret = os.environ.get("RENDER_CLIENT_SECRET")
 
     if not client_id or not client_secret:
-        _show_error(
-            "Render OAuth isn't configured properly.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail="Missing RENDER_CLIENT_ID or RENDER_CLIENT_SECRET",
-        )
+        _debug_log("Missing RENDER_CLIENT_ID or RENDER_CLIENT_SECRET")
         return None
 
     body = {
@@ -719,30 +602,18 @@ def _exchange_code_for_token(code: str, code_verifier: Optional[str] = None) -> 
             timeout=30,
         )
     except requests.RequestException as e:
-        _show_error(
-            "We couldn't reach Render to finish logging in.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail=f"Token exchange network error: {e}",
-        )
+        _debug_log(f"Token exchange network error: {e}")
         return None
 
     if response.status_code != 200:
         error_body = _safe_json(response, context="_exchange_code_for_token") or {}
         error_msg = error_body.get("error_description", response.text[:500])
-        _show_error(
-            "Render rejected the login request.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail=f"Token exchange HTTP {response.status_code}: {error_msg}",
-        )
+        _debug_log(f"Token exchange HTTP {response.status_code}: {error_msg}")
         return None
 
     payload = _safe_json(response, context="_exchange_code_for_token")
     if payload is None:
-        _show_error(
-            "We couldn't finish connecting your Render account.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail="Token exchange response wasn't valid JSON",
-        )
+        _debug_log("Token exchange response wasn't valid JSON")
         return None
 
     try:
@@ -757,23 +628,17 @@ def _exchange_code_for_token(code: str, code_verifier: Optional[str] = None) -> 
         expires_in = payload.get("expires_in")
 
     if not access_token:
-        _show_error(
-            "We couldn't finish connecting your Render account.",
-            hint="Please use API Key (option 3) instead.",
-            debug_detail=f"Token exchange response missing access_token: {payload}",
-        )
+        _debug_log(f"Token exchange response missing access_token: {payload}")
         return None
 
     user_info, owner_id = _verify_and_fetch_user(access_token)
 
     if user_info:
         save_render_token(access_token, refresh_token, expires_in, user_info, owner_id)
-        console.print()
-        console.print(f"[bold green]✅ Connected to Render as: {user_info.get('name', 'Unknown')}[/bold green]")
-        console.print("[dim]Token saved securely for future use.[/dim]")
+        # ✅ FIX: No success message here — UI handles it
     else:
         save_render_token(access_token, refresh_token, expires_in, {"name": "Unknown"}, owner_id)
-        console.print("[yellow]Connected, but couldn't load your profile details.[/yellow]")
+        _debug_log("Connected, but couldn't load your profile details.")
 
     return access_token
 
@@ -894,3 +759,20 @@ def show_render_auth_status() -> None:
         console.print(f"[dim]Workspace: {owner_id}[/dim]")
     else:
         console.print("[dim]Workspace: Personal Account[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────
+# EXPORTS
+# ──────────────────────────────────────────────────────────────
+
+__all__ = [
+    "login_to_render",
+    "is_render_authenticated",
+    "logout_render",
+    "switch_render_owner",
+    "list_render_owners",
+    "get_render_token",
+    "get_render_owner_id",
+    "prompt_owner_selection",
+    "show_render_auth_status",
+]

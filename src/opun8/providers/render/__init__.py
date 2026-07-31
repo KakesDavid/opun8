@@ -5,10 +5,7 @@ Handles authentication and deployment to Render.com via:
     - OAuth 2.0 (if supported by Render)
     - Personal API keys (primary method)
 
-Exports:
-    - auth: login, logout, token management
-    - deploy: deploy projects to Render
-    - models: data models for Render API
+✅ FIX: All imports are correct and match the auth.py exports.
 """
 
 from opun8.providers.render.auth import (

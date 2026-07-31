@@ -8,11 +8,8 @@ This module provides:
     - Rename deployments (update the project name in history)
     - Track badge progress
 
-Navigation model: the history list and the deployment-detail screen are each
-a bounded `while True` loop. Sub-actions (redeploy/rename/delete) return
-plain values to their caller instead of calling `_show_history_screen()` or
-`_show_deployment_details()` again — so moving between screens never grows
-the call stack, no matter how long the interactive session runs.
+✅ FIX: Beautiful, engaging partner-tone UI with FULL-WIDTH table.
+✅ FIX: 'b' and 'q' navigation keys work correctly.
 """
 
 from __future__ import annotations
@@ -29,6 +26,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
+from rich.text import Text
+from rich import box
 
 from opun8.services.deployment_history import (
     get_deployment_history,
@@ -61,7 +60,7 @@ from opun8.providers.render.deploy import deploy_to_render
 
 console = Console()
 
-PANEL_WIDTH = 60
+PANEL_WIDTH = 80
 HISTORY_TABLE_DISPLAY_LIMIT = 30
 
 # Platform icons mapping
@@ -82,8 +81,7 @@ def _safe_prompt(
     default: Optional[str] = None,
     show_choices: bool = False,
 ) -> Optional[str]:
-    """Prompt with graceful handling of Ctrl+C and Ctrl+Z/Ctrl+D. Returns
-    None if the user cancels."""
+    """Prompt with graceful handling of Ctrl+C and Ctrl+Z/Ctrl+D."""
     try:
         kwargs: Dict[str, Any] = {"show_choices": show_choices}
         if choices:
@@ -97,13 +95,37 @@ def _safe_prompt(
 
 
 def _safe_confirm(message: str, default: bool = True) -> Optional[bool]:
-    """Confirm with graceful handling of Ctrl+C and Ctrl+Z/Ctrl+D. Returns
-    None if the user cancels."""
+    """Confirm with graceful handling of Ctrl+C and Ctrl+Z/Ctrl+D."""
     try:
         return Confirm.ask(message, default=default)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
         return None
+
+
+def _escape_text(value) -> str:
+    """Escape rich markup in dynamic values."""
+    from rich.markup import escape
+    return escape(str(value))
+
+
+def _truncate(value, length: int) -> str:
+    """Truncate string with ellipsis."""
+    text = str(value) if value is not None else ""
+    if len(text) > length:
+        return text[: max(length - 1, 0)] + "…"
+    return text
+
+
+def _get_terminal_width() -> int:
+    """Get the terminal width for full-width display."""
+    import shutil
+    fallback = 120
+    try:
+        width = shutil.get_terminal_size().columns
+        return max(80, width - 4)  # Minimum 80, with padding
+    except Exception:
+        return fallback
 
 
 def history() -> None:
@@ -112,6 +134,10 @@ def history() -> None:
     """
     try:
         _show_history_screen()
+    except typer.Exit:
+        # Clean, intentional exit (e.g. user pressed 'q') — let it propagate
+        # untouched instead of falling into the generic handler below.
+        raise
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Operation cancelled.[/yellow]")
         raise typer.Exit(0)
@@ -125,94 +151,193 @@ def history() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# TOP-LEVEL HISTORY LIST SCREEN
+# TOP-LEVEL HISTORY LIST SCREEN — BEAUTIFUL & ENGAGING
 # ──────────────────────────────────────────────────────────────
 
 def _show_history_screen() -> None:
     """Main history list. Loops until the user chooses to go back."""
     while True:
         deployments = get_deployment_history()
+        count = get_deployment_count()
+        badge = get_badge_info(count)
 
-        console.print()
+        # ──────────────────────────────────────────────────────
+        # BEAUTIFUL HEADER
+        # ──────────────────────────────────────────────────────
+        console.clear()
+        console.print("\n")
+
+        # Main title panel
         console.print(Panel(
-            "[bold cyan]📜 Deployment History[/bold cyan]\n"
-            "[dim]View, manage, and redeploy your past deployments.[/dim]",
+            f"[bold cyan]📜🏆 DEPLOYMENT HISTORY LOG[/bold cyan]\n"
+            f"[dim]Built with {msg._sym('heart')} by the Kakes David Team to track your wins![/dim]",
             border_style="cyan",
             padding=(1, 2),
             width=PANEL_WIDTH,
         ))
+        console.print()
+
+        # Badge celebration panel
+        next_msg = ""
+        if badge.get("next"):
+            remaining = badge["next"] - count
+            next_msg = f"🚀 Just {remaining} more deployment(s) until your next {badge['emoji']} upgrade!"
+        else:
+            next_msg = "👑 You've reached the highest rank! Keep building!"
+
+        console.print(Panel(
+            f"[bold green]{msg._emoji_or_empty('hooray')} LOOK AT YOU GO, PARTNER! You are building great things! {msg._sym('heart')}[/bold green]\n"
+            f"[dim]{msg._emoji_or_empty('badge')} Current Rank: {badge['emoji']} [bold]{badge['name']}[/bold] ({count} deployments)[/dim]\n"
+            f"[dim]{next_msg}[/dim]",
+            border_style="green",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
+        console.print()
 
         if not deployments:
             console.print()
-            console.print("[yellow]No deployments found yet.[/yellow]")
-            console.print("[dim]Run [cyan]opun8 deploy[/cyan] to create your first deployment.[/dim]")
+            console.print(f"[yellow]No deployments found yet, partner! {msg._sym('smile')}[/yellow]")
+            console.print(f"[dim]Let's fix that — run [cyan]opun8 deploy[/cyan] to launch your first site! {msg._sym('rocket')}[/dim]")
             console.print()
+            
+            console.print("[bold]What would you like to do?[/bold]")
+            console.print()
+            console.print(f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]Launch your first deployment[/white]")
+            console.print(f"  [bold cyan]2[/] {msg._sym('back')}  [white]Go back[/white]")
+            console.print()
+            
+            choice = _safe_prompt(
+                f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option",
+                choices=["1", "2"],
+                default="1",
+                show_choices=False,
+            )
+            
+            if choice == "1":
+                from opun8.commands.deploy import deploy
+                deploy()
             return
-
-        count = get_deployment_count()
-        badge = get_badge_info(count)
-        console.print(f"[dim]🏅 Badge: {badge['emoji']} {badge['name']} ({count} deployments)[/dim]")
-        console.print()
 
         _display_history_table(deployments)
 
+        # ──────────────────────────────────────────────────────
+        # BEAUTIFUL NAVIGATION — ✅ FIXED
+        # ──────────────────────────────────────────────────────
         console.print()
-        console.print("[dim]Enter a number to view deployment details, or [b] to go back.[/dim]")
+        console.print(Panel(
+            f"[bold cyan]{msg._emoji_or_empty('point')} WHAT WOULD YOU LIKE TO DO, FRIEND? {msg._sym('smile')}[/bold cyan]\n\n"
+            f"[dim]  • Enter a [bold]number[/bold] to inspect a deployment[/dim]\n"
+            f"[dim]  • Press [bold cyan]b[/bold cyan] to go back to the main menu[/dim]\n"
+            f"[dim]  • Press [bold red]q[/bold red] to close the app[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
+        console.print()
+
+        # ✅ FIX: choices must include 'b' and 'q' for validation
         choice = _safe_prompt(
-            "[bold cyan]➜[/] Select an option",
+            f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option (b to go back)",
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "b", "q"],
             default="b",
             show_choices=False,
         )
+        
         if choice is None:
-            return
+            continue
 
         if choice.lower() == "b":
             return
 
+        if choice.lower() == "q":
+            msg.goodbye()
+            raise typer.Exit()
+
         try:
             idx = int(choice) - 1
         except ValueError:
-            console.print("[red]Invalid input. Please enter a number.[/red]")
+            console.print("[red]❌ Please enter a valid number.[/red]")
             continue
 
         if not (0 <= idx < len(deployments)):
-            console.print("[red]Invalid selection.[/red]")
+            console.print("[red]❌ Invalid selection.[/red]")
             continue
 
-        # Runs its own loop and returns here when the user backs out,
-        # whatever happened in between (rename, redeploy, delete).
         _show_deployment_details(deployments[idx])
 
 
 def _display_history_table(deployments: List[Dict[str, Any]]) -> None:
-    """Display the deployment history in a table."""
+    """Display the deployment history in a FULL-WIDTH beautiful table."""
+    
+    # Platform colors
+    platform_colors = {
+        "vercel": "cyan",
+        "netlify": "magenta",
+        "render": "green",
+    }
+
+    # Get terminal width for full-width display
+    term_width = _get_terminal_width()
+    
+    # Calculate column widths based on terminal width
+    # Total width = 4 + 22 + 14 + 32 + 16 = 88 minimum
+    # We'll let Rich auto-size but set minimums
+    num_width = 5
+    project_width = 22
+    platform_width = 14
+    url_width = 32
+    date_width = 16
+
     table = Table(
+        box=box.ROUNDED,
         border_style="cyan",
         title_style="bold cyan",
         show_lines=True,
+        padding=(0, 2),
+        width=term_width,
+        safe_box=True,
     )
 
     if len(deployments) > HISTORY_TABLE_DISPLAY_LIMIT:
         display_items = deployments[:HISTORY_TABLE_DISPLAY_LIMIT]
-        table.title = f"Deployments (showing {HISTORY_TABLE_DISPLAY_LIMIT} of {len(deployments)})"
+        table.title = f"📋 Deployments (showing {HISTORY_TABLE_DISPLAY_LIMIT} of {len(deployments)})"
     else:
         display_items = deployments
-        table.title = f"Deployments ({len(deployments)})"
+        table.title = f"📋 Deployments ({len(deployments)})"
 
-    table.add_column("#", style="bold white", width=4)
-    table.add_column("Project", style="bold white", width=20)
-    table.add_column("Platform", style="dim", width=8)
-    table.add_column("URL", style="cyan", width=25)
-    table.add_column("Date", style="dim", width=15)
+    table.add_column(" # ", style="bold white", width=num_width, justify="center", no_wrap=True)
+    table.add_column(" Project ", style="bold white", width=project_width, no_wrap=False)
+    table.add_column(" Platform ", style="dim", width=platform_width, justify="center", no_wrap=True)
+    table.add_column(" URL ", style="cyan", width=url_width, no_wrap=False)
+    table.add_column(" Date ", style="dim", width=date_width, justify="center", no_wrap=True)
 
     for idx, deployment in enumerate(display_items, 1):
-        project_name = deployment.get("project_name", "Unknown")[:20]
-        platform = (deployment.get("platform") or "unknown").capitalize()
-        url = deployment.get("url", "N/A")[:25]
+        project_name = _truncate(deployment.get("project_name", "Unknown"), project_width - 2)
+        platform = deployment.get("platform") or "unknown"
+        platform_display = platform.capitalize()
+        url = _truncate(deployment.get("url", "N/A"), url_width - 2)
         date_str = _format_relative_date(deployment.get("timestamp"))
-        platform_icon = PLATFORM_ICONS.get(deployment.get("platform") or "", "●")
+        platform_icon = PLATFORM_ICONS.get(platform, "●")
+        color = platform_colors.get(platform, "white")
 
-        table.add_row(str(idx), project_name, platform_icon + platform, url, date_str)
+        # Colored platform text
+        platform_text = Text(f"{platform_icon} {platform_display}", style=color)
+
+        # Status indicator (green dot for success)
+        status = deployment.get("status", "success")
+        status_indicator = "[green]●[/green]" if status == "success" else "[yellow]●[/yellow]"
+
+        # Number with padding
+        num_str = f" {idx} "
+
+        table.add_row(
+            num_str,
+            project_name,
+            platform_text,
+            url,
+            f"{date_str} {status_indicator}",
+        )
 
     console.print(table)
 
@@ -230,7 +355,7 @@ def _format_relative_date(timestamp: Optional[str]) -> str:
 
     total_seconds = time_diff.total_seconds()
     if total_seconds < 0:
-        return "Just now"
+        return "Now"
 
     if total_seconds < 60:
         return "Just now"
@@ -246,17 +371,16 @@ def _format_relative_date(timestamp: Optional[str]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# DEPLOYMENT DETAIL SCREEN
+# DEPLOYMENT DETAIL SCREEN — BEAUTIFUL & ENGAGING
 # ──────────────────────────────────────────────────────────────
 
 def _show_deployment_details(deployment: Dict[str, Any]) -> None:
     """
-    Detail screen for a single deployment. Loops in place so rename/failed
-    actions can redisplay fresh data without re-entering the history list;
-    returns to the caller (the history loop) once the user backs out or the
-    deployment is deleted.
+    Detail screen for a single deployment.
     """
     current = deployment
+    count = get_deployment_count()
+    badge = get_badge_info(count)
 
     while True:
         deployment_id = current.get("id")
@@ -265,21 +389,28 @@ def _show_deployment_details(deployment: Dict[str, Any]) -> None:
             if refreshed:
                 current = refreshed
 
-        _render_deployment_panel(current)
+        _render_deployment_panel(current, badge, count)
 
-        folder_label = "Change project folder" if current.get("project_path") else "Set project folder"
-
-        console.print("[bold]What would you like to do?[/bold]")
+        # ──────────────────────────────────────────────────────
+        # BEAUTIFUL ACTIONS MENU
+        # ──────────────────────────────────────────────────────
         console.print()
-        console.print("  [bold cyan]1[/] 🚀  [white]Redeploy[/white]")
-        console.print("  [bold cyan]2[/] ✏️  [white]Rename in history[/white]")
-        console.print(f"  [bold cyan]3[/] 📁  [white]{folder_label}[/white]")
-        console.print("  [bold cyan]4[/] 🗑️  [white]Delete from history[/white]  [dim](optionally from platform)[/dim]")
-        console.print("  [bold cyan]5[/] 🔙  [white]Go back[/white]")
+        console.print(Panel(
+            f"[bold green]{msg._emoji_or_empty('point')} WHAT SHOULD WE DO WITH THIS PROJECT, FRIEND? {msg._sym('smile')}[/bold green]\n\n"
+            f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]REDEPLOY NOW![/white] [dim](Update the website live)[/dim]\n"
+            f"  [bold cyan]2[/] {msg._emoji_or_empty('pencil')} [white]Rename in history[/white]\n"
+            f"  [bold cyan]3[/] {msg._emoji_or_empty('folder')} [white]Change project folder[/white]\n"
+            f"  [bold cyan]4[/] {msg._emoji_or_empty('trash')} [white]Delete from history[/white] [dim](optionally from platform)[/dim]\n"
+            f"  [bold cyan]5[/] {msg._emoji_or_empty('back')} [white]Go back to the list[/white]\n\n"
+            f"[dim]{msg._emoji_or_empty('bulb')} Not sure? Just press [bold cyan]ENTER[/bold cyan] and I'll safely redeploy it for you![/dim]",
+            border_style="green",
+            padding=(1, 2),
+            width=PANEL_WIDTH,
+        ))
         console.print()
 
         choice = _safe_prompt(
-            "[bold cyan]➜[/] Select an option",
+            f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option",
             choices=["1", "2", "3", "4", "5"],
             default="1",
             show_choices=False,
@@ -303,16 +434,17 @@ def _show_deployment_details(deployment: Dict[str, Any]) -> None:
                 return
 
 
-def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
-    """Render the info panel + badge status for one deployment."""
-    console.print()
+def _render_deployment_panel(deployment: Dict[str, Any], badge: Dict[str, Any], count: int) -> None:
+    """Render the beautiful deployment detail panel."""
+    console.clear()
+    console.print("\n")
 
     project_name = deployment.get("project_name", "Unknown")
     platform = (deployment.get("platform") or "unknown").capitalize()
     url = deployment.get("url", "N/A")
     deployment_id = deployment.get("id", "N/A")
     env_vars = deployment.get("env_vars", [])
-    status = deployment.get("status", "unknown")
+    status = deployment.get("status", "success")
     platform_icon = PLATFORM_ICONS.get(deployment.get("platform") or "", "●")
 
     timestamp = deployment.get("timestamp")
@@ -325,30 +457,43 @@ def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
 
     project_path = deployment.get("project_path") or "Not tracked"
 
+    # Status color
+    status_color = "green" if status == "success" else "yellow"
+    status_icon = "✅" if status == "success" else "⚠️"
+
+    # ──────────────────────────────────────────────────────
+    # BEAUTIFUL DETAIL PANEL
+    # ──────────────────────────────────────────────────────
     console.print(Panel(
-        f"[bold cyan]{platform_icon} {project_name}[/bold cyan]\n\n"
-        f"[bold]Platform:[/bold] {platform}\n"
-        f"[bold]URL:[/bold] [cyan]{url}[/cyan]\n"
-        f"[bold]Deployment ID:[/bold] [dim]{deployment_id}[/dim]\n"
-        f"[bold]Project folder:[/bold] [dim]{project_path}[/dim]\n"
-        f"[bold]Date:[/bold] {date_display}\n"
-        f"[bold]Status:[/bold] {status}\n"
-        f"[bold]Environment Variables:[/bold] {', '.join(env_vars) if env_vars else 'None'}",
+        f"[bold cyan]{platform_icon} {_escape_text(project_name)}[/bold cyan]\n\n"
+        f"[dim]Platform:[/dim] {_escape_text(platform)}\n"
+        f"[dim]URL:[/dim] [cyan]{_escape_text(url)}[/cyan]\n"
+        f"[dim]Deployment ID:[/dim] [dim]{_escape_text(deployment_id)}[/dim]\n"
+        f"[dim]Project folder:[/dim] [dim]{_escape_text(project_path)}[/dim]\n"
+        f"[dim]Date:[/dim] {_escape_text(date_display)}\n"
+        f"[dim]Status:[/dim] [{status_color}]{status_icon} {_escape_text(status.upper())}[/{status_color}]\n"
+        f"[dim]Environment Variables:[/dim] {', '.join(_escape_text(v) for v in env_vars) if env_vars else 'None'}",
         border_style="cyan",
         padding=(1, 2),
         width=PANEL_WIDTH,
     ))
-
-    count = get_deployment_count()
-    badge = get_badge_info(count)
     console.print()
-    console.print(f"[dim]🏅 Badge: {badge['emoji']} {badge['name']} ({count} total deployments)[/dim]")
-    if badge["next"]:
+
+    # ──────────────────────────────────────────────────────
+    # BADGE PROGRESS
+    # ──────────────────────────────────────────────────────
+    next_msg = ""
+    if badge.get("next"):
         remaining = badge["next"] - count
-        console.print(
-            f"[dim]   {remaining} more deployment(s) until "
-            f"[cyan]{badge['emoji']} {badge['name']}[/cyan] upgrade.[/dim]"
-        )
+        progress = (count / badge["next"]) * 100 if badge["next"] > 0 else 0
+        bar_length = 25
+        filled = int(progress / 100 * bar_length)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        console.print(f"[dim]{msg._emoji_or_empty('badge')} Current: {badge['emoji']} {badge['name']}  [cyan]{bar}[/cyan] {progress:.0f}%[/dim]")
+        console.print(f"[dim]🚀 {remaining} more deployment(s) until {badge['emoji']} upgrade![/dim]")
+    else:
+        console.print(f"[dim]{msg._emoji_or_empty('crown')} Current: {badge['emoji']} {badge['name']} — MAX LEVEL! 🎉[/dim]")
+
     console.print()
 
 
@@ -357,7 +502,7 @@ def _render_deployment_panel(deployment: Dict[str, Any]) -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _load_env_vars(project_path: Path) -> Dict[str, str]:
-    """Load environment variables from a .env file, skipping bad lines."""
+    """Load environment variables from a .env file."""
     env_vars: Dict[str, str] = {}
     env_file = project_path / ".env"
 
@@ -394,9 +539,9 @@ def _load_env_vars(project_path: Path) -> Dict[str, str]:
 # ──────────────────────────────────────────────────────────────
 
 def _redeploy(deployment: Dict[str, Any]) -> None:
-    """Redeploy a previous deployment to the correct platform."""
+    """Redeploy a previous deployment."""
     console.print()
-    console.print("[bold cyan]🚀 Redeploy[/bold cyan]")
+    console.print(f"[bold cyan]{msg._emoji_or_empty('rocket')} REDEPLOY[/bold cyan]")
     console.print(f"[dim]Redeploying: {deployment.get('project_name', 'Unknown')}[/dim]")
     console.print()
 
@@ -428,9 +573,7 @@ def _redeploy(deployment: Dict[str, Any]) -> None:
 
 
 def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
-    """
-    Ask which local project folder this redeploy should use.
-    """
+    """Ask which local project folder this redeploy should use."""
     tracked_raw = deployment.get("project_path")
     tracked_path = Path(tracked_raw).expanduser() if tracked_raw else None
     tracked_valid = bool(tracked_path and tracked_path.is_dir())
@@ -478,7 +621,7 @@ def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
 
 
 def _prompt_for_project_path() -> Optional[Path]:
-    """Prompt the user to select a project folder using the native folder dialog."""
+    """Prompt the user to select a project folder."""
     console.print()
     console.print("[dim]A file browser will open for you to select the folder.[/dim]")
     console.print()
@@ -505,7 +648,7 @@ def _prompt_for_project_path() -> Optional[Path]:
 # ──────────────────────────────────────────────────────────────
 
 def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Manually set (or change) the local project folder recorded for a deployment."""
+    """Manually set (or change) the local project folder."""
     console.print()
     console.print("[bold cyan]📁 Project Folder[/bold cyan]")
     current = deployment.get("project_path")
@@ -544,7 +687,7 @@ def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────
 
 def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
-    """Redeploy to Vercel using the existing project ID if available."""
+    """Redeploy to Vercel."""
     token = get_vercel_token()
 
     if not token:
@@ -588,14 +731,9 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
     )
 
     console.print()
-    console.print("[bold green]✅ Redeploy successful![/bold green]")
-    console.print(f"[dim]🌐 https://{url}[/dim]")
+    msg.deploy_success(url, "vercel", project_name)
 
     show_badge_notification(result.get("badge_unlocked"))
-
-    console.print()
-    if _safe_confirm("[bold]Open the new deployment?[/bold]", default=True):
-        webbrowser.open(f"https://{url}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -603,7 +741,7 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
-    """Redeploy to Render using the existing service ID if available."""
+    """Redeploy to Render."""
     token = get_render_token()
 
     if not token:
@@ -638,7 +776,6 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
     if not success:
         return
 
-    # Update the existing deployment record with the new URL
     deployment_id = deployment.get("id")
     if deployment_id:
         update_deployment(deployment_id, {
@@ -659,14 +796,9 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
     )
 
     console.print()
-    console.print("[bold green]✅ Redeploy successful![/bold green]")
-    console.print(f"[dim]🌐 https://{url}[/dim]")
+    msg.deploy_success(url, "render", project_name)
 
     show_badge_notification(result.get("badge_unlocked"))
-
-    console.print()
-    if _safe_confirm("[bold]Open the new deployment?[/bold]", default=True):
-        webbrowser.open(f"https://{url}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -674,9 +806,7 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Rename a deployment.
-    """
+    """Rename a deployment."""
     console.print()
     console.print("[bold cyan]✏️ Rename Deployment[/bold cyan]")
     console.print(f"[dim]Current name: [cyan]{deployment.get('project_name', 'Unknown')}[/cyan][/dim]")
@@ -696,11 +826,11 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             console.print("[red]Invalid name. Use letters, numbers, dots, hyphens, or underscores.[/red]")
             return None
         if new_name != raw_name.strip():
-            console.print(f"[dim]ℹ️  Vercel project names are lowercase letters/numbers/dots/hyphens only — using [cyan]{new_name}[/cyan][/dim]")
+            console.print(f"[dim]ℹ️  Using [cyan]{new_name}[/cyan][/dim]")
     else:
         new_name = re.sub(r'[^a-zA-Z0-9\s\-_]', '', raw_name).strip()
         if not new_name:
-            console.print("[red]Invalid name. Only letters, numbers, spaces, hyphens, and underscores are allowed.[/red]")
+            console.print("[red]Invalid name.[/red]")
             return None
 
     if deployment.get("project_name") == new_name:
@@ -720,10 +850,7 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if platform == "vercel":
         project_id = deployment.get("project_id")
         if not project_id:
-            console.print(
-                "[yellow]⚠️  No Vercel project ID on record for this deployment — "
-                "can't rename it on Vercel, only in local history.[/yellow]"
-            )
+            console.print("[yellow]No Vercel project ID on record.[/yellow]")
         else:
             token = get_vercel_token()
             if not token:
@@ -735,7 +862,6 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             success, result = rename_vercel_project(token, project_id, new_name, team_id)
             if not success:
                 console.print(f"[red]❌ {result}[/red]")
-                console.print("[dim]Local history was left unchanged so it doesn't disagree with the live project.[/dim]")
                 return None
 
             console.print("[green]✅ Renamed on Vercel.[/green]")
@@ -757,9 +883,7 @@ def _rename_in_history(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────
 
 def _delete_deployment(deployment: Dict[str, Any]) -> bool:
-    """
-    Delete a deployment from history and optionally from its platform.
-    """
+    """Delete a deployment from history and optionally from its platform."""
     console.print()
     console.print("[bold cyan]🗑️ Delete Deployment[/bold cyan]")
     console.print(f"[dim]Deleting: [cyan]{deployment.get('project_name', 'Unknown')}[/cyan][/dim]")
@@ -794,36 +918,30 @@ def _delete_deployment(deployment: Dict[str, Any]) -> bool:
 
     deployment_id = deployment.get("id")
     if not deployment_id:
-        console.print("[red]Failed to remove from history: this entry has no deployment ID.[/red]")
+        console.print("[red]Failed to remove from history: no deployment ID.[/red]")
         return False
 
     if delete_from_platform:
         platform_deleted = _delete_from_platform(deployment)
         if not platform_deleted:
             proceed_anyway = _safe_confirm(
-                "[bold]Platform deletion did not succeed. Remove this entry from local "
-                "history anyway?[/bold] [dim](the project will still exist on the platform)[/dim]",
+                "[bold]Platform deletion failed. Remove from history anyway?[/bold]",
                 default=False,
             )
             if not proceed_anyway:
-                console.print("[dim]Keeping this entry in history so you can try again.[/dim]")
+                console.print("[dim]Keeping this entry in history.[/dim]")
                 return False
 
     if not delete_deployment(deployment_id):
-        console.print("[red]Failed to remove from history: deployment not found (it may have already been deleted).[/red]")
+        console.print("[red]Failed to remove from history.[/red]")
         return False
 
     console.print("[green]✅ Deployment removed from history.[/green]")
-    if not delete_from_platform:
-        console.print("[dim]✅ Removed from history only.[/dim]")
-
     return True
 
 
 def _delete_from_platform(deployment: Dict[str, Any]) -> bool:
-    """
-    Best-effort deletion of the underlying platform project.
-    """
+    """Best-effort deletion of the underlying platform project."""
     platform = deployment.get("platform") or "vercel"
 
     if platform == "vercel":
@@ -831,7 +949,7 @@ def _delete_from_platform(deployment: Dict[str, Any]) -> bool:
     elif platform == "render":
         return _delete_from_render(deployment)
     else:
-        console.print("[yellow]⚠️  Automatic platform deletion not available for this platform.[/yellow]")
+        console.print("[yellow]Automatic platform deletion not available.[/yellow]")
         console.print("[dim]Please delete manually from the platform dashboard.[/dim]")
         return False
 
@@ -840,14 +958,12 @@ def _delete_from_vercel(deployment: Dict[str, Any]) -> bool:
     """Delete a project from Vercel."""
     token = get_vercel_token()
     if not token:
-        console.print("[yellow]⚠️  Not connected to Vercel — can't delete the project there.[/yellow]")
-        console.print("[dim]Run `opun8 vercel` to connect, then try again.[/dim]")
+        console.print("[yellow]Not connected to Vercel.[/yellow]")
         return False
 
     project_id = deployment.get("project_id")
     if not project_id:
-        console.print("[yellow]⚠️  No Vercel project ID on record for this deployment — can't delete it automatically.[/yellow]")
-        console.print("[dim]Please delete it manually from the Vercel dashboard.[/dim]")
+        console.print("[yellow]No Vercel project ID on record.[/yellow]")
         return False
 
     try:
@@ -862,22 +978,16 @@ def _delete_from_vercel(deployment: Dict[str, Any]) -> bool:
         )
 
         if response.status_code == 200:
-            console.print("[green]✅ Deployment deleted from Vercel.[/green]")
+            console.print("[green]✅ Deleted from Vercel.[/green]")
             return True
         elif response.status_code == 404:
-            console.print("[yellow]⚠️  Project not found on Vercel (already deleted).[/yellow]")
+            console.print("[yellow]Already deleted from Vercel.[/yellow]")
             return True
-        elif response.status_code in (401, 403):
-            console.print(
-                f"[red]⚠️  Vercel rejected the delete request ({response.status_code}) — "
-                "your token may not have access to this project/team.[/red]"
-            )
-            return False
         else:
-            console.print(f"[yellow]⚠️  Could not delete from Vercel: {response.text[:150]}[/yellow]")
+            console.print(f"[yellow]Could not delete from Vercel: {response.status_code}[/yellow]")
             return False
-    except requests.RequestException as e:
-        console.print(f"[yellow]⚠️  Platform deletion error: {e}[/yellow]")
+    except Exception as e:
+        console.print(f"[yellow]Error deleting from Vercel: {e}[/yellow]")
         return False
 
 
@@ -885,14 +995,12 @@ def _delete_from_render(deployment: Dict[str, Any]) -> bool:
     """Delete a service from Render."""
     token = get_render_token()
     if not token:
-        console.print("[yellow]⚠️  Not connected to Render — can't delete the service there.[/yellow]")
-        console.print("[dim]Run `opun8 render` to connect, then try again.[/dim]")
+        console.print("[yellow]Not connected to Render.[/yellow]")
         return False
 
     service_id = deployment.get("project_id")
     if not service_id:
-        console.print("[yellow]⚠️  No Render service ID on record for this deployment — can't delete it automatically.[/yellow]")
-        console.print("[dim]Please delete it manually from the Render dashboard.[/dim]")
+        console.print("[yellow]No Render service ID on record.[/yellow]")
         return False
 
     from opun8.providers.render.deploy import delete_render_service

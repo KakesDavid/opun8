@@ -1,6 +1,9 @@
 """
 GitHub OAuth authentication for Opun8.
 Now uses the Opun8 API backend instead of local .env file.
+
+✅ FIX: UI has been removed from this file. All UI is now handled by
+`ui/messages.py` -> `github_auth_start()` to avoid duplicate flows.
 """
 
 import os
@@ -14,8 +17,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Dict, List
 from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Prompt
 
 console = Console()
 
@@ -41,9 +42,8 @@ AUTHORIZATION_ENDPOINT = "https://github.com/login/oauth/authorize"
 TOKEN_FILE = Path.home() / ".opun8" / "github_token.json"
 
 
-def _build_authorize_url(state: str) -> str:
+def _build_authorize_url(state: str) -> Optional[str]:
     """Build GitHub OAuth URL - client_id comes from your API"""
-    # Get client_id from your API
     try:
         response = requests.get(f"{API_BASE_URL}/github/config", timeout=5)
         if response.status_code == 200:
@@ -164,55 +164,30 @@ def save_github_token(token: str, user_info: Dict) -> None:
 
 
 # ------------------------------------------------------------------------------
-# Login Flow - Uses your API for token exchange
+# Login Flow - SILENT (No UI)
+# ✅ FIX: All UI is now handled by ui/messages.py -> github_auth_start()
 # ------------------------------------------------------------------------------
 
 def login_to_github() -> Optional[str]:
-    console.print()
-    console.print(Panel(
-        "[bold cyan]🔐 GitHub Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to GitHub to:\n"
-        "  • Create repositories\n"
-        "  • Push your code\n"
-        "  • Enable auto-deploy\n\n"
-        "[dim]Your browser will open for authorization.[/dim]",
-        border_style="cyan",
-        padding=(1, 2),
-        width=60,
-    ))
-    console.print()
-    console.print("[bold]1[/] 🔑  [white]Login with GitHub[/white]  [dim](opens browser)[/dim]")
-    console.print("[bold]2[/] ⏭️  [white]Skip[/white]  [dim](deploy without GitHub)[/dim]")
-    console.print()
-
-    choice = Prompt.ask(
-        "[bold cyan]➜[/] Select an option",
-        choices=["1", "2"],
-        default="1",
-        show_choices=False,
-    )
-
-    if choice == "2":
-        console.print("\n[yellow]Skipping GitHub authentication.[/yellow]")
-        return None
-
+    """
+    Authenticate with GitHub using OAuth.
+    
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> github_auth_start().
+    
+    Returns:
+        Access token if successful, None otherwise.
+    """
     state = secrets.token_urlsafe(32)
     authorize_url = _build_authorize_url(state)
 
     if not authorize_url:
         return None
 
-    console.print()
-    console.print("[dim]🌐 Opening browser for GitHub authorization...[/dim]")
-    console.print(f"[dim]Waiting on {REDIRECT_URI} for the redirect...[/dim]")
-    console.print()
-
+    # Open browser silently
     webbrowser.open(authorize_url)
 
-    console.print("[bold]Waiting for GitHub to redirect back...[/bold]")
-    console.print("[dim]This happens automatically — no need to paste anything.[/dim]")
-    console.print()
-
+    # Wait for callback
     result = _wait_for_callback()
 
     if result.error and not result.code:
@@ -262,9 +237,7 @@ def exchange_github_code_for_token(code: str) -> Optional[str]:
             if user_response.status_code == 200:
                 user = user_response.json()
                 save_github_token(token, user)
-                console.print()
-                console.print(f"[bold green]✅ Connected as: {user.get('login', 'Unknown')}[/bold green]")
-                console.print("[dim]Token saved securely for future use.[/dim]")
+                # ✅ FIX: No success message here — UI handles it
             else:
                 save_github_token(token, {"login": "Unknown"})
 

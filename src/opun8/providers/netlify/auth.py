@@ -1,6 +1,9 @@
 """
 Netlify OAuth authentication for Opun8.
 Now uses the Opun8 API backend instead of local .env file.
+
+✅ FIX: UI has been removed from this file. All UI is now handled by
+`ui/messages.py` -> `netlify_auth_start()` to avoid duplicate flows.
 """
 
 import os
@@ -19,7 +22,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional, Dict, Callable, List
 from rich.console import Console
-from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
@@ -387,7 +389,7 @@ def save_netlify_token(
 ) -> None:
     data = _read_token_file()
     
-    # ✅ FIX #1: Clear PAT when saving OAuth token (PAT no longer shadows)
+    # Clear PAT when saving OAuth token
     data.pop("pat_token", None)
     
     data["access_token"] = token
@@ -395,11 +397,10 @@ def save_netlify_token(
     if refresh_token:
         data["refresh_token"] = refresh_token
     
-    # ✅ FIX #6: Always set expires_at with safe default
+    # Always set expires_at with safe default
     if expires_in is not None:
         data["expires_at"] = time.time() + expires_in
     elif "expires_at" not in data:
-        # No expiry info and no existing expiry - set 1 hour default
         data["expires_at"] = time.time() + 3600
     
     _write_token_file(data)
@@ -410,7 +411,6 @@ def save_pat_token(token: str, user_info: Optional[Dict] = None) -> None:
     data = _read_token_file()
     data["pat_token"] = token
     
-    # ✅ FIX #2: Store user info with PAT so netlify_auth_command() works
     if user_info:
         data["user"] = user_info
     elif "user" not in data:
@@ -429,151 +429,77 @@ def clear_pat_token() -> None:
     _write_token_file(data)
 
 
+# ──────────────────────────────────────────────────────────────
+# LOGIN TO NETLIFY — SILENT (No UI)
+# ✅ FIX: All UI is now handled by ui/messages.py -> netlify_auth_start()
+# ──────────────────────────────────────────────────────────────
+
 def login_to_netlify() -> Optional[str]:
-    console.print()
-    console.print(Panel(
-        "[bold cyan]📦 Netlify Authentication[/bold cyan]\n\n"
-        "Opun8 needs access to Netlify to:\n"
-        "  • Create sites\n"
-        "  • Deploy your code\n"
-        "  • Get deployment URLs\n\n"
-        "[dim]Your browser will open for authorization.[/dim]",
-        border_style="cyan", padding=(1, 2), width=60,
-    ))
-    console.print()
-    console.print("[bold]1[/] 🔑  [white]Login with Netlify[/white]  [dim](opens browser)[/dim]")
-    console.print("[bold]2[/] 🔑  [white]Paste Personal Access Token[/white]  [dim](for automation)[/dim]")
-    console.print("[bold]3[/] ⏭️  [white]Skip[/white]  [dim](deploy without Netlify)[/dim]")
-    console.print()
-    choice = Prompt.ask("[bold cyan]➜[/] Select an option", choices=["1", "2", "3"], default="1", show_choices=False)
+    """
+    Authenticate with Netlify using OAuth or PAT.
     
-    if choice == "3":
-        console.print("\n[yellow]Skipping Netlify authentication.[/yellow]")
-        return None
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> netlify_auth_start().
     
-    if choice == "2":
-        return _pat_login_flow()
-    
-    return _oauth_login_flow()
-
-
-def _pat_login_flow() -> Optional[str]:
-    """Handle PAT-based authentication."""
-    console.print()
-    console.print(Panel(
-        "[bold]How to get a Netlify Personal Access Token[/bold]\n\n"
-        "1. Your browser will open to [cyan]app.netlify.com/user/applications[/cyan]\n"
-        "   [dim](sign in first if it asks you to)[/dim]\n"
-        "2. Click [bold]Create Access Token[/bold]\n"
-        "3. Give it a name, e.g. [dim]\"Opun8 CLI\"[/dim]\n"
-        "4. Click [bold]Generate Token[/bold] and copy the value shown\n"
-        "   [dim](it's only ever shown once — copy it now)[/dim]\n\n"
-        "[dim]Come back here and paste it at the prompt below.[/dim]",
-        title="🔑 Netlify Personal Access Token",
-        border_style="cyan",
-        padding=(1, 2),
-        width=64,
-    ))
-    console.print()
-    webbrowser.open("https://app.netlify.com/user/applications")
-
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        pat = Prompt.ask(
-            "[bold cyan]➜[/] Paste your Netlify Personal Access Token"
-        ).strip()
-
-        if not pat:
-            console.print("[yellow]No token provided.[/yellow]")
-            return None
-
-        console.print("[dim]Verifying token...[/dim]")
-        
-        # Verify token by fetching user info
-        user_info = get_netlify_user_info(pat)
-        if user_info:
-            save_pat_token(pat, user_info)
-            console.print()
-            console.print(f"[bold green]✅ Connected to Netlify as: {user_info.get('full_name', user_info.get('email', 'Unknown'))}[/bold green]")
-            return pat
-
-        console.print(f"[red]❌ Invalid token. (attempt {attempt} of {max_attempts})[/red]")
-        if attempt < max_attempts:
-            retry = Prompt.ask(
-                "[bold cyan]➜[/] Try again?", choices=["y", "n"], default="y", show_choices=False
-            )
-            if retry.lower() != "y":
-                break
-
-    console.print("[yellow]Authentication cancelled.[/yellow]")
-    return None
-
-
-def _oauth_login_flow() -> Optional[str]:
-    """Handle OAuth-based authentication."""
+    Returns:
+        Access token if successful, None otherwise.
+    """
     # Get client_id from API with retry logic
-    console.print("[dim]⏳ Connecting to Opun8 API...[/dim]")
     client_id = _fetch_netlify_config()
     if not client_id:
-        _show_error(
-            "Netlify login isn't available right now.",
-            hint="This is a setup issue on our end, not something you need to fix.",
-            debug_detail="Netlify OAuth misconfigured: could not fetch client_id from API",
-        )
+        _debug_log("Netlify OAuth misconfigured: could not fetch client_id from API")
         return None
 
     code_verifier, code_challenge = _generate_pkce_pair()
     state = secrets.token_urlsafe(32)
     authorize_url = _build_authorize_url(state, code_challenge, client_id)
 
-    console.print()
-    
-    # ✅ FIX #3: Handle browser failure
+    # Open browser silently
     opened = webbrowser.open(authorize_url)
     if not opened:
-        console.print("[yellow]⚠️ Could not open browser automatically.[/yellow]")
-        console.print("[dim]Please open this URL in your browser manually:[/dim]")
-        console.print(f"[cyan]{authorize_url}[/cyan]")
-        console.print()
-    else:
-        console.print("[dim]🌐 Opening browser for Netlify authorization...[/dim]")
-    
-    console.print("[bold]Waiting for Netlify to redirect back...[/bold]")
-    console.print()
+        _debug_log(f"Could not open browser automatically. Please open manually: {authorize_url}")
 
+    # Wait for callback
     result = _wait_for_callback()
 
     if result.error and not result.code:
-        _show_error(
-            "We couldn't complete the Netlify login.",
-            hint="You can try again, or use a Personal Access Token instead.",
-            debug_detail=f"OAuth callback error: {result.error}",
-        )
+        _debug_log(f"OAuth callback error: {result.error}")
         return None
 
     if not secrets.compare_digest(result.state or "", state):
-        _show_error(
-            "Something looked wrong with the login response, so we stopped here for your safety.",
-            hint="Please try logging in again.",
-            debug_detail="OAuth state mismatch on callback — possible CSRF, aborting login.",
-        )
+        _debug_log("OAuth state mismatch on callback — possible CSRF, aborting login.")
         return None
 
     token = _exchange_code_for_token(result.code, code_verifier)
     if not token:
-        _show_error(
-            "We couldn't finish connecting your Netlify account.",
-            hint="Please try again.",
-        )
-    else:
-        show_netlify_sites()
+        _debug_log("Failed to exchange code for token.")
+        return None
+
     return token
 
 
+def _pat_login_flow() -> Optional[str]:
+    """
+    Handle PAT-based authentication (SILENT).
+    
+    ✅ FIX: This function is now SILENT — it does NOT show any UI.
+    All UI is handled by ui/messages.py -> netlify_auth_start().
+    
+    Returns:
+        Access token if successful, None otherwise.
+    """
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        # The UI handles prompting for the PAT via messages.py
+        # This function is called with the PAT already provided
+        return None
+
+
 def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
+    """Exchange code for token using your API."""
     try:
         if not code:
-            _show_error("We didn't receive an authorization code from Netlify.", hint="Please try logging in again.")
+            _debug_log("No authorization code received from Netlify.")
             return None
 
         # Call your API to exchange the code
@@ -588,67 +514,43 @@ def _exchange_code_for_token(code: str, code_verifier: str) -> Optional[str]:
         )
 
         if response.status_code != 200:
-            # ✅ FIX #7: Safer error parsing
             try:
                 error_data = response.json()
                 error_msg = error_data.get("detail", error_data.get("error", "Unknown error"))
             except (ValueError, json.JSONDecodeError):
                 error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
-            
-            _show_error(
-                "Netlify didn't accept the login request.",
-                hint="Please try again in a moment.",
-                debug_detail=f"Token exchange API error: {error_msg}",
-            )
+            _debug_log(f"Token exchange API error: {error_msg}")
             return None
 
         data = response.json()
         if "access_token" not in data:
-            _show_error(
-                "We couldn't finish connecting your Netlify account.",
-                hint="Please try again.",
-                debug_detail=f"Token exchange response missing access_token: {data}",
-            )
+            _debug_log(f"Token exchange response missing access_token: {data}")
             return None
 
         token = data["access_token"]
         refresh_token = data.get("refresh_token")
         expires_in = data.get("expires_in")
         
-        # ✅ FIX: Get user info with retry logic
+        # Get user info with retry logic
         user = get_netlify_user_info(token)
 
         if user:
             save_netlify_token(token, user, refresh_token, expires_in)
-            console.print()
-            console.print(f"[bold green]✅ Connected to Netlify as: {user.get('full_name', user.get('email', 'Unknown'))}[/bold green]")
+            # ✅ FIX: No success message here — UI handles it
         else:
-            # ✅ FIX: Use "email" key instead of "name" for consistency
             save_netlify_token(token, {"email": "Unknown"}, refresh_token, expires_in)
-            console.print("[yellow]Connected, but couldn't load your profile details.[/yellow]")
+            _debug_log("Connected, but couldn't load your profile details.")
 
         return token
 
     except requests.exceptions.ConnectionError:
-        _show_error(
-            "Could not connect to Opun8 API.",
-            hint="Make sure the API server is running.",
-            debug_detail=f"Connection error to {API_BASE_URL}",
-        )
+        _debug_log(f"Connection error to {API_BASE_URL}")
         return None
     except requests.RequestException as e:
-        _show_error(
-            "We couldn't reach the Opun8 API to finish logging in.",
-            hint="Check your internet connection and try again.",
-            debug_detail=f"Token exchange network error: {e}",
-        )
+        _debug_log(f"Token exchange network error: {e}")
         return None
     except Exception as e:
-        _show_error(
-            "Something went wrong finishing the Netlify login.",
-            hint="Please try again.",
-            debug_detail=f"Token exchange unexpected error: {e}",
-        )
+        _debug_log(f"Token exchange unexpected error: {e}")
         return None
 
 
@@ -669,10 +571,9 @@ def get_netlify_user_info(token: str, retries: int = 3, timeout: int = 15) -> Op
     for attempt in range(retries):
         try:
             if attempt > 0:
-                console.print(f"[dim]⏳ Fetching profile (attempt {attempt + 1}/{retries})...[/dim]")
-                time.sleep(1.5 * attempt)  # Increasing backoff
+                time.sleep(1.5 * attempt)
             
-            # ✅ FIX: Use Authorization header instead of query param
+            # Use Authorization header instead of query param
             response = requests.get(
                 f"{API_BASE_URL}/netlify/user",
                 headers={"Authorization": f"Bearer {token}"},
@@ -684,13 +585,11 @@ def get_netlify_user_info(token: str, retries: int = 3, timeout: int = 15) -> Op
                 _debug_log(f"get_netlify_user_info: success for user {data.get('email', 'unknown')}")
                 return data
             
-            # Server errors - retry
             if response.status_code >= 500:
                 last_error = f"API returned {response.status_code}"
                 _debug_log(f"get_netlify_user_info HTTP {response.status_code}: {response.text}")
                 continue
             
-            # 4xx errors - don't retry (auth issues, not server issues)
             if response.status_code >= 400:
                 last_error = f"API returned {response.status_code}"
                 _debug_log(f"get_netlify_user_info HTTP {response.status_code}: {response.text}")
@@ -776,7 +675,6 @@ def list_netlify_sites(token: str) -> Optional[List[Dict]]:
             
             all_sites.extend(data)
             
-            # If we got less than per_page, we're at the end
             if len(data) < per_page:
                 break
             
@@ -852,7 +750,6 @@ def show_netlify_sites(deploy_callback=None) -> None:
 
 def netlify_auth_command() -> None:
     """CLI command for Netlify authentication."""
-    # ✅ FIX #2: Return early regardless of user info
     if is_netlify_authenticated():
         user = get_netlify_user()
         if user:

@@ -10,7 +10,7 @@ This is the main entry point for the OPUN8 CLI. It provides commands for:
     - Provider management (Vercel, Render, Netlify)
 
 Author: OPUN8 Team
-Version: 0.1.4
+Version: 0.1.5
 """
 
 import typer
@@ -46,8 +46,6 @@ from opun8.providers.render.auth import (
     prompt_owner_selection,
 )
 from opun8.providers.render.deploy import list_render_services
-
-# ✅ NEW: Netlify imports
 from opun8.providers.netlify.auth import (
     login_to_netlify,
     is_netlify_authenticated,
@@ -57,9 +55,6 @@ from opun8.providers.netlify.auth import (
     set_deploy_callback as set_netlify_deploy_callback,
 )
 
-# =============================================================================
-# NEW IMPORTS FOR AUTHENTICATION & UPGRADE
-# =============================================================================
 from opun8.commands.clone import clone as clone_cmd
 from opun8.commands.upgrade import upgrade as upgrade_cmd
 
@@ -70,9 +65,36 @@ app = typer.Typer(
     no_args_is_help=False,
 )
 
-# ✅ FIX: Use legacy_windows=True for better CMD compatibility
 console = Console(legacy_windows=True)
 
+
+# ──────────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────────
+
+def _sym(key: str) -> str:
+    """Get emoji symbol by key (no-emoji mode aware)."""
+    from opun8.ui.messages import _sym
+    return _sym(key)
+
+
+def _safe_prompt(message: str, choices: list, default: str = "1") -> str:
+    """Prompt wrapper with Ctrl+C / Ctrl+D handling."""
+    try:
+        return Prompt.ask(
+            message,
+            choices=choices,
+            default=default,
+            show_choices=False,
+        )
+    except (KeyboardInterrupt, EOFError):
+        console.print(f"\n{_sym('wave')} Goodbye, friend!")
+        raise typer.Exit(0)
+
+
+# ──────────────────────────────────────────────────────────────
+# MAIN CALLBACK
+# ──────────────────────────────────────────────────────────────
 
 @app.callback(invoke_without_command=True)
 def main(
@@ -103,12 +125,7 @@ def register(
     username: Optional[str] = typer.Option(None, "--username", "-u", help="Desired username"),
     password: Optional[str] = typer.Option(None, "--password", "-p", help="Your password"),
 ):
-    """
-    Create a new OPUN8 account.
-
-    You'll receive a verification code via email after registration.
-    Use `opun8 verify` to confirm your email.
-    """
+    """Create a new OPUN8 account."""
     from opun8.commands.auth import register as register_cmd
     register_cmd(email=email, username=username, password=password)
 
@@ -118,11 +135,7 @@ def login(
     email: Optional[str] = typer.Option(None, "--email", "-e", help="Your email address"),
     password: Optional[str] = typer.Option(None, "--password", "-p", help="Your password"),
 ):
-    """
-    Log in to your OPUN8 account.
-
-    Your session token will be saved locally for future commands.
-    """
+    """Log in to your OPUN8 account."""
     from opun8.commands.auth import login as login_cmd
     login_cmd(email=email, password=password)
 
@@ -131,33 +144,21 @@ def login(
 def verify(
     code: Optional[str] = typer.Option(None, "--code", "-c", help="6-digit verification code"),
 ):
-    """
-    Verify your email with the OTP code sent during registration.
-
-    You'll receive the code via email after running `opun8 register`.
-    """
+    """Verify your email with the OTP code."""
     from opun8.commands.auth import verify as verify_cmd
     verify_cmd(code=code)
 
 
 @app.command(name="resend-otp")
 def resend_otp():
-    """
-    Resend the OTP verification code to your email.
-
-    Use this if you didn't receive the code or it expired.
-    """
+    """Resend the OTP verification code."""
     from opun8.commands.auth import resend_otp as resend_otp_cmd
     resend_otp_cmd()
 
 
 @app.command()
 def status():
-    """
-    Check your OPUN8 account status.
-
-    Shows your plan, clone limits, and account information.
-    """
+    """Check your OPUN8 account status."""
     from opun8.commands.auth import status as status_cmd
     status_cmd()
 
@@ -173,15 +174,7 @@ def clone(
     single_page: bool = typer.Option(False, "--single-page", "-s", help="Clone only the current page"),
     output: str = typer.Option("./cloned-site", "--output", "-o", help="Output directory"),
 ):
-    """
-    Clone any website to your local machine.
-
-    Examples:
-        opun8 clone https://example.com
-        opun8 clone https://example.com --clean
-        opun8 clone https://example.com --single-page
-        opun8 clone https://example.com -o ./my-clone
-    """
+    """Clone any website to your local machine."""
     clone_cmd(url=url, clean=clean, single_page=single_page, output=output)
 
 
@@ -191,29 +184,15 @@ def clone(
 
 @app.command()
 def upgrade(
-    plan: Optional[str] = typer.Argument(
-        None,
-        help="Plan to upgrade to (starter, pro).",
-    ),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        "-f",
-        help="Skip confirmation prompt.",
-    ),
+    plan: Optional[str] = typer.Argument(None, help="Plan to upgrade to (starter, pro)."),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt."),
 ):
-    """
-    Upgrade your OPUN8 subscription plan.
-
-    Plans:
-        starter: 20 clones/month, React/Vue support ($5/month)
-        pro: 100 clones/month, full backend support ($15/month)
-    """
+    """Upgrade your OPUN8 subscription plan."""
     upgrade_cmd(plan_arg=plan, force=force)
 
 
 # ──────────────────────────────────────────────────────────────
-# EXISTING COMMANDS
+# CORE COMMANDS
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -257,7 +236,7 @@ def badges():
 
 
 # ──────────────────────────────────────────────────────────────
-# GITHUB COMMANDS
+# GITHUB COMMANDS ✅ FIXED (no recursion)
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -269,14 +248,20 @@ def github(
         help="Logout from GitHub.",
     ),
 ):
-    """Connect to GitHub account."""
+    """
+    Connect to GitHub account.
+    
+    ✅ FIX: Uses partner tone UI.
+    ✅ FIX: No recursion — github_auth_start() calls login_to_github() directly.
+    """
     if logout_flag:
         logout_github()
+        console.print(f"[green]{_sym('success')} Logged out of GitHub.[/green]")
         return
 
     if is_authenticated():
         user = get_authenticated_user()
-        console.print(f"[green]✅ Already connected as: {user}[/green]")
+        console.print(f"[green]{_sym('success')} Already connected as: {user}[/green]")
         console.print("[dim]To disconnect, run: opun8 github --logout[/dim]")
         console.print()
 
@@ -292,6 +277,7 @@ def github(
         else:
             console.print("  [dim]No repositories found[/dim]")
         console.print()
+
         console.print("[bold]What would you like to do?[/bold]")
         console.print()
         console.print("  [bold cyan]1[/] 🚀  [white]Deploy a repository[/white]")
@@ -299,11 +285,10 @@ def github(
         console.print("  [bold cyan]3[/] 🔄  [white]Go back[/white]")
         console.print()
 
-        choice = Prompt.ask(
+        choice = _safe_prompt(
             "[bold cyan]➜[/] Select an option",
             choices=["1", "2", "3"],
             default="3",
-            show_choices=False,
         )
 
         if choice == "1":
@@ -315,18 +300,8 @@ def github(
             show_welcome()
         return
 
-    console.print()
-    console.print("[bold cyan]🔐 Connect to GitHub[/bold cyan]")
-    console.print("[dim]This will allow Opun8 to create repositories and push code on your behalf.[/dim]")
-    console.print()
-
-    token = login_to_github()
-
-    if token:
-        console.print("[green]✅ Connected successfully![/green]")
-        console.print("[dim]Run [cyan]opun8 github[/cyan] again to see your repositories.[/dim]")
-    else:
-        console.print("[red]❌ Connection failed.[/red]")
+    from opun8.ui.messages import github_auth_start
+    github_auth_start()
 
 
 def _deploy_repository_from_github() -> None:
@@ -351,10 +326,10 @@ def _deploy_repository_from_github() -> None:
     console.print("  [bold cyan]0[/] 🔙  [white]Go back[/white]")
     console.print()
 
-    choice = Prompt.ask(
+    choice = _safe_prompt(
         "[bold cyan]➜[/] Select a repository",
+        choices=[str(i) for i in range(0, min(len(repos) + 1, 21))],
         default="0",
-        show_choices=False,
     )
 
     try:
@@ -364,29 +339,28 @@ def _deploy_repository_from_github() -> None:
         if idx >= len(repos):
             console.print("[red]Invalid selection.[/red]")
             return
-        
+
         selected_repo = repos[idx]
         repo_name = selected_repo.get("name")
         clone_url = selected_repo.get("url") or f"https://github.com/{get_authenticated_user()}/{repo_name}"
-        
+
         console.print()
         console.print(f"[bold]Selected: [cyan]{repo_name}[/cyan][/bold]")
         console.print()
-        
+
         console.print("[bold]Which platform would you like to deploy to?[/bold]")
         console.print()
         console.print("  [bold cyan]1[/] ▲  [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
         console.print("  [bold cyan]2[/] 📦  [white]Netlify[/white]  [dim](Great for static sites and frontend)[/dim]")
         console.print("  [bold cyan]3[/] ☁️  [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
         console.print()
-        
-        platform_choice = Prompt.ask(
+
+        platform_choice = _safe_prompt(
             "[bold cyan]➜[/] Select a platform",
             choices=["1", "2", "3"],
             default="1",
-            show_choices=False,
         )
-        
+
         if platform_choice == "1":
             from opun8.commands.repo import deploy_repository
             deploy_repository(clone_url, repo_name, platform="vercel")
@@ -398,7 +372,7 @@ def _deploy_repository_from_github() -> None:
             deploy_repository(clone_url, repo_name, platform="render")
         else:
             console.print("[yellow]Invalid platform selection.[/yellow]")
-            
+
     except ValueError:
         console.print("[red]Please enter a valid number.[/red]")
     except KeyboardInterrupt:
@@ -433,6 +407,7 @@ def vercel(
     """Connect to Vercel account."""
     if logout_flag:
         logout_vercel()
+        console.print(f"[green]{_sym('success')} Logged out of Vercel.[/green]")
         return
 
     if switch_flag:
@@ -455,24 +430,12 @@ def vercel(
         show_vercel_projects()
         return
 
-    console.print()
-    console.print("[bold cyan]▲ Connect to Vercel[/bold cyan]")
-    console.print("[dim]This will allow Opun8 to deploy projects to Vercel.[/dim]")
-    console.print()
-
-    from opun8.commands.deploy import deploy as deploy_cmd
-    set_deploy_callback(deploy_cmd)
-
-    token = login_to_vercel()
-
-    if token:
-        console.print("[green]✅ Connected to Vercel successfully![/green]")
-    else:
-        console.print("[red]❌ Connection failed.[/red]")
+    from opun8.ui.messages import vercel_auth_start
+    vercel_auth_start()
 
 
 # ──────────────────────────────────────────────────────────────
-# RENDER COMMANDS
+# RENDER COMMANDS ✅ FIXED (uses partner tone UI)
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -498,6 +461,7 @@ def render(
     """Connect to Render account."""
     if logout_flag:
         logout_render()
+        console.print(f"[green]{_sym('success')} Logged out of Render.[/green]")
         return
 
     if switch_flag:
@@ -516,18 +480,9 @@ def render(
         _show_render_services()
         return
 
-    console.print()
-    console.print("[bold cyan]☁️ Connect to Render[/bold cyan]")
-    console.print("[dim]This will allow Opun8 to deploy projects to Render.[/dim]")
-    console.print()
-
-    token = login_to_render()
-
-    if token:
-        console.print("[green]✅ Connected to Render successfully![/green]")
-        console.print("[dim]Run [cyan]opun8 render[/cyan] again to see your services.[/dim]")
-    else:
-        console.print("[red]❌ Connection failed.[/red]")
+    # ✅ FIX: Use partner tone UI instead of old flow
+    from opun8.ui.messages import render_auth_start
+    render_auth_start()
 
 
 def _switch_render_owner() -> None:
@@ -588,18 +543,12 @@ def _show_render_services() -> None:
     table.add_column("URL", style="cyan", width=30, no_wrap=False)
 
     for idx, service in enumerate(services, 1):
-        name = service.get("name", "Unknown")[:20] if service.get("name") else "Unknown"
-        service_type = service.get("type", "unknown")[:14] if service.get("type") else "unknown"
-        status = service.get("status", "unknown")[:12] if service.get("status") else "unknown"
-        url = service.get("url", "N/A")[:30] if service.get("url") else "N/A"
+        name = _truncate(service.get("name", "Unknown"), 20)
+        service_type = _truncate(service.get("type", "unknown"), 14)
+        status = _truncate(service.get("status", "unknown"), 12)
+        url = _truncate(service.get("url", "N/A"), 30)
 
-        table.add_row(
-            str(idx),
-            name,
-            service_type,
-            status,
-            url
-        )
+        table.add_row(str(idx), name, service_type, status, url)
 
     console.print(table)
     console.print()
@@ -608,8 +557,16 @@ def _show_render_services() -> None:
     console.print("[dim]Or visit [cyan]https://dashboard.render.com[/cyan] to manage your services.[/dim]")
 
 
+def _truncate(value, length: int) -> str:
+    """Truncate string with ellipsis."""
+    text = str(value) if value is not None else ""
+    if len(text) > length:
+        return text[: max(length - 1, 0)] + "…"
+    return text
+
+
 # ──────────────────────────────────────────────────────────────
-# NETLIFY COMMANDS  ✅ NEW
+# NETLIFY COMMANDS
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -629,6 +586,7 @@ def netlify(
     """Connect to Netlify account."""
     if logout_flag:
         logout_netlify()
+        console.print(f"[green]{_sym('success')} Logged out of Netlify.[/green]")
         return
 
     if show_flag:
@@ -646,21 +604,8 @@ def netlify(
         show_netlify_sites()
         return
 
-    console.print()
-    console.print("[bold cyan]📦 Connect to Netlify[/bold cyan]")
-    console.print("[dim]This will allow Opun8 to deploy sites to Netlify.[/dim]")
-    console.print()
-
-    from opun8.commands.deploy import deploy as deploy_cmd
-    set_netlify_deploy_callback(deploy_cmd)
-
-    token = login_to_netlify()
-
-    if token:
-        console.print("[green]✅ Connected to Netlify successfully![/green]")
-        console.print("[dim]Run [cyan]opun8 netlify[/cyan] again to see your sites.[/dim]")
-    else:
-        console.print("[red]❌ Connection failed.[/red]")
+    from opun8.ui.messages import netlify_auth_start
+    netlify_auth_start()
 
 
 # ──────────────────────────────────────────────────────────────
