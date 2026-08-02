@@ -12,8 +12,6 @@ dist/
 build/
 *.whl
 *.pyi
-*.pyc
-*.pyd
 
 # ──────────────────────────────────────────────
 # Virtual Environment
@@ -54,7 +52,6 @@ desktop.ini
 # ──────────────────────────────────────────────
 # Project Specific
 # ──────────────────────────────────────────────
-*.log
 *.db
 *.sqlite3
 .env
@@ -79,13 +76,47 @@ opun8.egg-info/
 .ship8/
 *.pid
 *.state
+~/.opun8/
+
+# ──────────────────────────────────────────────
+# Build Artifacts — NEVER commit these
+# ──────────────────────────────────────────────
+*.spec
+dist/
+build/
+*.whl
+*.egg-info/
 
 # ──────────────────────────────────────────────
 # Ghost Files — These should NEVER be committed
 # ──────────────────────────────────────────────
-None
+Union[bool*
 Optional*
 bool
+None
 *.lock
 *.tmp
 *.temp
+*~          # vim/editor temp files
+# *          # ⚠️ WARNING: Do NOT uncomment this — it ignores EVERYTHING!
+
+# ──────────────────────────────────────────────
+# Backup Files
+# ──────────────────────────────────────────────
+*.bak
+*.backup
+*.old
+*.orig
+
+# ──────────────────────────────────────────────
+# Secret / Sensitive
+# ──────────────────────────────────────────────
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+*.token
+*_secret.py
+*_key.py
