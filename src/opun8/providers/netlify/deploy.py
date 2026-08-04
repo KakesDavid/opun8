@@ -21,8 +21,18 @@ FIXES APPLIED:
   6. Added user-visible countdown timers during retry waits (no more "hung" CLI)
   7. Fixed stale UI text after conflict resolution (shows actual site name)
   8. Added .gitignore support (respects patterns, no accidental secrets upload)
+  9. FIXED: .gitignore matching now supports '!' negation and correctly
+     handles directory-only ('dir/') and root-anchored ('/dir') patterns.
+     Previously, negation lines were silently inert (could never re-include
+     a file) and directory patterns with a trailing slash never matched
+     their own contents. Combined, this meant a repo using the common
+     "ignore everything, then un-ignore what you want" .gitignore style
+     (e.g. "*" followed by "!dist/", "!index.html") would have EVERY file
+     ignored and nothing un-ignored -- producing "No files found to deploy"
+     even though the project was valid.
 """
 
+import fnmatch
 import os
 import hashlib
 import re
@@ -99,7 +109,7 @@ def _debug_log(message: str) -> None:
 def _show_error(message: str, hint: Optional[str] = None, debug_detail: Optional[str] = None) -> None:
     """
     Thread-safe error display with consistent behavior.
-    
+
     Fixes Issue #5: Unified duplicate functions into one.
     """
     with _console_lock:
@@ -126,7 +136,7 @@ def _strip_scheme(url: str) -> str:
 def _sanitize_project_name(name: str) -> str:
     """
     Sanitize project name for Netlify.
-    
+
     - Converts to lowercase
     - Replaces spaces with hyphens
     - Removes invalid characters
@@ -149,47 +159,101 @@ def _is_env_file(name: str) -> bool:
     return name == ".env" or name.startswith(".env.")
 
 
-def _load_gitignore(project_path: Path) -> List[str]:
+# ----------------------------------------------------------------------------
+# .gitignore handling
+# ----------------------------------------------------------------------------
+# Each loaded pattern is stored as a (negated, dir_only, pattern) tuple, in
+# file order, so that patterns are applied the way git actually applies them:
+# later patterns can override earlier ones, and a leading '!' re-includes a
+# path that an earlier pattern excluded.
+
+GitignorePattern = Tuple[bool, bool, str]
+
+
+def _load_gitignore(project_path: Path) -> List[GitignorePattern]:
     """
     Load .gitignore patterns from project root.
-    
+
     Fixes Issue #8: Adds .gitignore support.
+    Fixes Issue #9: Parses '!' negation and directory-only ('/'-suffixed)
+    markers instead of treating every line as an opaque glob.
     """
     gitignore_path = project_path / ".gitignore"
-    patterns = []
+    patterns: List[GitignorePattern] = []
     try:
         if gitignore_path.exists():
             with open(gitignore_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    # Skip empty lines and comments
-                    if line and not line.startswith('#'):
-                        patterns.append(line)
+                for raw_line in f:
+                    line = raw_line.rstrip('\n').rstrip('\r')
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith('#'):
+                        continue
+
+                    negated = stripped.startswith('!')
+                    if negated:
+                        stripped = stripped[1:]
+
+                    dir_only = stripped.endswith('/')
+                    if dir_only:
+                        stripped = stripped[:-1]
+
+                    if not stripped:
+                        continue
+
+                    patterns.append((negated, dir_only, stripped))
             _debug_log(f"Loaded {len(patterns)} patterns from .gitignore")
     except Exception as e:
         _debug_log(f"Could not load .gitignore: {e}")
     return patterns
 
 
-def _should_ignore_file(file_path: Path, project_path: Path, gitignore_patterns: Optional[List[str]] = None) -> bool:
+def _pattern_matches_path(rel_str: str, pattern: str) -> bool:
+    """
+    Match a single (negation/dir-marker already stripped) gitignore pattern
+    against a forward-slash relative path.
+
+    - A pattern containing '/' (or starting with one) is anchored to the
+      project root and must match the path itself or one of its ancestors.
+    - A pattern with no '/' can match at any depth (any single path
+      component, or any path suffix).
+    - '*', '?', '[...]' are handled via fnmatch.
+    """
+    anchored = pattern.startswith('/') or '/' in pattern
+    pattern = pattern.lstrip('/')
+
+    if anchored:
+        return rel_str == pattern or fnmatch.fnmatch(rel_str, pattern) or rel_str.startswith(pattern + '/')
+
+    parts = rel_str.split('/')
+    for i in range(len(parts)):
+        suffix = '/'.join(parts[i:])
+        if fnmatch.fnmatch(parts[i], pattern) or fnmatch.fnmatch(suffix, pattern):
+            return True
+    return False
+
+
+def _should_ignore_file(file_path: Path, project_path: Path, gitignore_patterns: Optional[List[GitignorePattern]] = None) -> bool:
     """
     Check if a file should be ignored based on hardcoded exclusions and .gitignore.
-    
+
     Fixes Issue #8: Respects .gitignore patterns.
-    
+    Fixes Issue #9: Applies patterns in order with correct negation and
+    directory-only semantics, instead of a single first-match glob check.
+
     Args:
         file_path: Path to the file
         project_path: Root project path
-        gitignore_patterns: List of .gitignore patterns (optional)
-    
+        gitignore_patterns: List of (negated, dir_only, pattern) tuples
+
     Returns:
         True if file should be ignored, False otherwise
     """
     rel_path = file_path.relative_to(project_path)
     rel_str = rel_path.as_posix()
-    
+    parts = rel_path.parts
+
     # Check hardcoded exclusions first
-    if any(part in EXCLUDE_DIR_NAMES for part in rel_path.parts[:-1]):
+    if any(part in EXCLUDE_DIR_NAMES for part in parts[:-1]):
         return True
     if file_path.name in EXCLUDE_FILE_NAMES:
         return True
@@ -197,25 +261,27 @@ def _should_ignore_file(file_path: Path, project_path: Path, gitignore_patterns:
         return True
     if file_path.suffix in EXCLUDE_SUFFIXES:
         return True
-    
-    # Check .gitignore patterns if provided
-    if gitignore_patterns:
-        import fnmatch
-        for pattern in gitignore_patterns:
-            # Root-relative pattern (starts with /)
-            if pattern.startswith('/'):
-                if fnmatch.fnmatch(rel_str, pattern[1:]):
-                    return True
-            else:
-                # Anywhere in tree
-                if fnmatch.fnmatch(rel_str, pattern):
-                    return True
-                # Check if any parent directory matches
-                for part in rel_path.parents:
-                    if fnmatch.fnmatch(part.as_posix(), pattern):
-                        return True
-    
-    return False
+
+    if not gitignore_patterns:
+        return False
+
+    ignored = False
+    for negated, dir_only, pattern in gitignore_patterns:
+        if dir_only:
+            # A directory-only pattern can only match one of this file's
+            # ancestor directories -- never the file itself.
+            matched = False
+            for i in range(1, len(parts)):
+                if _pattern_matches_path('/'.join(parts[:i]), pattern):
+                    matched = True
+                    break
+        else:
+            matched = _pattern_matches_path(rel_str, pattern)
+
+        if matched:
+            ignored = not negated
+
+    return ignored
 
 
 # ============================================================================
@@ -414,7 +480,7 @@ def _find_site_by_name(
 def _get_site_name(session: requests.Session, site_id: str) -> Optional[str]:
     """
     Get site name from site ID.
-    
+
     Fixes Issue #7: Used to display the actual site name after conflict resolution.
     """
     try:
@@ -495,7 +561,7 @@ def _get_or_create_site(
                 console.print(f"[dim]  Retrying in {i}s...[/dim]", end="\r")
                 time.sleep(1)
             console.print()  # Clear the progress line
-            
+
             response = session.post(
                 SITES_ENDPOINT,
                 headers={"Content-Type": "application/json"},
@@ -506,6 +572,7 @@ def _get_or_create_site(
                 site_id = response.json().get("id")
                 _debug_log(f"_get_or_create_site: created new site on retry '{site_name}' -> {site_id}")
                 return site_id
+            _debug_log(f"_get_or_create_site: retry after 429 still failed HTTP {response.status_code}: {response.text}")
             return None
 
         # Handle duplicate subdomain conflict (422)
@@ -651,9 +718,11 @@ def _get_or_create_site(
 def _collect_project_files(project_path: Path) -> List[Dict]:
     """
     Collect all files to upload, respecting .gitignore.
-    
+
     Fixes Issue #8: Now loads and respects .gitignore patterns.
-    
+    Fixes Issue #9: .gitignore matching now honors negation and
+    directory-only patterns correctly (see module docstring).
+
     Returns:
         List of dicts with keys: path, sha1, size
     """
@@ -672,8 +741,8 @@ def _collect_project_files(project_path: Path) -> List[Dict]:
         for file_path in project_path.rglob("*"):
             if not file_path.is_file():
                 continue
-            
-            # Fixes Issue #8: Check .gitignore
+
+            # Fixes Issue #8/#9: Check .gitignore (with correct semantics)
             if _should_ignore_file(file_path, project_path, gitignore_patterns):
                 continue
 
@@ -700,6 +769,14 @@ def _collect_project_files(project_path: Path) -> List[Dict]:
         )
         return []
 
+    if not files:
+        _debug_log(
+            f"_collect_project_files: 0 files matched for {project_path} "
+            f"({len(gitignore_patterns)} .gitignore pattern(s) loaded) — "
+            f"if this is unexpected, check the .gitignore for a broad pattern "
+            f"like '*' or 'build/' at the project root."
+        )
+
     return files
 
 
@@ -717,7 +794,7 @@ def _create_deploy_with_manifest(
 
     Netlify expects: {"files": {"path/to/file": "sha1"}}
     It returns "required" as a list of SHA1 hashes that need uploading.
-    
+
     Fixes Issue #6: Added user-visible countdown during retry waits.
     """
     try:
@@ -794,7 +871,7 @@ def _upload_files_to_deploy(
     Upload files to a Netlify deploy.
 
     Fixes Issue #1: URL-encode file paths before upload.
-    
+
     Note: required_files is a list of SHA1 hashes, not file paths.
     Build lookup by SHA1 to find which local files correspond.
 
@@ -846,7 +923,7 @@ def _upload_files_to_deploy(
         try:
             # Fixes Issue #1: URL-encode file path
             encoded_path = urllib.parse.quote(file_path, safe='/')
-            
+
             response = session.put(
                 f"{DEPLOYS_ENDPOINT}/{deploy_id}/files/{encoded_path}",
                 headers={"Content-Type": "application/octet-stream"},
@@ -969,7 +1046,7 @@ def deploy_to_netlify(
 
     Returns:
         (success, url_or_message, site_id)
-        
+
     Fixes Issue #7: Now displays the actual site name after conflict resolution.
     """
     project_path = Path(project_path)
@@ -1020,7 +1097,7 @@ def deploy_to_netlify(
         site_id = _get_or_create_site(session, site_name)
         if not site_id:
             return False, "Couldn't set up the site on Netlify. Please try again.", None
-        
+
         # Fixes Issue #7: Get actual site name after conflict resolution
         actual_site_name = _get_site_name(session, site_id) or site_name
         console.print(f"[green]✅ Site ready: {actual_site_name}[/green]")

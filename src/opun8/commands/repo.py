@@ -2,20 +2,39 @@
 Repository deployment - Deploy GitHub repositories directly.
 
 This module handles:
-    - Cloning a GitHub repository to a temporary directory (for Vercel)
+    - Cloning a GitHub repository to a temporary directory (for Vercel/Netlify)
     - Detecting the project type
     - Deploying to the selected platform (Vercel, Render, Netlify)
     - Cleaning up temporary files
 
-For Render: we deploy directly from the GitHub URL without cloning.
+For Render: the repo is still cloned locally first (so we can run project
+detection and pick up a local .env file for convenience), but the actual
+deployment itself is triggered from the GitHub URL rather than by uploading
+local files.
 For Vercel: we clone the repo and upload local files.
 For Netlify: we clone the repo and upload local files.
+
+Changelog:
+✅ FIX: _clone_repository() returns resolved absolute path
+✅ FIX: _clone_repository() now escapes Rich markup in git error messages
+✅ FIX: _deploy_to_vercel() ensures path is resolved before deployment
+✅ FIX: _deploy_to_netlify() ensures path is resolved before deployment
+✅ FIX: Added debug logging to track file discovery
+✅ FIX: Docstring no longer claims Render skips cloning entirely
+✅ FIX: _load_env_vars() now checks multiple common env filenames and
+        clearly warns that .env files are typically not committed
+✅ FIX: _run_deployment() now handles "render" with a clear error message
+✅ FIX: status is now set to "failed" when project detection fails
+✅ FIX: repo_name is sanitized before being used to build filesystem paths
+✅ FIX: _detect_project() now guards os.chdir() with a lock
 """
 
 import logging
 import os
+import re
 import shutil
 import tempfile
+import threading
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -68,10 +87,51 @@ PANEL_WIDTH = 60
 # Platforms that are fully implemented
 LIVE_PLATFORMS = {"vercel", "render", "netlify"}
 
+# Platforms that deploy from local files (as opposed to a bare GitHub URL)
+LOCAL_FILE_PLATFORMS = {"vercel", "netlify"}
+
 # Upcoming platforms (empty set)
-UPCOMING_PLATFORMS = set()
+UPCOMING_PLATFORMS: set[str] = set()
+
+# Common env filenames to look for, in priority order (later files override
+# earlier ones, matching the usual dotenv precedence convention).
+ENV_FILE_CANDIDATES = (".env", ".env.local", ".env.production", ".env.production.local")
 
 DeployStatus = Literal["success", "unsupported", "failed"]
+
+# Guards os.chdir() in _detect_project so two concurrent calls in the same
+# process can't race and detect the wrong directory's project type.
+_detect_project_lock = threading.Lock()
+
+# Anything outside this set gets stripped out of repo_name before it's used
+# to build a filesystem path, to avoid path traversal / unexpected deletion.
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_repo_name(repo_name: str) -> str:
+    """
+    Make repo_name safe to use as a single path component.
+
+    Strips path separators, parent-directory references, and any other
+    characters that aren't conservatively "filename-safe". This prevents a
+    malicious or malformed repo_name (e.g. containing "../" or "/") from
+    escaping the intended temp directory when building clone_path, and
+    later being handed to shutil.rmtree during cleanup.
+    """
+    name = repo_name.strip().replace("\\", "/").split("/")[-1]
+    name = _SAFE_NAME_RE.sub("_", name)
+    name = name.lstrip(".") or "repo"
+    return name
+
+
+def _escape_rich_markup(text: str) -> str:
+    """
+    Escape square brackets so Rich doesn't interpret them as markup tags.
+
+    ✅ FIX #1: Prevents MarkupError on clone failure messages containing
+    brackets (e.g., "[email protected]", ref names, auth errors).
+    """
+    return str(text).replace("[", "(").replace("]", ")")
 
 
 def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -> None:
@@ -83,6 +143,8 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
         repo_name: The name of the repository.
         platform: The platform to deploy to (vercel, render, netlify).
     """
+    safe_repo_name = _sanitize_repo_name(repo_name)
+
     project_path: Optional[Path] = None
     status: Optional[DeployStatus] = None
     project_info: Optional[ProjectInfo] = None
@@ -99,22 +161,32 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
         ))
         console.print()
 
-        # Step 1: Clone the repository (needed for all platforms)
+        # Step 1: Clone the repository.
+        # We always clone locally, even for Render, so that we can run
+        # project detection and optionally pick up a local .env file. Only
+        # the *upload* step differs: Render deploys straight from the
+        # GitHub URL, while Vercel/Netlify upload these local files.
         console.print("[bold]Step 1: Cloning repository[/bold]")
         console.print(f"[dim]Cloning from: {repo_url}[/dim]\n")
 
-        project_path = _clone_repository(repo_url, repo_name)
+        project_path = _clone_repository(repo_url, safe_repo_name)
         if project_path is None:
             msg.error("Failed to clone repository.", suggestion="Check the URL and your internet connection.")
+            status = "failed"
             return
 
         console.print(f"[green]✅ Cloned to: {project_path}[/green]\n")
+
+        # Debug: Check if files exist after clone
+        file_count = sum(1 for _ in project_path.rglob("*") if _.is_file())
+        console.print(f"[dim]📁 Found {file_count} files in cloned repository[/dim]\n")
 
         # Step 2: Detect project type
         console.print("[bold]Step 2: Detecting project type[/bold]\n")
         project_info = _detect_project(project_path)
         if project_info is None:
             msg.error("Could not detect project type.", suggestion="Make sure the repository contains a valid project.")
+            status = "failed"  # ✅ FIX #5: Set status so final banner appears
             return
 
         _show_project_summary(project_info)
@@ -122,22 +194,23 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
 
         # Step 3: Deploy
         if platform == "render":
-            # Render deploys directly from GitHub URL (no local files)
-            # But we still pass the cloned path for detection and env vars
+            # Render deploys directly from GitHub (no local file upload).
+            # We still pass the cloned path along for detection and env vars.
             status = _run_render_deployment_from_github(
-                repo_url, repo_name, project_info, project_path
+                repo_url, safe_repo_name, project_info, project_path
             )
         else:
-            # Vercel and Netlify deploy from local files
-            status = _run_deployment(platform, project_info, project_path, repo_name)
+            # Vercel and Netlify deploy from local files.
+            status = _run_deployment(platform, project_info, project_path, safe_repo_name)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️ Operation cancelled.[/yellow]")
         raise typer.Exit(0)
     except Exception as exc:
         logger.exception("Unexpected error while deploying repository %s", repo_name)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]Unexpected error: {error_msg}[/red]")
+        status = "failed"
         raise typer.Exit(1)
     finally:
         if project_path is not None:
@@ -159,7 +232,19 @@ def _run_deployment(
     project_path: Path,
     repo_name: str,
 ) -> DeployStatus:
-    """Dispatch deployment to the requested platform and report the outcome."""
+    """
+    Dispatch deployment to the requested LOCAL-FILE platform (vercel/netlify)
+    and report the outcome.
+
+    Note: this function intentionally does not handle "render" — that
+    platform has its own upload-free flow in
+    _run_render_deployment_from_github and is routed there directly by
+    deploy_repository. If "render" (or anything else unexpected) ever
+    reaches this function, that's a routing bug upstream, so we surface a
+    clear error instead of silently reporting failure.
+
+    ✅ FIX #4: "render" now produces a clear error message instead of silently failing.
+    """
     console.print(f"[bold]Step 3: Deploying to {platform.capitalize()}[/bold]\n")
 
     if platform in UPCOMING_PLATFORMS:
@@ -170,12 +255,22 @@ def _run_deployment(
         msg.error(f"Unknown platform: {platform}", suggestion="Choose one of: vercel, render, netlify.")
         return "failed"
 
+    # ✅ FIX #4: Explicitly handle "render" with a clear error message
+    if platform == "render":
+        logger.error(
+            "Platform 'render' reached _run_deployment() — this should not happen. "
+            "It should be routed to _run_render_deployment_from_github() instead."
+        )
+        msg.error(
+            "Internal routing error: Render was sent to the local-file deployment path.",
+            suggestion="Please report this issue.",
+        )
+        return "failed"
+
     if platform == "vercel":
         success = _deploy_to_vercel(project_info, project_path, repo_name)
-    elif platform == "netlify":
+    else:  # platform == "netlify"
         success = _deploy_to_netlify(project_info, project_path, repo_name)
-    else:
-        success = False
 
     return "success" if success else "failed"
 
@@ -209,18 +304,21 @@ def _run_render_deployment_from_github(
             if owner_id is None:
                 console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
 
-        # ✅ Load environment variables from the cloned repo
+        # Load environment variables from the cloned repo (best effort)
+        # ✅ FIX #3: Clear warning about .env files being excluded from git
         env_vars = _load_env_vars(project_path)
         if env_vars:
             console.print(f"[dim]📄 Loaded {len(env_vars)} environment variables for Render.[/dim]")
         else:
-            console.print("[dim]ℹ️ No .env file found. Render env vars can be set in the dashboard.[/dim]")
+            console.print(
+                "[dim]ℹ️ No local .env file found (or it's excluded via .gitignore, "
+                "as is typical). You can set env vars in the Render dashboard.[/dim]"
+            )
 
         console.print()
         console.print("[bold]Step 3: Deploying to Render from GitHub[/bold]")
         console.print("[dim]☁️ This may take a few minutes.[/dim]\n")
 
-        # ✅ Pass env_vars to deploy_to_render
         success, url, service_id = deploy_to_render(
             token=token,
             project_name=repo_name,
@@ -268,14 +366,13 @@ def _run_render_deployment_from_github(
 
             return "success"
         else:
-            error_msg = str(url) if url else "Unknown error"
-            error_msg = error_msg.replace("[", "(").replace("]", ")")
+            error_msg = _escape_rich_markup(str(url) if url else "Unknown error")
             console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
             return "failed"
 
     except Exception as exc:
         logger.exception("Error deploying %s to Render from GitHub", repo_name)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]❌ Render deployment error: {error_msg}[/red]")
         return "failed"
 
@@ -283,6 +380,16 @@ def _run_render_deployment_from_github(
 def _clone_repository(repo_url: str, repo_name: str) -> Optional[Path]:
     """
     Clone a GitHub repository to a temporary directory.
+
+    ✅ FIX: Returns resolved absolute path.
+    ✅ FIX #1: Escapes Rich markup characters in git's error message before
+            printing, since that message is not under our control and may
+            legitimately contain "[" / "]" (e.g. in URLs, refs, or auth
+            errors), which Rich would otherwise try to interpret as markup.
+
+    Args:
+        repo_name: Expected to already be sanitized (see _sanitize_repo_name)
+            by the caller, since it's used directly as a path component.
 
     Returns:
         The path to the cloned repository, or None if cloning failed.
@@ -302,15 +409,18 @@ def _clone_repository(repo_url: str, repo_name: str) -> Optional[Path]:
         )
 
         if not success:
-            console.print(f"[red]❌ Clone failed: {message}[/red]")
+            # ✅ FIX #1: Escape Rich markup in git error message
+            safe_message = _escape_rich_markup(message)
+            console.print(f"[red]❌ Clone failed: {safe_message}[/red]")
             return None
 
         cloned_ok = True
-        return clone_path
+        # ✅ FIX: Return resolved absolute path
+        return clone_path.resolve()
 
     except Exception as exc:
         logger.exception("Error cloning repository %s", repo_url)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]❌ Clone error: {error_msg}[/red]")
         return None
     finally:
@@ -319,20 +429,29 @@ def _clone_repository(repo_url: str, repo_name: str) -> Optional[Path]:
 
 
 def _detect_project(project_path: Path) -> Optional[ProjectInfo]:
-    """Detect the project type in the cloned repository."""
-    original_cwd = os.getcwd()
+    """
+    Detect the project type in the cloned repository.
 
-    try:
-        os.chdir(project_path)
-        with msg.scanning_spinner():
-            result = detect_project(".")
-    except Exception as exc:
-        logger.exception("Error detecting project type at %s", project_path)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
-        console.print(f"[red]❌ Detection error: {error_msg}[/red]")
-        return None
-    finally:
-        os.chdir(original_cwd)
+    ✅ FIX #7: os.chdir() mutates process-global state. A lock serializes
+    access so that two concurrent calls to this function (e.g. from a
+    future batch/async deploy flow) can't race and end up detecting the
+    wrong directory's project type. This has no effect on today's
+    single-threaded CLI usage but makes the function safe to reuse.
+    """
+    with _detect_project_lock:
+        original_cwd = os.getcwd()
+
+        try:
+            os.chdir(project_path)
+            with msg.scanning_spinner():
+                result = detect_project(".")
+        except Exception as exc:
+            logger.exception("Error detecting project type at %s", project_path)
+            error_msg = _escape_rich_markup(exc)
+            console.print(f"[red]❌ Detection error: {error_msg}[/red]")
+            return None
+        finally:
+            os.chdir(original_cwd)
 
     if result.framework == "unknown" and not result.is_static:
         return None
@@ -363,8 +482,28 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
-    """Deploy the project to Vercel and record the result in deployment history."""
+    """
+    Deploy the project to Vercel and record the result in deployment history.
+
+    ✅ FIX: Ensures path is resolved before deployment.
+    ✅ FIX: Adds debug logging to track file discovery.
+    """
     try:
+        # ✅ FIX: Ensure path is resolved
+        project_path = project_path.resolve()
+
+        # Debug: Log files found
+        files = list(project_path.rglob("*"))
+        file_count = sum(1 for f in files if f.is_file())
+        console.print(f"[dim]📁 Vercel: Found {file_count} files in {project_path}[/dim]")
+
+        # Debug: Check for package.json
+        package_json = project_path / "package.json"
+        if package_json.exists():
+            console.print("[dim]📦 package.json found[/dim]")
+        else:
+            console.print("[dim]⚠️ No package.json found[/dim]")
+
         if not is_vercel_authenticated():
             console.print("[yellow]You're not connected to Vercel yet.[/yellow]")
             login_to_vercel()
@@ -396,12 +535,11 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
         )
 
         if not success:
-            error_msg = str(url) if url else "Unknown error"
-            error_msg = error_msg.replace("[", "(").replace("]", ")")
+            error_msg = _escape_rich_markup(str(url) if url else "Unknown error")
             console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
             return False
 
-        # ✅ Handle None URL
+        # Handle None URL
         if not url:
             url = f"https://{repo_name}.vercel.app"
             _debug_log(f"URL was None, using constructed URL: {url}")
@@ -438,7 +576,7 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
 
     except Exception as exc:
         logger.exception("Error deploying %s to Vercel", repo_name)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]❌ Vercel deployment error: {error_msg}[/red]")
         return False
 
@@ -448,8 +586,15 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
 # ──────────────────────────────────────────────────────────────
 
 def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
-    """Deploy the project to Netlify and record the result in deployment history."""
+    """
+    Deploy the project to Netlify and record the result in deployment history.
+
+    ✅ FIX: Ensures path is resolved before deployment.
+    """
     try:
+        # ✅ FIX: Ensure path is resolved
+        project_path = project_path.resolve()
+
         if not is_netlify_authenticated():
             console.print("[yellow]You're not connected to Netlify yet.[/yellow]")
             login_to_netlify()
@@ -478,12 +623,11 @@ def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name:
         )
 
         if not success:
-            error_msg = str(url) if url else "Unknown error"
-            error_msg = error_msg.replace("[", "(").replace("]", ")")
+            error_msg = _escape_rich_markup(str(url) if url else "Unknown error")
             console.print(f"[red]❌ Deployment failed: {error_msg}[/red]")
             return False
 
-        # ✅ Handle None URL
+        # Handle None URL
         if not url:
             url = f"https://{repo_name}.netlify.app"
             _debug_log(f"URL was None, using constructed URL: {url}")
@@ -520,7 +664,7 @@ def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name:
 
     except Exception as exc:
         logger.exception("Error deploying %s to Netlify", repo_name)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]❌ Netlify deployment error: {error_msg}[/red]")
         return False
 
@@ -531,32 +675,54 @@ def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name:
 
 def _load_env_vars(project_path: Path) -> Dict[str, str]:
     """
-    Load environment variables from a .env file if one exists.
+    Load environment variables from local env files, if any exist.
 
-    Note: For Render deployments, .env variables are loaded and passed to
-    the deploy function, but you may still need to configure them in the
-    Render dashboard for full functionality.
+    ✅ FIX #3: Checks a small set of common env filenames (.env, .env.local,
+    .env.production, .env.production.local) instead of only ".env", since
+    real projects commonly split config across these. Later files in
+    ENV_FILE_CANDIDATES override earlier ones, matching typical dotenv
+    precedence.
+
+    Important limitation (by design, not a bug): .env files are almost
+    always excluded via .gitignore, which means a freshly cloned repo
+    frequently won't have ANY of these files, even if the project needs
+    env vars to run. When that happens we say so explicitly rather than
+    silently reporting "0 env vars loaded" with no explanation, so users
+    aren't misled into thinking their secrets made it over automatically.
+    You may still need to configure env vars manually in the target
+    platform's dashboard.
     """
-    env_file = project_path / ".env"
     env_vars: Dict[str, str] = {}
+    found_any_file = False
 
-    if not env_file.exists():
-        return env_vars
+    for filename in ENV_FILE_CANDIDATES:
+        env_file = project_path / filename
+        if not env_file.exists():
+            continue
 
-    try:
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                env_vars[key.strip()] = value.strip().strip('"').strip("'")
+        found_any_file = True
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                file_vars = 0
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    env_vars[key.strip()] = value.strip().strip('"').strip("'")
+                    file_vars += 1
+            if file_vars:
+                console.print(f"[dim]📄 Loaded {file_vars} variable(s) from {filename}.[/dim]")
+        except Exception as exc:
+            error_msg = _escape_rich_markup(exc)
+            console.print(f"[yellow]⚠️ Could not read {filename}: {error_msg}[/yellow]")
 
-        if env_vars:
-            console.print(f"[dim]📄 Loaded {len(env_vars)} environment variables.[/dim]")
-    except Exception as exc:
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
-        console.print(f"[yellow]⚠️ Could not read .env file: {error_msg}[/yellow]")
+    if not found_any_file:
+        console.print(
+            "[dim]ℹ️ No .env file found in the cloned repo. This is expected if it's "
+            "listed in .gitignore (the common case) — configure env vars in the "
+            "target platform's dashboard if your app needs them.[/dim]"
+        )
 
     return env_vars
 
@@ -594,7 +760,7 @@ def _record_deployment_history(
         return deployment_record
     except Exception as exc:
         logger.exception("Error recording deployment history for %s", project_name)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[yellow]⚠️ Couldn't save to history: {error_msg}[/yellow]")
         return None
 
@@ -612,10 +778,10 @@ def _cleanup_temp_dir(project_path: Path) -> None:
             console.print("[dim]🧹 Cleaned up temporary files.[/dim]")
     except Exception as exc:
         logger.exception("Error cleaning up temp directory for %s", project_path)
-        error_msg = str(exc).replace("[", "(").replace("]", ")")
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[yellow]⚠️ Could not clean up: {error_msg}[/yellow]")
 
 
 def _debug_log(message: str) -> None:
     """Log a debug message to the console."""
-    console.print(f"[dim]🐛 {message}[/dim]")
+    console.print(f"[dim]🐛 {_escape_rich_markup(message)}[/dim]")

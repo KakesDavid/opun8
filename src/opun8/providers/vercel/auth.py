@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional, Dict, Callable
 from rich.console import Console
 from rich.prompt import Prompt
+from rich.panel import Panel
 from rich.table import Table
 
 console = Console()

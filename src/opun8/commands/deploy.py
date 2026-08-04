@@ -17,6 +17,12 @@ Supported Platforms:
     - Netlify (Static sites, JAMstack)
     - Render (Full-stack, Python, Node.js)
 
+✅ FIX: _deploy_github_repo() now lists user's repos and lets them select
+✅ FIX: Pagination support for large repo lists (n=next, p=previous)
+✅ FIX: Shows (private) tags on private repos
+✅ FIX: Proper GitHub auth check before listing repos
+✅ FIX: Pagination prompt now uses _safe_prompt_free() instead of _safe_prompt()
+
 Author: OPUN8 Team
 Version: 0.1.6
 """
@@ -26,6 +32,7 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import shutil
 import traceback
 import webbrowser
 from dataclasses import dataclass
@@ -43,8 +50,10 @@ from rich.markup import escape
 
 from opun8.auth import (
     get_github_token,
+    get_authenticated_user,
     is_authenticated,
     login_to_github,
+    list_github_repos,
 )
 from opun8.commands.badges import show_badge_notification
 from opun8.core.detector import ProjectInfo, detect_project
@@ -422,7 +431,7 @@ def deploy(
     except Exception as exc:
         _log_debug_exception("deploy() unexpected error", exc)
         msg.error(
-            f"Unexpected error: {exc}",
+            f"Unexpected error: {escape(str(exc))}",
             suggestion="Check the error above and try again.",
         )
         raise typer.Exit(1)
@@ -437,7 +446,7 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
     Show the 4-option deploy menu for a specific platform.
 
     ✅ FIX: Now uses ui.messages.deploy_platform_start() and deploy_platform_menu()
-    
+
     Options:
         1. Deploy Now
         2. Select Different Project
@@ -447,13 +456,13 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
     while True:
         # Show platform-specific welcome (from ui.messages)
         deploy_platform_start(platform.value)
-        
+
         # Show project summary
         _show_project_summary(project_info)
 
         # Show 4 options and get user choice (from ui.messages)
         choice = deploy_platform_menu()
-        
+
         # _safe_prompt raises Exit on cancel, so choice should never be None
         # but keep check for safety
         if choice is None:
@@ -468,6 +477,7 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
 
         elif choice == "2":
             # Select Different Project
+            previous_cwd = Path.cwd()
             if _browse_and_change_folder():
                 new_project = _detect_project()
                 if new_project:
@@ -475,8 +485,15 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
                     if new_project:
                         project_info = new_project
                         continue
+                    else:
+                        # Build failed in the new folder: don't keep showing
+                        # the stale summary for a project that no longer
+                        # matches the current directory.
+                        os.chdir(previous_cwd)
+                        continue
                 else:
                     console.print("[yellow]No project detected in the selected folder.[/yellow]")
+                    os.chdir(previous_cwd)
                     continue
             else:
                 console.print("[dim]Folder selection cancelled.[/dim]")
@@ -530,7 +547,7 @@ def _browse_and_change_folder() -> bool:
 def _ensure_github_auth() -> Optional[str]:
     """
     Ensure the user is authenticated with GitHub and return the token.
-    
+
     Returns:
         GitHub token if authenticated, None otherwise.
     """
@@ -559,13 +576,15 @@ def _ensure_github_auth() -> Optional[str]:
 def _deploy_github_repo(platform: Platform) -> None:
     """
     Clone and deploy a GitHub repository.
-    
-    ✅ FIX: Uses _safe_prompt_free() for free-text input.
+
+    ✅ FIX: Lists user's repos and lets them select one (like opun8 github)
+    ✅ FIX: Pagination support for large repo lists (n=next, p=previous)
+    ✅ FIX: Shows (private) tags on private repos
     """
     console.print()
     console.print(Panel(
         f"[bold cyan]{_sym('clone')} Deploy GitHub Repo[/bold cyan]\n"
-        f"[dim]{_emoji_or_empty('handshake')} Let's get a repo from GitHub and deploy it![/dim]",
+        f"[dim]{_emoji_or_empty('handshake')} Select a repository from your GitHub account to deploy![/dim]",
         border_style="cyan",
         padding=(1, 2),
         width=PANEL_WIDTH,
@@ -578,34 +597,106 @@ def _deploy_github_repo(platform: Platform) -> None:
         console.print("[yellow]GitHub authentication required for this feature.[/yellow]")
         return
 
-    # Step 2: Ask for GitHub repo URL
-    # ✅ FIX: Use _safe_prompt_free() for free-text input
-    repo_url = _safe_prompt_free(
-        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter GitHub repository URL (e.g., https://github.com/user/repo)",
-        default="",
-    )
-
-    if not repo_url or not repo_url.strip():
-        console.print("[yellow]No repository URL provided. Returning to menu.[/yellow]")
+    # Step 2: Get authenticated user
+    username = get_authenticated_user()
+    if not username:
+        console.print("[red]Could not get GitHub username.[/red]")
         return
 
-    repo_url = repo_url.strip()
+    # Step 3: List repositories
+    console.print("[dim]📡 Fetching your repositories...[/dim]")
+    repos = list_github_repos(github_token)
 
-    # Step 3: Ask for clone destination
-    default_dest = Path.cwd() / "cloned_repo"
-    # ✅ FIX: Use _safe_prompt_free() for free-text input
-    dest_path = _safe_prompt_free(
+    if not repos:
+        console.print("[yellow]No repositories found in your GitHub account.[/yellow]")
+        return
+
+    # Step 4: Display repos with pagination
+    console.print()
+    console.print(f"[bold]📁 Select a repository to deploy to {platform.value.capitalize()}:[/bold]")
+    console.print()
+
+    page = 0
+    page_size = 20
+    total_repos = len(repos)
+    selected_repo = None
+
+    while True:
+        start = page * page_size
+        end = min(start + page_size, total_repos)
+        page_repos = repos[start:end]
+
+        for i, repo in enumerate(page_repos, start + 1):
+            private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
+            console.print(f"  [bold cyan]{i:2}[/]  [white]{repo['name']}[/white] {private_tag}")
+
+        if end < total_repos:
+            console.print()
+            console.print(f"  [bold cyan]n[/]  [white]Next page[/white]  [dim]({end+1}-{min(end+page_size, total_repos)} of {total_repos})[/dim]")
+        if page > 0:
+            console.print(f"  [bold cyan]p[/]  [white]Previous page[/white]")
+
+        console.print()
+        console.print("  [bold cyan]0[/]  🔙  [white]Cancel[/white]")
+        console.print()
+
+        # ✅ FIX: Use _safe_prompt_free() for free-text input (n, p, numbers)
+        choice = _safe_prompt_free(
+            f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter repo number, 'n' for next, 'p' for previous",
+            default="0",
+        )
+
+        if choice is None or choice == "0":
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+        if choice.lower() == "n" and end < total_repos:
+            page += 1
+            continue
+        if choice.lower() == "p" and page > 0:
+            page -= 1
+            continue
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < total_repos:
+                selected_repo = repos[idx]
+                break
+            else:
+                console.print("[red]Invalid selection. Please try again.[/red]")
+                continue
+        else:
+            console.print("[red]Invalid input. Enter a number, 'n', or 'p'.[/red]")
+            continue
+
+    if selected_repo is None:
+        return
+
+    repo_name = selected_repo.get("name")
+    repo_url = selected_repo.get("clone_url") or f"https://github.com/{username}/{repo_name}"
+
+    # Step 5: Confirm selection
+    console.print()
+    console.print(f"[bold]Selected: [cyan]{repo_name}[/cyan][/bold]")
+    console.print(f"[dim]URL: {repo_url}[/dim]")
+    console.print()
+
+    if not _safe_confirm(f"{_emoji_or_empty('arrow')} Clone and deploy this repository?", default=True):
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    # Step 6: Clone destination path
+    default_dest = Path.cwd() / repo_name
+    dest_path_input = _safe_prompt_free(
         f"[bold cyan]{_emoji_or_empty('arrow')}[/] Clone destination path",
         default=str(default_dest),
     )
 
-    if not dest_path or not dest_path.strip():
+    if not dest_path_input or not dest_path_input.strip():
         console.print("[yellow]No destination provided. Returning to menu.[/yellow]")
         return
 
-    dest_path = dest_path.strip()
-
-    dest = Path(dest_path).expanduser()
+    dest = Path(dest_path_input.strip()).expanduser()
 
     # Warn before overwriting existing folder
     if dest.exists():
@@ -622,7 +713,19 @@ def _deploy_github_repo(platform: Platform) -> None:
             console.print("[dim]Cancelled.[/dim]")
             return
 
-    # Step 4: Clone the repo with GitHub token
+        # Actually make good on the "will be erased" promise before cloning.
+        try:
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        except Exception as exc:
+            console.print(
+                f"[red]{_sym('error')} Could not remove existing path: {escape(str(exc))}[/red]"
+            )
+            return
+
+    # Step 7: Clone the repo with GitHub token
     console.print()
     console.print(f"[dim]{_emoji_or_empty('clone')} Cloning repository...[/dim]")
 
@@ -640,25 +743,24 @@ def _deploy_github_repo(platform: Platform) -> None:
 
     console.print(f"[green]{_sym('success')} {escape(message)}[/green]")
 
-    # Step 5: Change to the cloned directory
+    # Step 8: Change to cloned directory
     cloned_path = dest.resolve()
     if cloned_path.exists() and cloned_path.is_dir():
         os.chdir(cloned_path)
         console.print(f"[dim]{_emoji_or_empty('folder')} Changed to: {escape(str(cloned_path))}[/dim]")
         console.print()
 
-        # Step 6: Detect the cloned project
+        # Step 9: Detect project
         project_info = _detect_project()
         if project_info is None:
             console.print("[yellow]No project detected in the cloned repository.[/yellow]")
             return
 
-        # Step 7: Build the cloned project
+        # Step 10: Build and deploy
         project_info = _build_project(project_info)
         if project_info is None:
             return
 
-        # Step 8: Deploy, passing the repo URL through
         _deploy_to_platform(project_info, platform, repo_url=repo_url)
     else:
         console.print(f"[red]{_sym('error')} Could not find cloned directory: {escape(str(cloned_path))}[/red]")
@@ -704,7 +806,6 @@ def _deploy_to_platform(
             return False
 
     # Execute deployment
-    # ✅ FIX: repo_url only passed to Render (Vercel/Netlify don't use it)
     if platform == Platform.VERCEL:
         _handle_vercel_deploy(project_info)
     elif platform == Platform.NETLIFY:
@@ -734,7 +835,7 @@ def _detect_project() -> Optional[ProjectInfo]:
     except Exception as exc:
         _log_debug_exception("_detect_project() unexpected error", exc)
         msg.error(
-            f"Unexpected error while detecting project: {exc}",
+            f"Unexpected error while detecting project: {escape(str(exc))}",
             suggestion="Run `opun8 detect` to see more details.",
         )
         return None
@@ -862,7 +963,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
             ))
         else:
             msg.error(
-                url or "Deployment failed.",
+                escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
 
@@ -882,7 +983,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
     except Exception as exc:
         _log_debug_exception("_handle_vercel_deploy() unexpected error", exc)
         msg.error(
-            f"Deployment failed: {exc}",
+            f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
 
@@ -964,7 +1065,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
             ))
         else:
             msg.error(
-                url or "Deployment failed.",
+                escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
 
@@ -984,7 +1085,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
     except Exception as exc:
         _log_debug_exception("_handle_netlify_deploy() unexpected error", exc)
         msg.error(
-            f"Deployment failed: {exc}",
+            f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
 
@@ -1077,7 +1178,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
             ))
         else:
             msg.error(
-                url or "Deployment failed.",
+                escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
 
@@ -1097,7 +1198,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
     except Exception as exc:
         _log_debug_exception("_handle_render_deploy() unexpected error", exc)
         msg.error(
-            f"Deployment failed: {exc}",
+            f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
 
@@ -1225,7 +1326,10 @@ def _rename_url_flow(result: SuccessResult) -> None:
         console.print("[dim]Please rename manually in the platform dashboard.[/dim]")
         return
 
-    current_name = result.url.split('.')[0] if '.' in result.url else result.url
+    # Strip any scheme before slicing on '.' so "https://foo.vercel.app"
+    # yields "foo", not "https://foo".
+    url_without_scheme = re.sub(r'^https?://', '', result.url)
+    current_name = url_without_scheme.split('.')[0] if '.' in url_without_scheme else url_without_scheme
     max_attempts = 3
     attempt = 0
 

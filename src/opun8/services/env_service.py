@@ -17,8 +17,13 @@ Features:
     - Supports selecting specific vars to include
     - Supports target environments (production, preview, development)
 
+✅ FIX: Added clean separation before env var display (rule + panel)
+✅ FIX: Clear screen before showing env var table
+✅ FIX: Consistent panel styling with the rest of the UI
+✅ FIX: No more overlapping with GitHub menu text
+
 Author: OPUN8 Team
-Version: 0.2.1
+Version: 0.1.6
 """
 
 import logging
@@ -676,7 +681,7 @@ def merge_env_vars(
 
 
 # =============================================================================
-# INTERACTIVE PROMPTS
+# INTERACTIVE PROMPTS  ✅ FIXED
 # =============================================================================
 
 def display_detected_vars(
@@ -686,7 +691,8 @@ def display_detected_vars(
     """
     Display detected environment variables to the user with interactive selection.
 
-    Allows user to toggle selection via checkbox-style input.
+    ✅ FIX: Clean separation from other UI elements (rule + panel)
+    ✅ FIX: Consistent styling with the rest of the UI
 
     Args:
         detected_vars: Dictionary of detected vars with metadata
@@ -704,9 +710,19 @@ def display_detected_vars(
 
     while True:
         console.clear()
+        
+        # ✅ FIX: Clean separation with rule and panel
         console.print()
-        console.print("[bold cyan]🔐 Environment Variables Detected[/bold cyan]")
-        console.print("[dim]Select variables to include. Toggle by number or use 'a' for all, 'n' for none.[/dim]")
+        console.rule("[bold cyan]🔐 Environment Variables[/bold cyan]")
+        console.print()
+        
+        console.print(Panel(
+            "[bold]Select environment variables to include.[/bold]\n"
+            "[dim]Toggle by number, or use 'a' for all, 'n' for none.[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+            width=70,
+        ))
         console.print()
 
         table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
@@ -822,8 +838,13 @@ def prompt_env_var_values(
         existing_values = {}
 
     console.print()
-    console.print("[bold cyan]✏️ Enter Environment Variable Values[/bold cyan]")
-    console.print("[dim]Leave blank to skip (use existing value or skip entirely)[/dim]")
+    console.print(Panel(
+        "[bold cyan]✏️ Enter Environment Variable Values[/bold cyan]\n"
+        "[dim]Leave blank to skip (use existing value or skip entirely)[/dim]",
+        border_style="cyan",
+        padding=(1, 2),
+        width=70,
+    ))
     console.print()
 
     for var_name in selected_vars:

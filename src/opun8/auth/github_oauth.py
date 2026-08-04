@@ -4,6 +4,7 @@ Now uses the Opun8 API backend instead of local .env file.
 
 ✅ FIX: UI has been removed from this file. All UI is now handled by
 `ui/messages.py` -> `github_auth_start()` to avoid duplicate flows.
+✅ FIX: Token exchange now sends code as JSON body (not query params)
 """
 
 import os
@@ -205,21 +206,31 @@ def login_to_github() -> Optional[str]:
 
 
 def exchange_github_code_for_token(code: str) -> Optional[str]:
-    """Exchange code for token using your API (not .env)"""
+    """
+    Exchange code for token using your API (not .env)
+    
+    ✅ FIX: Sends code as JSON body, not query params.
+    """
     try:
         if not code:
             console.print("[red]❌ No authorization code received.[/red]")
             return None
 
-        # Call your API to exchange the code
+        # ✅ FIX: Send code as JSON body, not query params
         response = requests.post(
             f"{API_BASE_URL}/github/exchange",
-            params={"code": code},
+            json={"code": code},
+            headers={"Content-Type": "application/json"},
             timeout=30,
         )
 
         if response.status_code != 200:
-            error_msg = response.json().get("detail", "Unknown error")
+            try:
+                error_data = response.json()
+                error_msg = error_data.get("detail", error_data.get("message", "Unknown error"))
+            except json.JSONDecodeError:
+                error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
+            
             console.print(f"[red]❌ Token exchange failed: {error_msg}[/red]")
             return None
 
@@ -237,18 +248,20 @@ def exchange_github_code_for_token(code: str) -> Optional[str]:
             if user_response.status_code == 200:
                 user = user_response.json()
                 save_github_token(token, user)
-                # ✅ FIX: No success message here — UI handles it
             else:
                 save_github_token(token, {"login": "Unknown"})
 
             return token
         else:
-            console.print(f"[red]❌ No access token in response: {data}[/red]")
+            console.print(f"[red]❌ No access token in response.[/red]")
             return None
 
     except requests.exceptions.ConnectionError:
         console.print(f"[red]❌ Could not connect to Opun8 API at {API_BASE_URL}[/red]")
         console.print("[dim]Make sure the API is running or check OPUN8_API_URL[/dim]")
+        return None
+    except requests.exceptions.Timeout:
+        console.print(f"[red]❌ Request to Opun8 API timed out.[/red]")
         return None
     except Exception as e:
         console.print(f"[red]❌ Error exchanging code: {e}[/red]")

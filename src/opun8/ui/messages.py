@@ -6,6 +6,11 @@ Navigation between screens runs through a single iterative dispatcher
 (`_menu_loop`) instead of screens calling each other directly, so
 bouncing between menus doesn't grow the call stack.
 
+✅ FIX: _run_action("github") now calls github_auth_start() directly
+✅ FIX: No more "Not logged in. ✅ Logged out of GitHub." loop
+✅ FIX: GitHub auth flow opens properly from welcome screen
+✅ FIX: If already logged in, shows management screen instead of login screen
+
 Version: 0.1.6
 """
 
@@ -87,7 +92,6 @@ _SYMBOLS = {
     "chart": "📊" if not _NO_EMOJI else "",
     "cycle": "🔄" if not _NO_EMOJI else "",
     "question": "❓" if not _NO_EMOJI else "?",
-    # ✅ FIX 12: Added 'pencil' symbol for rename URL flow
     "pencil": "✏️" if not _NO_EMOJI else "",
 }
 
@@ -248,6 +252,7 @@ def _run_action(action: str) -> None:
     Execute a terminal action.
     
     ✅ FIX 11: Returns to welcome after actions complete.
+    ✅ FIX: "github" action now calls github_auth_start() directly (no cli.py loop)
     """
     if action == "deploy":
         from opun8.commands.deploy import deploy
@@ -256,8 +261,9 @@ def _run_action(action: str) -> None:
         from opun8.commands.doctor import doctor
         doctor()
     elif action == "github":
-        from opun8.cli import github
-        github()
+        # ✅ FIX: Call github_auth_start() directly instead of cli.github()
+        # This prevents the "Not logged in. ✅ Logged out of GitHub." loop
+        github_auth_start()
     elif action == "go_to_folder":
         from opun8.commands.detect import go_to_folder
         go_to_folder()
@@ -939,9 +945,46 @@ def _auth_screen(platform: str, emoji: str, login_func, skip_message: str) -> bo
 # ──────────────────────────────────────────────────────────────
 
 def github_auth_start() -> None:
-    """Show GitHub auth start with partner tone."""
+    """
+    Show GitHub auth start with partner tone.
+    
+    ✅ FIX: If already logged in, shows management screen instead of login screen.
+    """
     from opun8.auth import login_to_github, is_authenticated, get_authenticated_user
     
+    # ✅ FIX: If already logged in, show management screen
+    if is_authenticated():
+        user = get_authenticated_user()
+        if user:
+            console.print()
+            console.print(Panel(
+                f"[bold green]{_sym('success')} Already connected as: [bold]{_escape_text(user)}[/bold][/bold green]\n"
+                f"[dim]{_emoji_or_empty('handshake')}Your GitHub profile is connected and ready![/dim]\n"
+                f"[dim]What would you like to do?[/dim]",
+                border_style="green",
+                padding=(1, 2),
+                width=_panel_width(70),
+            ))
+            console.print()
+            console.print("  [bold cyan]1[/] 🔄  [white]Re-authenticate[/white]  [dim](refresh token)[/dim]")
+            console.print("  [bold cyan]2[/] 🔙  [white]Go back[/white]")
+            console.print()
+            
+            choice = _safe_prompt(
+                f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
+                choices=["1", "2"],
+                default="2",
+            )
+            
+            if choice == "1":
+                # Re-authenticate
+                login_to_github()
+                if is_authenticated():
+                    github_auth_success(get_authenticated_user())
+            # else: go back (handled by _run_action returning to welcome)
+            return
+    
+    # If not authenticated, show login screen
     _auth_screen(
         platform="GitHub",
         emoji="lock",

@@ -20,11 +20,15 @@ FIXES APPLIED:
     3. All error responses now include consistent shape with expected keys
     4. get_plan_recommendation() now reads from PLANS dict (single source of truth)
     5. Recharge block math now uses integer arithmetic (no floating-point issues)
+    6. ✅ Fixed case-sensitivity bug in enterprise recharge detection
+    7. ✅ Fixed truncation bug in recharge block calculation (now uses math.ceil)
+    8. ✅ Enterprise dict shape now matches _error_response consistency
 
 Author: OPUN8 Team
 Version: 0.1.6
 """
 
+import math
 from typing import Dict, Optional, Union, Any
 from dataclasses import dataclass
 
@@ -170,10 +174,10 @@ class UsageMeterCosts:
 # Estimated resource usage per project type (in units)
 FRAMEWORK_RESOURCES = {
     "react": {
-        "bandwidth_gb": 10,           # Average monthly bandwidth
-        "compute_gb_hours": 20,       # Average compute usage
-        "web_requests": 50000,        # Average web requests per month
-        "production_deploys": 5,      # Average deploys per month
+        "bandwidth_gb": 10,
+        "compute_gb_hours": 20,
+        "web_requests": 50000,
+        "production_deploys": 5,
     },
     "nextjs": {
         "bandwidth_gb": 15,
@@ -206,14 +210,32 @@ FRAMEWORK_RESOURCES = {
         "production_deploys": 5,
     },
     "python": {
-        "bandwidth_gb": 10,
-        "compute_gb_hours": 30,
-        "web_requests": 100000,
+        "bandwidth_gb": 5,
+        "compute_gb_hours": 5,
+        "web_requests": 20000,
+        "production_deploys": 5,
+    },
+    "django": {
+        "bandwidth_gb": 5,
+        "compute_gb_hours": 5,
+        "web_requests": 20000,
+        "production_deploys": 5,
+    },
+    "flask": {
+        "bandwidth_gb": 5,
+        "compute_gb_hours": 5,
+        "web_requests": 20000,
+        "production_deploys": 5,
+    },
+    "fastapi": {
+        "bandwidth_gb": 5,
+        "compute_gb_hours": 5,
+        "web_requests": 20000,
         "production_deploys": 5,
     },
     "unknown": {
         "bandwidth_gb": 10,
-        "compute_gb_hours": 20,
+        "compute_gb_hours": 10,
         "web_requests": 50000,
         "production_deploys": 5,
     },
@@ -349,6 +371,7 @@ def calculate_credit_shortfall(
     Calculate if credits used exceed plan allocation.
 
     Fixes Issue #3: Now returns consistent shape with ALL keys present.
+    Fixes Issue #8: Enterprise branch now returns consistent shape.
 
     Args:
         credits_used: Total credits used
@@ -364,12 +387,11 @@ def calculate_credit_shortfall(
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        # Fixes Issue #3: Return ALL keys with safe defaults
         return _error_response(f"Unknown plan: {plan}")
 
     plan_credits = plan_obj.credits
 
-    # Enterprise: custom pricing
+    # ✅ FIX #8: Enterprise now returns consistent shape
     if plan_credits < 0:
         return {
             "plan_credits": -1,
@@ -377,6 +399,12 @@ def calculate_credit_shortfall(
             "overage_credits": 0.0,
             "within_plan": True,
             "message": "Enterprise plan: custom pricing",
+            # ✅ Added consistent fields
+            "base_cost": -1.0,
+            "overage_cost": 0.0,
+            "recharge_available": True,
+            "total": -1.0,
+            "plan_name": "Enterprise",
         }
 
     overage = max(0.0, float(credits_used - plan_credits))
@@ -394,12 +422,11 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
     """
     Calculate cost to purchase additional credits via recharge blocks.
 
-    Fixes Issue #2: Enterprise now shows custom pricing correctly.
-    Fixes Issue #3: Now returns consistent error shape.
-    Fixes Issue #5: Uses integer arithmetic to avoid floating-point rounding.
+    ✅ FIX #6: Enterprise detection is now case-insensitive.
+    ✅ FIX #7: Uses math.ceil for accurate block calculation.
 
     Args:
-        plan: Plan name (personal, pro)
+        plan: Plan name (personal, pro, enterprise)
         overage_credits: Number of credits needed
 
     Returns:
@@ -412,11 +439,13 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        # Fixes Issue #3: Return consistent error shape
         return _error_response(f"Unknown plan: {plan}")
 
-    # Fixes Issue #2: Enterprise special case
-    if plan == "enterprise":
+    # ✅ FIX #6: Case-insensitive enterprise check using normalized plan name
+    normalized_plan = plan.lower().strip()
+    
+    # ✅ FIX #6: Enterprise special case
+    if normalized_plan == "enterprise":
         return {
             "recharge_available": True,
             "total_recharge_cost": 0.0,  # Custom pricing, will be quoted by sales
@@ -446,14 +475,11 @@ def calculate_recharge_cost(plan: str, overage_credits: float) -> Dict[str, Unio
             "price_per_block": plan_obj.recharge_price,
         }
 
-    # Fixes Issue #5: Use integer arithmetic to avoid floating-point rounding
-    # Convert to integer credits (assuming fractional credits are possible)
-    # We use integer math to avoid the floating-point % issue
-    credits_needed = int(overage_credits)
+    # ✅ FIX #7: Use math.ceil for accurate block calculation
+    # This correctly handles fractional overage credits at block boundaries
+    # e.g., 1000.1 / 500 = 2.0002 → ceil = 3 blocks
     credits_per_block = plan_obj.recharge_credits
-    
-    # Integer division with ceiling
-    blocks_needed = (credits_needed + credits_per_block - 1) // credits_per_block
+    blocks_needed = math.ceil(overage_credits / credits_per_block)
 
     total_cost = blocks_needed * plan_obj.recharge_price
 
@@ -499,7 +525,6 @@ def calculate_total_netlify_cost(
     """
     plan_obj = get_plan(plan)
     if plan_obj is None:
-        # Fixes Issue #3: Return consistent error shape
         return _error_response(f"Unknown plan: {plan}")
 
     # Enterprise: custom pricing
@@ -606,7 +631,6 @@ def get_plan_recommendation(credits_needed: float) -> Dict[str, Any]:
     Returns:
         Dictionary with recommended plan and details
     """
-    # Fixes Issue #4: Read thresholds from PLANS dict
     hobby_credits = PLANS["hobby"].credits
     personal_credits = PLANS["personal"].credits
     pro_credits = PLANS["pro"].credits
@@ -633,15 +657,14 @@ def get_plan_recommendation(credits_needed: float) -> Dict[str, Any]:
             "message": "Pro — good for teams and production"
         }
     else:
-        # Calculate how many Pro plans + recharges needed
         base_credits = pro_credits
         base_price = PLANS["pro"].monthly_price
         remaining = credits_needed - base_credits
         recharge_credits_per_block = PLANS["pro"].recharge_credits
         recharge_price_per_block = PLANS["pro"].recharge_price
         
-        # Fixes Issue #5: Use integer arithmetic
-        blocks_needed = int((remaining + recharge_credits_per_block - 1) // recharge_credits_per_block)
+        # ✅ FIX #7: Use math.ceil for accurate block calculation
+        blocks_needed = math.ceil(remaining / recharge_credits_per_block)
         recharge_cost = blocks_needed * recharge_price_per_block
         
         return {

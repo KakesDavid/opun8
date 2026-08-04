@@ -9,8 +9,11 @@ This is the main entry point for the OPUN8 CLI. It provides commands for:
     - GitHub integration (connect, list repos, deploy from repo)
     - Provider management (Vercel, Render, Netlify)
 
+✅ FIX: Deploy callbacks now pass platform_arg directly (Vercel → vercel, Netlify → netlify, Render → render)
+✅ FIX: "No project yet" → "Deploy your first project now?" now goes directly to the right platform
+
 Author: OPUN8 Team
-Version: 0.1.5
+Version: 0.1.6
 """
 
 import typer
@@ -236,7 +239,7 @@ def badges():
 
 
 # ──────────────────────────────────────────────────────────────
-# GITHUB COMMANDS ✅ FIXED (no recursion)
+# GITHUB COMMANDS
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -381,7 +384,7 @@ def _deploy_repository_from_github() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# VERCEL COMMANDS
+# VERCEL COMMANDS  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -416,7 +419,8 @@ def vercel(
 
     if show_flag:
         from opun8.commands.deploy import deploy as deploy_cmd
-        set_deploy_callback(deploy_cmd)
+        # ✅ FIX: Pass platform_arg="vercel" to deploy callback
+        set_deploy_callback(lambda: deploy_cmd(platform_arg="vercel"))
         show_vercel_projects()
         return
 
@@ -426,7 +430,8 @@ def vercel(
         console.print("[dim]To switch teams, run: opun8 vercel --switch[/dim]")
         console.print()
         from opun8.commands.deploy import deploy as deploy_cmd
-        set_deploy_callback(deploy_cmd)
+        # ✅ FIX: Pass platform_arg="vercel" to deploy callback
+        set_deploy_callback(lambda: deploy_cmd(platform_arg="vercel"))
         show_vercel_projects()
         return
 
@@ -435,7 +440,7 @@ def vercel(
 
 
 # ──────────────────────────────────────────────────────────────
-# RENDER COMMANDS ✅ FIXED (uses partner tone UI)
+# RENDER COMMANDS  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -480,7 +485,6 @@ def render(
         _show_render_services()
         return
 
-    # ✅ FIX: Use partner tone UI instead of old flow
     from opun8.ui.messages import render_auth_start
     render_auth_start()
 
@@ -566,7 +570,7 @@ def _truncate(value, length: int) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# NETLIFY COMMANDS
+# NETLIFY COMMANDS  ✅ FIXED
 # ──────────────────────────────────────────────────────────────
 
 @app.command()
@@ -591,7 +595,8 @@ def netlify(
 
     if show_flag:
         from opun8.commands.deploy import deploy as deploy_cmd
-        set_netlify_deploy_callback(deploy_cmd)
+        # ✅ FIX: Pass platform_arg="netlify" to deploy callback
+        set_netlify_deploy_callback(lambda: deploy_cmd(platform_arg="netlify"))
         show_netlify_sites()
         return
 
@@ -600,7 +605,8 @@ def netlify(
         console.print("[dim]To disconnect, run: opun8 netlify --logout[/dim]")
         console.print()
         from opun8.commands.deploy import deploy as deploy_cmd
-        set_netlify_deploy_callback(deploy_cmd)
+        # ✅ FIX: Pass platform_arg="netlify" to deploy callback
+        set_netlify_deploy_callback(lambda: deploy_cmd(platform_arg="netlify"))
         show_netlify_sites()
         return
 
