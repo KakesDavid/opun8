@@ -17,12 +17,6 @@ Supported Platforms:
     - Netlify (Static sites, JAMstack)
     - Render (Full-stack, Python, Node.js)
 
-✅ FIX: _deploy_github_repo() now lists user's repos and lets them select
-✅ FIX: Pagination support for large repo lists (n=next, p=previous)
-✅ FIX: Shows (private) tags on private repos
-✅ FIX: Proper GitHub auth check before listing repos
-✅ FIX: Pagination prompt now uses _safe_prompt_free() instead of _safe_prompt()
-
 Author: OPUN8 Team
 Version: 0.1.6
 """
@@ -33,6 +27,7 @@ import datetime
 import os
 import re
 import shutil
+import tempfile
 import traceback
 import webbrowser
 from dataclasses import dataclass
@@ -45,7 +40,6 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich import box
 from rich.markup import escape
 
 from opun8.auth import (
@@ -175,6 +169,12 @@ def _log_debug_exception(context: str, exc: Exception) -> None:
 
     if os.environ.get("OPUN8_DEBUG"):
         console.print_exception()
+
+
+def _debug_log(message: str) -> None:
+    """Log debug message."""
+    if os.environ.get("OPUN8_DEBUG"):
+        console.print(f"[dim]🐛 {message}[/dim]")
 
 
 # =============================================================================
@@ -445,8 +445,6 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
     """
     Show the 4-option deploy menu for a specific platform.
 
-    ✅ FIX: Now uses ui.messages.deploy_platform_start() and deploy_platform_menu()
-
     Options:
         1. Deploy Now
         2. Select Different Project
@@ -463,8 +461,6 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
         # Show 4 options and get user choice (from ui.messages)
         choice = deploy_platform_menu()
 
-        # _safe_prompt raises Exit on cancel, so choice should never be None
-        # but keep check for safety
         if choice is None:
             msg.goodbye()
             raise typer.Exit()
@@ -472,7 +468,6 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
         if choice == "1":
             # Deploy Now
             _deploy_to_platform(project_info, platform)
-            # After deployment attempt, return to menu
             continue
 
         elif choice == "2":
@@ -486,9 +481,6 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
                         project_info = new_project
                         continue
                     else:
-                        # Build failed in the new folder: don't keep showing
-                        # the stale summary for a project that no longer
-                        # matches the current directory.
                         os.chdir(previous_cwd)
                         continue
                 else:
@@ -500,8 +492,10 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
                 continue
 
         elif choice == "3":
-            # Deploy GitHub Repo
-            _deploy_github_repo(platform)
+            # ✅ FIX: Deploy GitHub Repo — returns ProjectInfo
+            new_project = _deploy_github_repo(platform)
+            if new_project:
+                project_info = new_project
             continue
 
         else:
@@ -573,13 +567,22 @@ def _ensure_github_auth() -> Optional[str]:
     return token
 
 
-def _deploy_github_repo(platform: Platform) -> None:
+# =============================================================================
+# DEPLOY GITHUB REPO — WITH TEMP DIRECTORY  ✅ FIXED
+# =============================================================================
+
+def _deploy_github_repo(platform: Platform) -> Optional[ProjectInfo]:
     """
     Clone and deploy a GitHub repository.
-
-    ✅ FIX: Lists user's repos and lets them select one (like opun8 github)
-    ✅ FIX: Pagination support for large repo lists (n=next, p=previous)
-    ✅ FIX: Shows (private) tags on private repos
+    
+    ✅ FIX: Uses temporary directory for cloning (no leftover folders)
+    ✅ FIX: Clean up temp directory after deployment
+    ✅ FIX: Clean up temp directory on all error paths
+    ✅ FIX: Original working directory is restored before cleanup
+    ✅ FIX: Returns ProjectInfo so menu can update
+    
+    Returns:
+        ProjectInfo of the cloned project if successful, None otherwise.
     """
     console.print()
     console.print(Panel(
@@ -595,13 +598,13 @@ def _deploy_github_repo(platform: Platform) -> None:
     github_token = _ensure_github_auth()
     if github_token is None:
         console.print("[yellow]GitHub authentication required for this feature.[/yellow]")
-        return
+        return None
 
     # Step 2: Get authenticated user
     username = get_authenticated_user()
     if not username:
         console.print("[red]Could not get GitHub username.[/red]")
-        return
+        return None
 
     # Step 3: List repositories
     console.print("[dim]📡 Fetching your repositories...[/dim]")
@@ -609,7 +612,7 @@ def _deploy_github_repo(platform: Platform) -> None:
 
     if not repos:
         console.print("[yellow]No repositories found in your GitHub account.[/yellow]")
-        return
+        return None
 
     # Step 4: Display repos with pagination
     console.print()
@@ -640,7 +643,6 @@ def _deploy_github_repo(platform: Platform) -> None:
         console.print("  [bold cyan]0[/]  🔙  [white]Cancel[/white]")
         console.print()
 
-        # ✅ FIX: Use _safe_prompt_free() for free-text input (n, p, numbers)
         choice = _safe_prompt_free(
             f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter repo number, 'n' for next, 'p' for previous",
             default="0",
@@ -648,7 +650,7 @@ def _deploy_github_repo(platform: Platform) -> None:
 
         if choice is None or choice == "0":
             console.print("[dim]Cancelled.[/dim]")
-            return
+            return None
 
         if choice.lower() == "n" and end < total_repos:
             page += 1
@@ -670,7 +672,7 @@ def _deploy_github_repo(platform: Platform) -> None:
             continue
 
     if selected_repo is None:
-        return
+        return None
 
     repo_name = selected_repo.get("name")
     repo_url = selected_repo.get("clone_url") or f"https://github.com/{username}/{repo_name}"
@@ -683,10 +685,16 @@ def _deploy_github_repo(platform: Platform) -> None:
 
     if not _safe_confirm(f"{_emoji_or_empty('arrow')} Clone and deploy this repository?", default=True):
         console.print("[dim]Cancelled.[/dim]")
-        return
+        return None
+
+    # ✅ FIX: Save original directory before any chdir
+    previous_cwd = Path.cwd()
+    
+    # ✅ FIX: Use temporary directory for cloning
+    temp_dir = Path(tempfile.mkdtemp(prefix="opun8_clone_"))
+    default_dest = temp_dir / repo_name
 
     # Step 6: Clone destination path
-    default_dest = Path.cwd() / repo_name
     dest_path_input = _safe_prompt_free(
         f"[bold cyan]{_emoji_or_empty('arrow')}[/] Clone destination path",
         default=str(default_dest),
@@ -694,7 +702,9 @@ def _deploy_github_repo(platform: Platform) -> None:
 
     if not dest_path_input or not dest_path_input.strip():
         console.print("[yellow]No destination provided. Returning to menu.[/yellow]")
-        return
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        os.chdir(previous_cwd)
+        return None
 
     dest = Path(dest_path_input.strip()).expanduser()
 
@@ -711,19 +721,20 @@ def _deploy_github_repo(platform: Platform) -> None:
         )
         if confirm is None or not confirm:
             console.print("[dim]Cancelled.[/dim]")
-            return
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            os.chdir(previous_cwd)
+            return None
 
-        # Actually make good on the "will be erased" promise before cloning.
         try:
             if dest.is_dir() and not dest.is_symlink():
                 shutil.rmtree(dest)
             else:
                 dest.unlink()
         except Exception as exc:
-            console.print(
-                f"[red]{_sym('error')} Could not remove existing path: {escape(str(exc))}[/red]"
-            )
-            return
+            console.print(f"[red]{_sym('error')} Could not remove existing path: {escape(str(exc))}[/red]")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            os.chdir(previous_cwd)
+            return None
 
     # Step 7: Clone the repo with GitHub token
     console.print()
@@ -739,7 +750,9 @@ def _deploy_github_repo(platform: Platform) -> None:
 
     if not success:
         console.print(f"[red]{_sym('error')} Failed to clone: {escape(message)}[/red]")
-        return
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        os.chdir(previous_cwd)
+        return None
 
     console.print(f"[green]{_sym('success')} {escape(message)}[/green]")
 
@@ -754,16 +767,37 @@ def _deploy_github_repo(platform: Platform) -> None:
         project_info = _detect_project()
         if project_info is None:
             console.print("[yellow]No project detected in the cloned repository.[/yellow]")
-            return
+            os.chdir(previous_cwd)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
 
         # Step 10: Build and deploy
         project_info = _build_project(project_info)
         if project_info is None:
-            return
+            os.chdir(previous_cwd)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
 
+        # ✅ Pass project_info to deployment
         _deploy_to_platform(project_info, platform, repo_url=repo_url)
+
+        # ✅ Restore original directory BEFORE cleanup
+        os.chdir(previous_cwd)
+        
+        # ✅ Clean up temp directory after deployment
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            console.print("[dim]🧹 Cleaned up temporary files.[/dim]")
+        except Exception as exc:
+            _debug_log(f"Failed to clean up temp dir: {exc}")
+        
+        # ✅ Return the project info so the menu can update
+        return project_info
     else:
         console.print(f"[red]{_sym('error')} Could not find cloned directory: {escape(str(cloned_path))}[/red]")
+        os.chdir(previous_cwd)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return None
 
 
 def _deploy_to_platform(
@@ -775,8 +809,10 @@ def _deploy_to_platform(
     Show the cost estimate and deploy the project to the specified platform
     if the user confirms.
 
+    ✅ FIX: Now propagates success/failure from platform handlers.
+
     Returns:
-        True if a deployment attempt was made; False if the user backed out.
+        True if deployment succeeded, False if it failed or was cancelled.
     """
     # Show cost estimate
     estimator = get_cost_estimator(project_info)
@@ -807,13 +843,13 @@ def _deploy_to_platform(
 
     # Execute deployment
     if platform == Platform.VERCEL:
-        _handle_vercel_deploy(project_info)
+        return _handle_vercel_deploy(project_info)
     elif platform == Platform.NETLIFY:
-        _handle_netlify_deploy(project_info)
+        return _handle_netlify_deploy(project_info)
     elif platform == Platform.RENDER:
-        _handle_render_deploy(project_info, repo_url)
-
-    return True
+        return _handle_render_deploy(project_info, repo_url)
+    
+    return False
 
 
 # =============================================================================
@@ -894,7 +930,6 @@ def _ask_platform() -> Optional[Platform]:
         default="1",
     )
 
-    # _safe_prompt raises Exit on cancel, so choice should never be None
     if choice is None:
         return None
 
@@ -902,10 +937,10 @@ def _ask_platform() -> Optional[Platform]:
 
 
 # =============================================================================
-# VERCEL DEPLOYMENT
+# VERCEL DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
+def _handle_vercel_deploy(project_info: ProjectInfo) -> bool:
     """Deploy the project to Vercel."""
     try:
         console.print()
@@ -918,7 +953,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
         console.print()
 
         if not _ensure_vercel_auth():
-            return
+            return False
 
         token = get_vercel_token()
         if not token:
@@ -926,7 +961,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
                 "No Vercel token found.",
                 suggestion="Run `opun8 vercel` to connect.",
             )
-            return
+            return False
 
         team_id = (get_vercel_scope() or {}).get("team_id")
         project_path = Path.cwd()
@@ -961,21 +996,24 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
                 project_id=project_id,
                 platform=Platform.VERCEL,
             ))
+            return True
         else:
             msg.error(
                 escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
+            return False
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]{_sym('warning')} Vercel deployment cancelled.[/yellow]")
-        return
+        return False
 
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+        return False
 
     except typer.Exit:
         raise
@@ -986,6 +1024,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> None:
             f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
+        return False
 
 
 def _ensure_vercel_auth() -> bool:
@@ -1007,10 +1046,10 @@ def _ensure_vercel_auth() -> bool:
 
 
 # =============================================================================
-# NETLIFY DEPLOYMENT
+# NETLIFY DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
+def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
     """Deploy the project to Netlify."""
     try:
         console.print()
@@ -1023,7 +1062,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
         console.print()
 
         if not _ensure_netlify_auth():
-            return
+            return False
 
         token = get_netlify_token()
         if not token:
@@ -1031,7 +1070,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
                 "No Netlify token found.",
                 suggestion="Run `opun8 netlify` to connect.",
             )
-            return
+            return False
 
         project_path = Path.cwd()
         site_name = project_info.metadata.get("name", project_path.name)
@@ -1063,21 +1102,24 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
                 project_id=site_id,
                 platform=Platform.NETLIFY,
             ))
+            return True
         else:
             msg.error(
                 escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
+            return False
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]{_sym('warning')} Netlify deployment cancelled.[/yellow]")
-        return
+        return False
 
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+        return False
 
     except typer.Exit:
         raise
@@ -1088,6 +1130,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> None:
             f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
+        return False
 
 
 def _ensure_netlify_auth() -> bool:
@@ -1109,10 +1152,10 @@ def _ensure_netlify_auth() -> bool:
 
 
 # =============================================================================
-# RENDER DEPLOYMENT
+# RENDER DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = None) -> None:
+def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = None) -> bool:
     """Deploy the project to Render."""
     try:
         console.print()
@@ -1125,7 +1168,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
         console.print()
 
         if not _ensure_render_auth():
-            return
+            return False
 
         token = get_render_token()
         if not token:
@@ -1133,7 +1176,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
                 "No Render token found.",
                 suggestion="Run `opun8 render` to connect.",
             )
-            return
+            return False
 
         owner_id = get_render_owner_id()
         if not owner_id:
@@ -1176,21 +1219,24 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
                 project_id=service_id,
                 platform=Platform.RENDER,
             ))
+            return True
         else:
             msg.error(
                 escape(url) if url else "Deployment failed.",
                 suggestion="Check your project for build errors and try again.",
             )
+            return False
 
     except KeyboardInterrupt:
         console.print(f"\n[yellow]{_sym('warning')} Render deployment cancelled.[/yellow]")
-        return
+        return False
 
     except TimeoutError:
         msg.error(
             "Deployment timed out.",
             suggestion="Your project may be large or complex. Try again later.",
         )
+        return False
 
     except typer.Exit:
         raise
@@ -1201,6 +1247,7 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
             f"Deployment failed: {escape(str(exc))}",
             suggestion="Check your internet connection and try again.",
         )
+        return False
 
 
 def _ensure_render_auth() -> bool:
@@ -1326,8 +1373,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
         console.print("[dim]Please rename manually in the platform dashboard.[/dim]")
         return
 
-    # Strip any scheme before slicing on '.' so "https://foo.vercel.app"
-    # yields "foo", not "https://foo".
     url_without_scheme = re.sub(r'^https?://', '', result.url)
     current_name = url_without_scheme.split('.')[0] if '.' in url_without_scheme else url_without_scheme
     max_attempts = 3
@@ -1344,7 +1389,6 @@ def _rename_url_flow(result: SuccessResult) -> None:
         console.print()
 
         sanitized_name = current_name.replace("-", "")
-        # ✅ FIX: Use _safe_prompt_free() for free-text input
         new_name = _safe_prompt_free(
             f"[bold cyan]{_emoji_or_empty('arrow')}[/] Enter a new name",
             default=sanitized_name,
