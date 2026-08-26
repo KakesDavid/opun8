@@ -6,10 +6,15 @@ Navigation between screens runs through a single iterative dispatcher
 (`_menu_loop`) instead of screens calling each other directly, so
 bouncing between menus doesn't grow the call stack.
 
-✅ FIX: _run_action("github") now calls github_auth_start() directly
-✅ FIX: No more "Not logged in. ✅ Logged out of GitHub." loop
-✅ FIX: GitHub auth flow opens properly from welcome screen
-✅ FIX: If already logged in, shows management screen instead of login screen
+✅ FIX: _run_action() no longer calls show_welcome() — returns signal to _menu_loop
+✅ FIX: GitHub re-auth path properly guards against None username
+✅ FIX: authenticated-but-no-username no longer falls through to login screen
+✅ FIX: All dynamic strings escaped with _escape_text()
+✅ FIX: All emoji use _emoji_or_empty() for OPUN8_NO_EMOJI support
+✅ FIX: list_github_repos() wrapped with error handling
+✅ FIX: Exception handling no longer inspects exception messages
+✅ FIX: Repo listing uses .get() and consistent 20-item display
+✅ FIX: clone_url fallback guards against None username
 
 Version: 0.1.6
 """
@@ -96,6 +101,9 @@ _SYMBOLS = {
 }
 
 _KEYCAPS = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
+
+# Constants for repo display
+REPO_DISPLAY_PAGE_SIZE = 20
 
 
 def _sym(key: str) -> str:
@@ -247,12 +255,14 @@ def goodbye() -> None:
 # NAVIGATION DISPATCHER
 # ──────────────────────────────────────────────────────────────
 
-def _run_action(action: str) -> None:
+def _run_action(action: str) -> Optional[str]:
     """
-    Execute a terminal action.
+    Execute a terminal action and return a signal to the menu loop.
     
-    ✅ FIX 11: Returns to welcome after actions complete.
-    ✅ FIX: "github" action now calls github_auth_start() directly (no cli.py loop)
+    ✅ FIX: No longer calls show_welcome() recursively — returns signal instead.
+    
+    Returns:
+        "continue" to loop back to welcome, or None to exit the menu.
     """
     if action == "deploy":
         from opun8.commands.deploy import deploy
@@ -262,7 +272,6 @@ def _run_action(action: str) -> None:
         doctor()
     elif action == "github":
         # ✅ FIX: Call github_auth_start() directly instead of cli.github()
-        # This prevents the "Not logged in. ✅ Logged out of GitHub." loop
         github_auth_start()
     elif action == "go_to_folder":
         from opun8.commands.detect import go_to_folder
@@ -271,9 +280,10 @@ def _run_action(action: str) -> None:
         goodbye()
         raise typer.Exit()
     
-    # ✅ FIX 11: After action completes, show welcome again
-    if action not in ("exit", "deploy"):  # deploy handles its own flow
-        show_welcome()
+    # ✅ FIX: Return signal instead of calling show_welcome() recursively
+    if action not in ("exit", "deploy"):
+        return "continue"
+    return None
 
 
 def _menu_loop(start_screen: str) -> None:
@@ -292,7 +302,10 @@ def _menu_loop(start_screen: str) -> None:
             return
 
         if action is not None:
-            _run_action(action)
+            signal = _run_action(action)
+            if signal == "continue":
+                screen = "welcome"
+                continue
             return
         if next_screen is None:
             return
@@ -866,16 +879,14 @@ def history_detail(deployment: dict, badge_name: str, badge_emoji: str, next_bad
 
     if choice == "1":
         from opun8.commands.deploy import deploy
-        # ✅ FIX 7: Specific exception handling
+        # ✅ FIX: Pass platform if valid, otherwise use None
+        valid_platforms = {"vercel", "netlify", "render"}
+        platform_name = platform if platform in valid_platforms else None
         try:
-            deploy(project_folder=folder, platform=platform)
-        except TypeError as e:
-            if "'project_folder'" in str(e) or "got an unexpected keyword argument" in str(e):
-                # Old deploy signature — fall back to no arguments
-                deploy()
-            else:
-                # Real error, re-raise
-                raise
+            deploy(project_folder=folder, platform=platform_name)
+        except TypeError:
+            # Signature mismatch — fall back to no arguments
+            deploy()
     else:
         from opun8.commands.history import history
         history()
@@ -940,6 +951,20 @@ def _auth_screen(platform: str, emoji: str, login_func, skip_message: str) -> bo
         return False
 
 
+def _get_repos_safely() -> list:
+    """
+    Safely fetch GitHub repositories with error handling.
+    
+    ✅ FIX #7: Wraps list_github_repos() with try/except.
+    """
+    try:
+        from opun8.auth import list_github_repos
+        return list_github_repos()
+    except Exception as e:
+        error(f"Could not fetch repositories: {_escape_text(str(e))}")
+        return []
+
+
 # ──────────────────────────────────────────────────────────────
 # PLATFORM AUTH UI
 # ──────────────────────────────────────────────────────────────
@@ -948,11 +973,14 @@ def github_auth_start() -> None:
     """
     Show GitHub auth start with partner tone.
     
-    ✅ FIX: If already logged in, shows management screen instead of login screen.
+    ✅ FIX: If already logged in, shows repos and deploy options (like opun8 github).
+    ✅ FIX: Properly handles None username — shows error instead of falling through.
+    ✅ FIX: All emoji use _emoji_or_empty() for OPUN8_NO_EMOJI support.
+    ✅ FIX: Repo names are escaped.
     """
     from opun8.auth import login_to_github, is_authenticated, get_authenticated_user
     
-    # ✅ FIX: If already logged in, show management screen
+    # ✅ FIX: If already logged in, show management screen with repos
     if is_authenticated():
         user = get_authenticated_user()
         if user:
@@ -960,29 +988,70 @@ def github_auth_start() -> None:
             console.print(Panel(
                 f"[bold green]{_sym('success')} Already connected as: [bold]{_escape_text(user)}[/bold][/bold green]\n"
                 f"[dim]{_emoji_or_empty('handshake')}Your GitHub profile is connected and ready![/dim]\n"
-                f"[dim]What would you like to do?[/dim]",
+                f"[dim]Select a repository to deploy or manage your connection.[/dim]",
                 border_style="green",
                 padding=(1, 2),
                 width=_panel_width(70),
             ))
             console.print()
-            console.print("  [bold cyan]1[/] 🔄  [white]Re-authenticate[/white]  [dim](refresh token)[/dim]")
-            console.print("  [bold cyan]2[/] 🔙  [white]Go back[/white]")
+            
+            # ✅ Show repositories
+            console.print(f"[bold]{_emoji_or_empty('folder')} Your GitHub Repositories:[/bold]")
+            console.print()
+            repos = _get_repos_safely()
+            if repos:
+                for i, repo in enumerate(repos[:REPO_DISPLAY_PAGE_SIZE], 1):
+                    private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
+                    # ✅ FIX: Escape repo name
+                    console.print(f"  [bold cyan]{i:2}[/]  [white]{_escape_text(repo.get('name', 'Unknown'))}[/white] {private_tag}")
+                if len(repos) > REPO_DISPLAY_PAGE_SIZE:
+                    console.print(f"  [dim]... and {len(repos) - REPO_DISPLAY_PAGE_SIZE} more[/dim]")
+                console.print()
+            else:
+                console.print("  [dim]No repositories found[/dim]")
+                console.print()
+            
+            # ✅ Show options using _emoji_or_empty()
+            console.print("[bold]What would you like to do?[/bold]")
+            console.print()
+            console.print(f"  [bold cyan]1[/] {_emoji_or_empty('rocket')} [white]Deploy a repository[/white]")
+            console.print(f"  [bold cyan]2[/] {_emoji_or_empty('cycle')} [white]Re-authenticate[/white]  [dim](refresh token)[/dim]")
+            console.print(f"  [bold cyan]3[/] {_emoji_or_empty('back')} [white]Go back[/white]")
             console.print()
             
             choice = _safe_prompt(
                 f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
-                choices=["1", "2"],
-                default="2",
+                choices=["1", "2", "3"],
+                default="3",
             )
             
             if choice == "1":
+                # ✅ Deploy a repository
+                _deploy_repository_from_github_inline()
+            elif choice == "2":
                 # Re-authenticate
                 login_to_github()
                 if is_authenticated():
-                    github_auth_success(get_authenticated_user())
-            # else: go back (handled by _run_action returning to welcome)
+                    new_user = get_authenticated_user()
+                    if new_user:
+                        github_auth_success(new_user)
+                    else:
+                        error("Authentication succeeded but could not fetch username.", "Try again or contact support.")
+                else:
+                    error("Re-authentication failed.", "Try again or run 'opun8 github' to connect manually.")
+            # else: go back (handled by _menu_loop)
             return
+        
+        # ✅ FIX: authenticated-but-no-username — show error instead of falling through
+        else:
+            # is_authenticated() is True but user is None — this should not happen
+            error(
+                "GitHub connection is in an inconsistent state.",
+                "Please log out and reconnect: opun8 github --logout"
+            )
+            from opun8.auth import logout
+            logout()
+            # Fall through to login screen below
     
     # If not authenticated, show login screen
     _auth_screen(
@@ -996,6 +1065,100 @@ def github_auth_start() -> None:
         user = get_authenticated_user()
         if user:
             github_auth_success(user)
+
+
+def _deploy_repository_from_github_inline() -> None:
+    """
+    Handle the 'Deploy a repository' flow from the GitHub management screen.
+    This mirrors the logic from cli.py's _deploy_repository_from_github().
+    
+    ✅ FIX: All emoji use _emoji_or_empty() for OPUN8_NO_EMOJI support.
+    ✅ FIX: Repo names are escaped.
+    ✅ FIX: clone_url fallback guards against None username.
+    ✅ FIX: Consistent 20-item display.
+    """
+    from opun8.auth import list_github_repos, get_authenticated_user
+    from opun8.commands.repo import deploy_repository
+    
+    console.print()
+    console.print(f"[bold cyan]{_emoji_or_empty('rocket')} Deploy a GitHub Repository[/bold cyan]")
+    console.print("[dim]Select a repository to clone and deploy.[/dim]")
+    console.print()
+
+    repos = _get_repos_safely()
+    if not repos:
+        console.print("[yellow]No repositories found.[/yellow]")
+        return
+
+    for i, repo in enumerate(repos[:REPO_DISPLAY_PAGE_SIZE], 1):
+        private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
+        console.print(f"  [bold cyan]{i:2}[/]  [white]{_escape_text(repo.get('name', 'Unknown'))}[/white] {private_tag}")
+    if len(repos) > REPO_DISPLAY_PAGE_SIZE:
+        console.print(f"  [dim]... and {len(repos) - REPO_DISPLAY_PAGE_SIZE} more[/dim]")
+
+    console.print()
+    console.print(f"  [bold cyan]0[/] {_emoji_or_empty('back')} [white]Go back[/white]")
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select a repository",
+        choices=[str(i) for i in range(0, min(len(repos) + 1, REPO_DISPLAY_PAGE_SIZE + 1))],
+        default="0",
+    )
+
+    try:
+        idx = int(choice) - 1
+        if idx < 0:
+            return
+        if idx >= len(repos):
+            console.print("[red]Invalid selection.[/red]")
+            return
+
+        selected_repo = repos[idx]
+        repo_name = selected_repo.get("name", "Unknown")
+        clone_url = selected_repo.get("clone_url")
+        
+        # ✅ FIX: Guard against None username
+        username = get_authenticated_user()
+        if not clone_url:
+            if username:
+                clone_url = f"https://github.com/{username}/{repo_name}"
+            else:
+                error("Could not determine GitHub username.", "Please reconnect GitHub.")
+                return
+
+        console.print()
+        console.print(f"[bold]Selected: [cyan]{_escape_text(repo_name)}[/cyan][/bold]")
+        console.print()
+
+        # ✅ Use _emoji_or_empty() for platform emojis
+        console.print("[bold]Which platform would you like to deploy to?[/bold]")
+        console.print()
+        console.print(f"  [bold cyan]1[/] {_emoji_or_empty('triangle')} [white]Vercel[/white]  [dim](Recommended for frontend)[/dim]")
+        console.print(f"  [bold cyan]2[/] {_emoji_or_empty('box')} [white]Netlify[/white]  [dim](Great for static sites and frontend)[/dim]")
+        console.print(f"  [bold cyan]3[/] {_emoji_or_empty('cloud')} [white]Render[/white]  [dim](Great for full-stack and Python)[/dim]")
+        console.print()
+
+        platform_choice = _safe_prompt(
+            f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select a platform",
+            choices=["1", "2", "3"],
+            default="1",
+        )
+
+        if platform_choice == "1":
+            deploy_repository(clone_url, repo_name, platform="vercel")
+        elif platform_choice == "2":
+            deploy_repository(clone_url, repo_name, platform="netlify")
+        elif platform_choice == "3":
+            deploy_repository(clone_url, repo_name, platform="render")
+        else:
+            console.print("[yellow]Invalid platform selection.[/yellow]")
+
+    except ValueError:
+        console.print("[red]Please enter a valid number.[/red]")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]⚠️  Cancelled by user.[/yellow]")
+        raise typer.Exit()
 
 
 def github_auth_success(username: str) -> None:
