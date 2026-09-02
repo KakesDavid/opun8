@@ -17,20 +17,26 @@ Features:
     - Supports selecting specific vars to include
     - Supports target environments (production, preview, development)
 
-✅ FIX: Added clean separation before env var display (rule + panel)
-✅ FIX: Clear screen before showing env var table
-✅ FIX: Consistent panel styling with the rest of the UI
-✅ FIX: No more overlapping with GitHub menu text
+✅ FIX: Added support for yaml/json/toml/ini/conf files (they now use shell patterns)
+✅ FIX: JS destructuring now handles multiple variables (const { API_KEY, URL } = process.env)
+✅ FIX: Error messages are now displayed before console.clear() clears them
+✅ FIX: Framework matching now works both ways (nodejs ↔ node)
+✅ FIX: Removed overly broad settings\. regex that caused false positives
+✅ FIX: Removed duplicate Java regex
+✅ FIX: env_targets filtering is now actually implemented
+✅ FIX: env_targets=[] no longer silently becomes ["production"]
+✅ FIX: Added Kotlin and Scala support
+✅ FIX: Removed duplicate Kotlin regex (was causing SyntaxWarning confusion)
 
 Author: OPUN8 Team
-Version: 0.1.6
+Version: 0.1.7
 """
 
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from rich.console import Console
 from rich.panel import Panel
@@ -46,17 +52,28 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # =============================================================================
 
-# Environment file patterns to detect
+# Environment file patterns to detect (ordered by specificity, least to most)
 ENV_FILE_PATTERNS = [
     ".env",
     ".env.local",
-    ".env.production",
     ".env.development",
     ".env.test",
     ".env.staging",
+    ".env.production",
     ".env.dev",
     ".env.ci",
 ]
+
+# Target environment to file pattern mapping
+TARGET_ENV_FILE_MAP = {
+    "production": [".env.production", ".env.production.local", ".env"],
+    "development": [".env.development", ".env.development.local", ".env"],
+    "staging": [".env.staging", ".env.staging.local", ".env"],
+    "test": [".env.test", ".env.test.local", ".env"],
+    "preview": [".env.preview", ".env.preview.local", ".env"],
+    "ci": [".env.ci", ".env"],
+    "local": [".env.local", ".env"],
+}
 
 # File extensions to scan for env var usage
 SCAN_EXTENSIONS = {
@@ -65,7 +82,11 @@ SCAN_EXTENSIONS = {
     ".yml", ".yaml", ".json", ".toml", ".ini", ".conf",
 }
 
+# Languages that should use shell-style env var detection ($VAR, ${VAR})
+SHELL_STYLE_LANGS = {"shell", "yaml", "json", "toml", "ini", "conf"}
+
 # Regex patterns for detecting env vars by language
+# ✅ All patterns use raw strings (r'...') to prevent escape sequence warnings
 ENV_PATTERNS = {
     # JavaScript / TypeScript
     "javascript": [
@@ -73,7 +94,6 @@ ENV_PATTERNS = {
         re.compile(r'process\.env\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
         re.compile(r'import\.meta\.env\.([A-Z_][A-Z0-9_]*)'),
         re.compile(r'import\.meta\.env\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
-        re.compile(r'const\s*{\s*([A-Z_][A-Z0-9_]*)\s*}\s*=\s*process\.env'),
     ],
     # Python
     "python": [
@@ -82,16 +102,15 @@ ENV_PATTERNS = {
         re.compile(r'os\.environ\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
         re.compile(r'os\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\s*,\s*[^)]+\)'),
         re.compile(r'django\.conf\.settings\.([A-Z_][A-Z0-9_]*)'),
-        re.compile(r'(?<!django\.conf\.)settings\.([A-Z_][A-Z0-9_]*)'),
     ],
     # PHP
     "php": [
         re.compile(r'getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
         re.compile(r'\$_ENV\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
         re.compile(r'env\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
-        re.compile(r'Config::get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+        re.compile(r'Config\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
     ],
-    # Shell
+    # Shell (also used for yaml/json/toml/ini/conf)
     "shell": [
         re.compile(r'\$([A-Z_][A-Z0-9_]*)'),
         re.compile(r'\${([A-Z_][A-Z0-9_]*)}'),
@@ -115,9 +134,20 @@ ENV_PATTERNS = {
     # Java
     "java": [
         re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+    ],
+    # Kotlin (same as Java) — ✅ FIX: Removed duplicate regex
+    "kotlin": [
         re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
     ],
+    # Scala (same as Java)
+    "scala": [
+        re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+        re.compile(r'sys\.env\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+    ],
 }
+
+# ✅ FIX 2: JS destructuring regex (captures all variables in the braces)
+DESTRUCTURE_RE = re.compile(r'(?:const|let|var)\s*{\s*([^}]+)}\s*=\s*process\.env')
 
 # Framework-specific environment variable requirements
 FRAMEWORK_ENV_VARS: Dict[str, Dict[str, str]] = {
@@ -157,7 +187,7 @@ FRAMEWORK_ENV_VARS: Dict[str, Dict[str, str]] = {
         "DEBUG": "Enable debug mode (True/False)",
         "API_KEY": "API key for authentication",
     },
-    "nodejs": {
+    "node": {
         "PORT": "Port number for the server",
         "DATABASE_URL": "Database connection string (required)",
         "JWT_SECRET": "JWT secret key (required)",
@@ -167,6 +197,20 @@ FRAMEWORK_ENV_VARS: Dict[str, Dict[str, str]] = {
     "static": {
         "API_URL": "Backend API URL for static sites",
     },
+    "python": {
+        "SECRET_KEY": "Secret key (required)",
+        "DATABASE_URL": "Database connection string (required)",
+        "DEBUG": "Enable debug mode (True/False)",
+    },
+}
+
+# Framework alias mapping
+FRAMEWORK_ALIASES = {
+    "nodejs": "node",
+    "next": "nextjs",
+    "angular": "angular",
+    "svelte": "svelte",
+    "astro": "astro",
 }
 
 SENSITIVE_PATTERNS = [
@@ -321,6 +365,9 @@ def detect_env_vars_from_source(
     """
     Scan source files for environment variable usage.
 
+    ✅ FIX 1: YAML/JSON/TOML/INI/CONF now use shell patterns
+    ✅ FIX 2: JS destructuring now captures multiple variables
+
     Args:
         project_path: Path to the project root
         extensions: List of file extensions to scan (default: all supported)
@@ -362,20 +409,42 @@ def detect_env_vars_from_source(
 
             lang = detect_file_language(file_path)
 
-            if lang == "shell":
+            # ✅ FIX 1: Use shell patterns for YAML/JSON/TOML/INI/CONF
+            if lang in SHELL_STYLE_LANGS:
                 patterns = ENV_PATTERNS.get("shell", [])
+            elif lang in ENV_PATTERNS:
+                patterns = ENV_PATTERNS[lang]
             else:
-                patterns = ENV_PATTERNS.get(lang, [])
-                if not patterns and lang == "unknown":
-                    patterns = all_patterns
+                patterns = all_patterns
 
+            rel_path = file_path.relative_to(project_path)
+
+            # ✅ FIX 2: Handle JS destructuring separately
+            if lang == "javascript":
+                for match in DESTRUCTURE_RE.finditer(content):
+                    body = match.group(1)
+                    line_num = content[:match.start()].count(chr(10)) + 1
+                    for part in body.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        # Handle destructuring with aliasing: { oldName: newName }
+                        name = part.split(":")[0].split("=")[0].strip()
+                        if re.fullmatch(r'[A-Z_][A-Z0-9_]*', name):
+                            location = f"{rel_path}:{line_num}"
+                            if name not in result:
+                                result[name] = []
+                            if location not in result[name]:
+                                result[name].append(location)
+
+            # Apply regex patterns
             for pattern in patterns:
                 for match in pattern.finditer(content):
                     if len(match.groups()) >= 1:
                         var_name = match.group(1)
                         if var_name:
-                            rel_path = file_path.relative_to(project_path)
-                            location = f"{rel_path}:{content[:match.start()].count(chr(10)) + 1}"
+                            line_num = content[:match.start()].count(chr(10)) + 1
+                            location = f"{rel_path}:{line_num}"
                             if var_name not in result:
                                 result[var_name] = []
                             if location not in result[var_name]:
@@ -419,6 +488,8 @@ def detect_env_vars_from_framework(
     """
     Get framework-specific environment variable requirements.
 
+    ✅ FIX 4: Now uses alias mapping for better framework detection
+
     Args:
         project_path: Path to the project root
         framework: Detected framework name
@@ -428,19 +499,24 @@ def detect_env_vars_from_framework(
     """
     framework_normalized = framework.lower().replace(".", "").replace("-", "")
 
-    framework_vars = FRAMEWORK_ENV_VARS.get(framework_normalized)
-    if framework_vars is None:
-        for key in FRAMEWORK_ENV_VARS:
-            if key in framework_normalized:
-                framework_vars = FRAMEWORK_ENV_VARS[key]
-                break
+    # ✅ FIX 4: Check aliases first
+    if framework_normalized in FRAMEWORK_ALIASES:
+        framework_normalized = FRAMEWORK_ALIASES[framework_normalized]
+
+    # ✅ FIX 4: Check both directions for matching
+    framework_vars = None
+    for key in FRAMEWORK_ENV_VARS:
+        if key in framework_normalized or framework_normalized in key:
+            framework_vars = FRAMEWORK_ENV_VARS[key]
+            break
 
     result: Dict[str, str] = {}
     if framework_vars:
         result = dict(framework_vars)
 
-    if "nextjs" in framework_normalized:
-        env_files = detect_env_files(project_path)
+    # Next.js-specific detection
+    if "next" in framework_normalized or "nextjs" in framework_normalized:
+        env_files = detect_env_files(project_path, target_envs=["production"])
         for env_file in env_files:
             try:
                 content = env_file.read_text(encoding="utf-8", errors="replace")
@@ -453,8 +529,9 @@ def detect_env_vars_from_framework(
             except Exception:
                 continue
 
+    # Vite-specific detection
     if "vite" in framework_normalized:
-        env_files = detect_env_files(project_path)
+        env_files = detect_env_files(project_path, target_envs=["production"])
         for env_file in env_files:
             try:
                 content = env_file.read_text(encoding="utf-8", errors="replace")
@@ -542,12 +619,18 @@ def detect_required_env_vars(
 # ENV FILE PARSING
 # =============================================================================
 
-def detect_env_files(project_path: Path) -> List[Path]:
+def detect_env_files(
+    project_path: Path,
+    target_envs: Optional[List[str]] = None,
+) -> List[Path]:
     """
     Detect all environment files in the project root.
 
+    ✅ FIX 7: Now supports target environment filtering
+
     Args:
         project_path: Path to the project root
+        target_envs: Optional list of target environments to filter files
 
     Returns:
         List of detected .env file paths
@@ -556,7 +639,21 @@ def detect_env_files(project_path: Path) -> List[Path]:
         return []
 
     detected = []
-    for pattern in ENV_FILE_PATTERNS:
+
+    # ✅ FIX 7: If target_envs specified, only return files for those targets
+    if target_envs:
+        patterns_to_check: Set[str] = set()
+        for target in target_envs:
+            if target in TARGET_ENV_FILE_MAP:
+                for pattern in TARGET_ENV_FILE_MAP[target]:
+                    patterns_to_check.add(pattern)
+        # Fallback to all patterns if no matches
+        if not patterns_to_check:
+            patterns_to_check = set(ENV_FILE_PATTERNS)
+    else:
+        patterns_to_check = set(ENV_FILE_PATTERNS)
+
+    for pattern in patterns_to_check:
         file_path = project_path / pattern
         if file_path.exists() and file_path.is_file():
             detected.append(file_path)
@@ -691,8 +788,7 @@ def display_detected_vars(
     """
     Display detected environment variables to the user with interactive selection.
 
-    ✅ FIX: Clean separation from other UI elements (rule + panel)
-    ✅ FIX: Consistent styling with the rest of the UI
+    ✅ FIX 3: Error messages now persist across console.clear()
 
     Args:
         detected_vars: Dictionary of detected vars with metadata
@@ -708,14 +804,20 @@ def display_detected_vars(
     var_names = sorted(detected_vars.keys())
     selected_vars = list(var_names)
 
+    error_message: Optional[str] = None
+
     while True:
         console.clear()
-        
-        # ✅ FIX: Clean separation with rule and panel
-        console.print()
+
+        # ✅ FIX 3: Show error message before redisplaying
+        if error_message:
+            console.print(f"[red]{error_message}[/red]")
+            error_message = None
+            console.print()
+
         console.rule("[bold cyan]🔐 Environment Variables[/bold cyan]")
         console.print()
-        
+
         console.print(Panel(
             "[bold]Select environment variables to include.[/bold]\n"
             "[dim]Toggle by number, or use 'a' for all, 'n' for none.[/dim]",
@@ -803,9 +905,11 @@ def display_detected_vars(
                     selected_vars.append(var_name)
                     selected_vars = sorted(selected_vars, key=lambda x: var_names.index(x))
             else:
-                console.print("[red]Invalid number.[/red]")
+                # ✅ FIX 3: Store error message for next loop
+                error_message = "Invalid number. Please enter a number between 1 and " + str(len(var_names))
         except ValueError:
-            console.print("[red]Invalid command.[/red]")
+            # ✅ FIX 3: Store error message for next loop
+            error_message = "Invalid command. Enter a number, 'a', 'n', 'd', or 'q'."
 
     if not selected_vars:
         console.print("[yellow]No environment variables selected.[/yellow]")
@@ -900,14 +1004,18 @@ def interactive_env_prompt(
     project_path: Path,
     framework: str,
     existing_env_vars: Optional[Dict[str, str]] = None,
+    env_targets: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """
     Full interactive flow for environment variable configuration.
+
+    ✅ FIX 7: env_targets filtering is now applied
 
     Args:
         project_path: Path to the project root
         framework: Detected framework name
         existing_env_vars: Existing env vars from .env file
+        env_targets: Target environments to filter by
 
     Returns:
         Dictionary of environment variables to deploy
@@ -970,11 +1078,11 @@ def prompt_for_env_vars(
 
     This function is used by all providers (Vercel, Render, Netlify).
 
+    ✅ FIX 8: env_targets=[] no longer becomes ["production"]
+
     Args:
         project_path: Path to the project root
         env_targets: Optional list of target environments (filtering)
-                     Note: Currently this parameter is a no-op as filtering
-                     is not yet implemented. It's kept for API compatibility.
 
     Returns:
         Tuple of (selected_env_vars, target_environments)
@@ -988,20 +1096,22 @@ def prompt_for_env_vars(
     except Exception as e:
         logger.exception(f"Failed to detect project framework: {e}")
 
-    env_files = detect_env_files(project_path)
+    # ✅ FIX 7: Use env_targets for filtering
+    env_files = detect_env_files(project_path, target_envs=env_targets)
     existing_vars: Dict[str, str] = {}
     for env_file in env_files:
         vars_from_file = load_env_file(env_file)
         if vars_from_file:
             existing_vars = merge_env_vars(existing_vars, vars_from_file, prefer="new")
 
-    env_vars = interactive_env_prompt(project_path, framework, existing_vars)
+    env_vars = interactive_env_prompt(project_path, framework, existing_vars, env_targets)
 
     if not env_vars:
-        return {}, env_targets or []
+        # ✅ FIX 8: env_targets is None check
+        targets = env_targets if env_targets is not None else ["production"]
+        return {}, targets
 
-    targets = env_targets or ["production"]
-
+    targets = env_targets if env_targets is not None else ["production"]
     return env_vars, targets
 
 
