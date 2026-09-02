@@ -16,6 +16,8 @@ Features:
     - Secure: no CORS headers, Origin validation
     - Secure: variable name validation
     - Secure: rejects unknown variable operations
+    - ✅ FIX: Rejects incomplete names (e.g., "VITE_")
+    - ✅ FIX: Rejects variables with empty values
 
 Architecture:
     1. Server starts in a background thread
@@ -38,19 +40,8 @@ Security Notes:
     - Variable names validated against safe pattern
     - Unknown variable operations rejected
 
-Usage:
-    from opun8.services.env_web_editor import open_env_editor
-
-    detected_vars = {
-        "API_URL": {"default": "", "sensitive": False, "description": "Backend API URL"},
-        "SECRET_KEY": {"default": "", "sensitive": True, "description": "Secret key"},
-    }
-
-    result = open_env_editor(detected_vars)
-    # result = {"API_URL": "https://api.example.com", "SECRET_KEY": "abc123"}
-
 Author: OPUN8 Team
-Version: 0.1.8
+Version: 0.1.9
 """
 
 import json
@@ -272,6 +263,7 @@ def _get_fallback_html() -> str:
             margin-top: 16px;
             padding: 12px 0;
             border-top: 1px dashed #1a2340;
+            flex-wrap: wrap;
         }
         .add-row input {
             flex: 1;
@@ -282,6 +274,7 @@ def _get_fallback_html() -> str:
             color: #e0e0e0;
             font-size: 13px;
             transition: border-color 0.2s;
+            min-width: 0;
         }
         .add-row input:focus {
             border-color: #00d4ff;
@@ -643,9 +636,21 @@ class EnvEditorState:
 
         ✅ FIX: Names are validated against _VALID_ENV_NAME pattern.
         ✅ FIX: Rejects empty names or names that already exist.
+        ✅ FIX: Rejects names that end with underscore (incomplete).
         """
-        if not var_name or not _VALID_ENV_NAME.match(var_name):
+        # Reject empty names
+        if not var_name:
             return False
+
+        # ✅ FIX: Reject names that end with underscore (e.g., "VITE_")
+        if var_name.endswith("_"):
+            return False
+
+        # Validate against pattern
+        if not _VALID_ENV_NAME.match(var_name):
+            return False
+
+        # Reject duplicates
         if var_name in self.detected_vars:
             return False
 
@@ -671,7 +676,7 @@ class EnvEditorState:
         """Save current state and mark as done."""
         result = {}
         for var_name in self.selected_vars:
-            if var_name in self.values:
+            if var_name in self.values and self.values[var_name]:
                 result[var_name] = self.values[var_name]
         self.result = result
         self.is_done = True
@@ -824,14 +829,20 @@ class EnvEditorHandler(BaseHTTPRequestHandler):
             self._send_json({"success": False, "error": "Missing or invalid name"})
 
     def _handle_add(self):
-        """Handle add variable request."""
+        """
+        Handle add variable request.
+
+        ✅ FIX: Rejects incomplete names (e.g., "VITE_")
+        ✅ FIX: Rejects variables with empty values
+        ✅ FIX: Clear, user-friendly error messages
+        """
         if not self.state:
             self._send_json({"success": False})
             return
 
         data = self._get_json_body()
 
-        # ✅ FIX: Validate name is a string before calling .strip()
+        # Validate name is a string
         if not data or not isinstance(data.get("name"), str):
             self._send_json({"success": False, "error": "Missing or invalid name"})
             return
@@ -841,15 +852,32 @@ class EnvEditorHandler(BaseHTTPRequestHandler):
         if not isinstance(value, str):
             value = str(value)
 
+        # ✅ FIX: Reject empty names
         if not name:
             self._send_json({"success": False, "error": "Name cannot be empty"})
             return
 
-        # ✅ FIX: Clear error message for invalid names
+        # ✅ FIX: Reject names that end with underscore (incomplete, e.g., "VITE_")
+        if name.endswith("_"):
+            self._send_json({
+                "success": False,
+                "error": f"Did you forget to complete the variable name? '{name}' is incomplete."
+            })
+            return
+
+        # Validate against pattern
         if not _VALID_ENV_NAME.match(name):
             self._send_json({
                 "success": False,
                 "error": "Use only letters, numbers, and underscores; don't start with a number.",
+            })
+            return
+
+        # ✅ FIX: Reject variables with empty values
+        if not value:
+            self._send_json({
+                "success": False,
+                "error": f"Value for '{name}' cannot be empty."
             })
             return
 
