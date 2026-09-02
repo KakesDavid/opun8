@@ -16,6 +16,7 @@ Features:
     - Redacts sensitive values in display
     - Supports selecting specific vars to include
     - Supports target environments (production, preview, development)
+    - Web-based editor for environment variables (new)
 
 ✅ FIX: Added support for yaml/json/toml/ini/conf files (they now use shell patterns)
 ✅ FIX: JS destructuring now handles multiple variables (const { API_KEY, URL } = process.env)
@@ -27,9 +28,15 @@ Features:
 ✅ FIX: env_targets=[] no longer silently becomes ["production"]
 ✅ FIX: Added Kotlin and Scala support
 ✅ FIX: Removed duplicate Kotlin regex (was causing SyntaxWarning confusion)
+✅ FIX: Added "KEY" and "AUTH" to SENSITIVE_PATTERNS (API_KEY now flagged as sensitive)
+✅ FIX: Added os.environ.get() with default argument pattern
+✅ FIX: Added PHP env() with default argument pattern
+✅ FIX: Fixed PHP Config::get() pattern (was using wrong operator)
+✅ FIX: env_targets now properly propagated through all detection functions
+✅ NEW: Web-based environment variable editor integration
 
 Author: OPUN8 Team
-Version: 0.1.7
+Version: 0.1.8
 """
 
 import logging
@@ -86,7 +93,6 @@ SCAN_EXTENSIONS = {
 SHELL_STYLE_LANGS = {"shell", "yaml", "json", "toml", "ini", "conf"}
 
 # Regex patterns for detecting env vars by language
-# ✅ All patterns use raw strings (r'...') to prevent escape sequence warnings
 ENV_PATTERNS = {
     # JavaScript / TypeScript
     "javascript": [
@@ -98,17 +104,23 @@ ENV_PATTERNS = {
     # Python
     "python": [
         re.compile(r'os\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
-        re.compile(r'os\.environ\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
-        re.compile(r'os\.environ\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
         re.compile(r'os\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\s*,\s*[^)]+\)'),
+        re.compile(r'os\.environ\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
+        # ✅ FIX 2: Added os.environ.get() with and without default
+        re.compile(r'os\.environ\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+        re.compile(r'os\.environ\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\s*,\s*[^)]+\)'),
         re.compile(r'django\.conf\.settings\.([A-Z_][A-Z0-9_]*)'),
     ],
     # PHP
     "php": [
         re.compile(r'getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
         re.compile(r'\$_ENV\[["\']([A-Z_][A-Z0-9_]*)["\']\]'),
+        # ✅ FIX 2: Added PHP env() with and without default
         re.compile(r'env\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
-        re.compile(r'Config\.get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+        re.compile(r'env\(["\']([A-Z_][A-Z0-9_]*)["\']\s*,\s*[^)]+\)'),
+        # ✅ FIX 3: Fixed Config::get() pattern (was using wrong operator)
+        re.compile(r'Config::get\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
+        re.compile(r'Config::get\(["\']([A-Z_][A-Z0-9_]*)["\']\s*,\s*[^)]+\)'),
     ],
     # Shell (also used for yaml/json/toml/ini/conf)
     "shell": [
@@ -135,18 +147,18 @@ ENV_PATTERNS = {
     "java": [
         re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
     ],
-    # Kotlin (same as Java) — ✅ FIX: Removed duplicate regex
+    # Kotlin
     "kotlin": [
         re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
     ],
-    # Scala (same as Java)
+    # Scala
     "scala": [
         re.compile(r'System\.getenv\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
         re.compile(r'sys\.env\(["\']([A-Z_][A-Z0-9_]*)["\']\)'),
     ],
 }
 
-# ✅ FIX 2: JS destructuring regex (captures all variables in the braces)
+# JS destructuring regex (captures all variables in the braces)
 DESTRUCTURE_RE = re.compile(r'(?:const|let|var)\s*{\s*([^}]+)}\s*=\s*process\.env')
 
 # Framework-specific environment variable requirements
@@ -213,10 +225,12 @@ FRAMEWORK_ALIASES = {
     "astro": "astro",
 }
 
+# ✅ FIX 1: Added "KEY" and "AUTH" to SENSITIVE_PATTERNS
 SENSITIVE_PATTERNS = [
     "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL",
     "SIGNATURE", "CERT", "CERTIFICATE", "ENCRYPT",
     "JWT", "SSH", "SSL", "TLS", "PRIV",
+    "KEY", "AUTH",
     "DATABASE_URL",
     "POSTGRES", "MYSQL", "MONGODB", "REDIS_URL",
 ]
@@ -484,15 +498,18 @@ def detect_env_vars_from_dotenv_example(project_path: Path) -> Dict[str, str]:
 def detect_env_vars_from_framework(
     project_path: Path,
     framework: str,
+    env_targets: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """
     Get framework-specific environment variable requirements.
 
+    ✅ FIX 4: Now accepts and uses env_targets for filtering
     ✅ FIX 4: Now uses alias mapping for better framework detection
 
     Args:
         project_path: Path to the project root
         framework: Detected framework name
+        env_targets: Optional target environments for filtering
 
     Returns:
         Dictionary mapping env var names to their descriptions
@@ -516,7 +533,8 @@ def detect_env_vars_from_framework(
 
     # Next.js-specific detection
     if "next" in framework_normalized or "nextjs" in framework_normalized:
-        env_files = detect_env_files(project_path, target_envs=["production"])
+        # ✅ FIX 4: Use env_targets for filtering
+        env_files = detect_env_files(project_path, target_envs=env_targets or ["production"])
         for env_file in env_files:
             try:
                 content = env_file.read_text(encoding="utf-8", errors="replace")
@@ -531,7 +549,8 @@ def detect_env_vars_from_framework(
 
     # Vite-specific detection
     if "vite" in framework_normalized:
-        env_files = detect_env_files(project_path, target_envs=["production"])
+        # ✅ FIX 4: Use env_targets for filtering
+        env_files = detect_env_files(project_path, target_envs=env_targets or ["production"])
         for env_file in env_files:
             try:
                 content = env_file.read_text(encoding="utf-8", errors="replace")
@@ -550,9 +569,12 @@ def detect_env_vars_from_framework(
 def detect_required_env_vars(
     project_path: Path,
     framework: str,
+    env_targets: Optional[List[str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Main entry point for detecting required environment variables.
+
+    ✅ FIX 4: Now accepts and passes env_targets to framework detection
 
     Combines results from:
         1. Source code scanning
@@ -562,6 +584,7 @@ def detect_required_env_vars(
     Args:
         project_path: Path to the project root
         framework: Detected framework name
+        env_targets: Optional target environments for filtering
 
     Returns:
         Dictionary mapping env var names to their metadata:
@@ -598,7 +621,8 @@ def detect_required_env_vars(
                 "from_framework": False,
             }
 
-    framework_vars = detect_env_vars_from_framework(project_path, framework)
+    # ✅ FIX 4: Pass env_targets to framework detection
+    framework_vars = detect_env_vars_from_framework(project_path, framework, env_targets)
     for var_name, description in framework_vars.items():
         if var_name in result:
             result[var_name]["description"] = description
@@ -778,7 +802,150 @@ def merge_env_vars(
 
 
 # =============================================================================
-# INTERACTIVE PROMPTS  ✅ FIXED
+# ENVIRONMENT DETECTION SUMMARY
+# =============================================================================
+
+def detect_env_files_and_vars(
+    project_path: Path,
+    framework: str,
+    env_targets: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Detect all environment files and variables, return a summary.
+
+    ✅ FIX 4: Now accepts and passes env_targets to all detection functions
+
+    Args:
+        project_path: Path to the project root
+        framework: Detected framework name
+        env_targets: Optional target environments for filtering
+
+    Returns:
+        Dictionary with detection summary:
+            {
+                "files": {
+                    ".env.local": {"path": "...", "vars": 3},
+                    ".env.production": {"path": "...", "vars": 5},
+                },
+                "source_vars": ["API_URL", "SECRET_KEY", ...],
+                "framework_vars": {"SECRET_KEY": "Django secret key"},
+                "total_vars": 8,
+                "detected_vars": {...}
+            }
+    """
+    result = {
+        "files": {},
+        "source_vars": [],
+        "framework_vars": {},
+        "total_vars": 0,
+        "detected_vars": {},
+    }
+
+    # ✅ FIX 4: Pass env_targets to detect_env_files
+    env_files = detect_env_files(project_path, target_envs=env_targets)
+    for env_file in env_files:
+        vars_from_file = load_env_file(env_file)
+        if vars_from_file:
+            result["files"][env_file.name] = {
+                "path": str(env_file),
+                "vars": len(vars_from_file)
+            }
+            result["total_vars"] += len(vars_from_file)
+
+    # Step 2: Detect source code usage (not target-specific)
+    source_vars = detect_env_vars_from_source(project_path)
+    if source_vars:
+        result["source_vars"] = list(source_vars.keys())
+        result["total_vars"] += len(source_vars)
+
+    # ✅ FIX 4: Pass env_targets to framework detection
+    framework_vars = detect_env_vars_from_framework(project_path, framework, env_targets)
+    if framework_vars:
+        result["framework_vars"] = framework_vars
+        result["total_vars"] += len(framework_vars)
+
+    # ✅ FIX 4: Pass env_targets to required vars detection
+    result["detected_vars"] = detect_required_env_vars(project_path, framework, env_targets)
+
+    return result
+
+
+def _get_github_username() -> Optional[str]:
+    """Get GitHub username if authenticated."""
+    try:
+        from opun8.auth import is_authenticated, get_authenticated_user
+        if is_authenticated():
+            return get_authenticated_user()
+    except Exception:
+        pass
+    return None
+
+
+def _show_env_detection_prompt(detection_result: Dict[str, Any]) -> str:
+    """
+    Show environment detection summary and ask user if they want to upload.
+
+    ✅ NEW: User-friendly detection summary with yes/no options.
+    ✅ FIX: Removed unused project_path parameter.
+
+    Returns:
+        "yes" or "no"
+    """
+    from rich.panel import Panel
+    from opun8.ui.messages import _sym, _emoji_or_empty, _safe_prompt, _panel_width, _escape_text
+
+    console.print()
+    console.print()
+
+    # Build file summary
+    file_summary = []
+    for filename, info in detection_result["files"].items():
+        file_summary.append(f"  📁 {_escape_text(filename)}          ({info['vars']} variables)")
+
+    if not file_summary:
+        file_summary.append("  📁 No .env files found")
+
+    source_count = len(detection_result["source_vars"])
+    framework_count = len(detection_result["framework_vars"])
+
+    # Add source code info
+    source_line = ""
+    if source_count > 0:
+        source_line = f"\n  📄 Source code         ({source_count} variables used)"
+
+    # Add framework info
+    framework_line = ""
+    if framework_count > 0:
+        framework_line = f"\n  🔧 Framework           ({framework_count} recommended variables)"
+
+    total_vars = detection_result["total_vars"]
+
+    console.print(Panel(
+        f"[bold cyan]{_sym('folder')} Environmental Configs Found![/bold cyan]\n\n"
+        + "\n".join(file_summary)
+        + source_line
+        + framework_line
+        + f"\n\n[dim]📊 Total: {total_vars} environment variable(s) detected[/dim]\n"
+        + f"\n[white]Do you want to upload them?[/white]\n\n"
+        f"  [bold cyan]1[/] ✅  Yes, I want to add them\n"
+        f"  [bold cyan]2[/] ❌  No, skip",
+        border_style="cyan",
+        padding=(1, 2),
+        width=_panel_width(70),
+    ))
+    console.print()
+
+    choice = _safe_prompt(
+        f"[bold cyan]{_emoji_or_empty('arrow')}[/] Select an option",
+        choices=["1", "2"],
+        default="1",
+    )
+
+    return "yes" if choice == "1" else "no"
+
+
+# =============================================================================
+# INTERACTIVE PROMPTS (Terminal-based - Kept for fallback)
 # =============================================================================
 
 def display_detected_vars(
@@ -1000,28 +1167,37 @@ def prompt_env_var_values(
     return result
 
 
+# =============================================================================
+# MAIN INTERACTIVE PROMPT (Web Editor + Fallback)
+# =============================================================================
+
 def interactive_env_prompt(
     project_path: Path,
     framework: str,
     existing_env_vars: Optional[Dict[str, str]] = None,
     env_targets: Optional[List[str]] = None,
+    use_web: bool = True,
 ) -> Dict[str, str]:
     """
     Full interactive flow for environment variable configuration.
 
-    ✅ FIX 7: env_targets filtering is now applied
+    ✅ NEW: Uses web-based editor by default.
+    ✅ FALLBACK: Uses terminal prompts if web editor fails or use_web=False.
+    ✅ FIX 4: env_targets now passed to all detection functions.
 
     Args:
         project_path: Path to the project root
         framework: Detected framework name
         existing_env_vars: Existing env vars from .env file
         env_targets: Target environments to filter by
+        use_web: Use web editor (True) or terminal prompts (False)
 
     Returns:
         Dictionary of environment variables to deploy
     """
+    # ✅ FIX 4: Pass env_targets to detection
     try:
-        detected_vars = detect_required_env_vars(project_path, framework)
+        detected_vars = detect_required_env_vars(project_path, framework, env_targets)
     except Exception as e:
         logger.exception(f"Failed to detect env vars: {e}")
         console.print("[yellow]⚠️ Could not detect environment variables.[/yellow]")
@@ -1031,6 +1207,51 @@ def interactive_env_prompt(
         console.print("[dim]No environment variables detected. Deploying without env vars.[/dim]")
         return {}
 
+    # Step 1: Show detection summary and ask user
+    # ✅ FIX 4: Pass env_targets to detection summary
+    detection_result = detect_env_files_and_vars(project_path, framework, env_targets)
+    # ✅ FIX: Remove unused project_path parameter
+    user_choice = _show_env_detection_prompt(detection_result)
+
+    if user_choice == "no":
+        console.print("[dim]⏭️ Skipping environment variables.[/dim]")
+        return {}
+
+    # Step 2: Open web editor (or fallback to terminal)
+    if use_web:
+        try:
+            console.print()
+            console.print("[dim]🌐 Opening environment editor...[/dim]")
+
+            # Get username for callback message
+            username = _get_github_username() or "user"
+            console.print(f"[dim]⏳ Waiting for callback from [cyan]{username}[/cyan]...[/dim]")
+            console.print()
+
+            from opun8.services.env_web_editor import open_env_editor
+            env_values = open_env_editor(detected_vars)
+
+            if env_values:
+                console.print(f"[green]✅ Selected {len(env_values)} environment variable(s).[/green]")
+                sensitive_count = sum(1 for k in env_values.keys() if is_sensitive_env_key(k))
+                if sensitive_count:
+                    console.print(f"[dim]🔒 {sensitive_count} sensitive value(s) hidden from display[/dim]")
+                return env_values
+            else:
+                console.print("[dim]⏭️ No environment variables selected.[/dim]")
+                return {}
+
+        except ImportError as e:
+            logger.warning(f"Web editor not available: {e}. Falling back to terminal.")
+            console.print("[yellow]⚠️ Web editor not available. Using terminal prompts.[/yellow]")
+            # Fall through to terminal prompts
+        except Exception as e:
+            logger.warning(f"Web editor failed: {e}. Falling back to terminal.")
+            console.print(f"[yellow]⚠️ Web editor failed: {e}[/yellow]")
+            console.print("[dim]Falling back to terminal prompts...[/dim]")
+            # Fall through to terminal prompts
+
+    # Fallback: Terminal prompts
     selected_vars, all_vars = display_detected_vars(detected_vars)
 
     if not selected_vars:
@@ -1150,6 +1371,7 @@ __all__ = [
     "detect_env_vars_from_source",
     "detect_env_vars_from_dotenv_example",
     "detect_env_vars_from_framework",
+    "detect_env_files_and_vars",
     # Prompting
     "prompt_for_env_vars",
     "prompt_env_files_selection",
