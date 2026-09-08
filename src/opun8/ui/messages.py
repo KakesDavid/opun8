@@ -15,8 +15,9 @@ bouncing between menus doesn't grow the call stack.
 ✅ FIX: Exception handling no longer inspects exception messages
 ✅ FIX: Repo listing uses .get() and consistent 20-item display
 ✅ FIX: clone_url fallback guards against None username
+✅ FIX: Added prompt_select_folder() for GUI folder selection
 
-Version: 0.1.6
+Version: 0.1.7
 """
 
 import os
@@ -161,6 +162,40 @@ def _panel_width(preferred: int = 65, minimum: int = 40) -> int:
     """Calculate safe panel width based on terminal size."""
     term_width = shutil.get_terminal_size(fallback=(preferred, 24)).columns
     return max(minimum, min(preferred, term_width - 4))
+
+
+# ──────────────────────────────────────────────────────────────
+# FOLDER SELECTION DIALOG
+# ──────────────────────────────────────────────────────────────
+
+def prompt_select_folder(message: str) -> Optional[Path]:
+    """
+    Open a folder selection dialog and return the selected path.
+
+    ✅ FIX: Added to support GUI folder selection in history.py
+
+    Args:
+        message: The prompt message to display
+
+    Returns:
+        The selected Path, or None if cancelled.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        root = tk.Tk()
+        root.withdraw()  # Hide the main window
+        
+        folder_path = filedialog.askdirectory(title=message)
+        root.destroy()
+        
+        if folder_path:
+            return Path(folder_path)
+        return None
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Could not open folder dialog: {e}[/yellow]")
+        return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1439,4 +1474,6 @@ __all__ = [
     "_safe_prompt",
     "_safe_prompt_free",
     "_safe_confirm",
+    # Folder selection
+    "prompt_select_folder",
 ]

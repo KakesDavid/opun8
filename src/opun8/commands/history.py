@@ -10,6 +10,10 @@ This module provides:
 
 ✅ FIX: Beautiful, engaging partner-tone UI with FULL-WIDTH table.
 ✅ FIX: 'b' and 'q' navigation keys work correctly.
+✅ FIX: Detail view renders BELOW the history table (no overlap).
+✅ FIX: GitHub redeploy option for repo-based deployments.
+✅ FIX: project_path and repo_url now used for redeploy.
+✅ FIX: Folder change → redeploy uses updated folder path.
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ import typer
 import webbrowser
 import re
 import requests
+import subprocess
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -41,8 +48,14 @@ from opun8.services.deployment_history import (
 )
 from opun8.commands.badges import show_badge_notification
 from opun8.ui import messages as msg
-from opun8.auth import get_vercel_token
-from opun8.providers.vercel.auth import get_vercel_scope
+from opun8.auth import get_github_token, get_authenticated_user, list_github_repos
+from opun8.services.git_service import GitService
+from opun8.providers.vercel.auth import (
+    get_vercel_token,
+    get_vercel_scope,
+    is_vercel_authenticated,
+    login_to_vercel,
+)
 from opun8.providers.vercel.deploy import (
     deploy_to_vercel,
     rename_vercel_project,
@@ -55,8 +68,17 @@ from opun8.providers.render.auth import (
     is_render_authenticated,
     login_to_render,
     get_render_owner_id,
+    prompt_owner_selection,
 )
 from opun8.providers.render.deploy import deploy_to_render
+
+# Netlify imports
+from opun8.providers.netlify.auth import (
+    get_netlify_token,
+    is_netlify_authenticated,
+    login_to_netlify,
+)
+from opun8.providers.netlify.deploy import deploy_to_netlify
 
 console = Console()
 
@@ -123,9 +145,20 @@ def _get_terminal_width() -> int:
     fallback = 120
     try:
         width = shutil.get_terminal_size().columns
-        return max(80, width - 4)  # Minimum 80, with padding
+        return max(80, width - 4)
     except Exception:
         return fallback
+
+
+def _escape_rich_markup(text: str) -> str:
+    """Escape square brackets so Rich doesn't interpret them as markup tags."""
+    return str(text).replace("[", "(").replace("]", ")")
+
+
+def _sanitize_repo_name(name: str) -> str:
+    """Make repo name safe for filesystem path."""
+    safe = re.sub(r'[^A-Za-z0-9._-]', '_', name)
+    return safe.lstrip('.') or 'repo'
 
 
 def history() -> None:
@@ -135,8 +168,6 @@ def history() -> None:
     try:
         _show_history_screen()
     except typer.Exit:
-        # Clean, intentional exit (e.g. user pressed 'q') — let it propagate
-        # untouched instead of falling into the generic handler below.
         raise
     except (KeyboardInterrupt, EOFError):
         console.print("\n[yellow]⚠️  Operation cancelled.[/yellow]")
@@ -151,7 +182,7 @@ def history() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# TOP-LEVEL HISTORY LIST SCREEN — BEAUTIFUL & ENGAGING
+# TOP-LEVEL HISTORY LIST SCREEN
 # ──────────────────────────────────────────────────────────────
 
 def _show_history_screen() -> None:
@@ -161,13 +192,9 @@ def _show_history_screen() -> None:
         count = get_deployment_count()
         badge = get_badge_info(count)
 
-        # ──────────────────────────────────────────────────────
-        # BEAUTIFUL HEADER
-        # ──────────────────────────────────────────────────────
         console.clear()
         console.print("\n")
 
-        # Main title panel
         console.print(Panel(
             f"[bold cyan]📜🏆 DEPLOYMENT HISTORY LOG[/bold cyan]\n"
             f"[dim]Built with {msg._sym('heart')} by the Kakes David Team to track your wins![/dim]",
@@ -177,7 +204,6 @@ def _show_history_screen() -> None:
         ))
         console.print()
 
-        # Badge celebration panel
         next_msg = ""
         if badge.get("next"):
             remaining = badge["next"] - count
@@ -200,20 +226,20 @@ def _show_history_screen() -> None:
             console.print(f"[yellow]No deployments found yet, partner! {msg._sym('smile')}[/yellow]")
             console.print(f"[dim]Let's fix that — run [cyan]opun8 deploy[/cyan] to launch your first site! {msg._sym('rocket')}[/dim]")
             console.print()
-            
+
             console.print("[bold]What would you like to do?[/bold]")
             console.print()
             console.print(f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]Launch your first deployment[/white]")
             console.print(f"  [bold cyan]2[/] {msg._sym('back')}  [white]Go back[/white]")
             console.print()
-            
+
             choice = _safe_prompt(
                 f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option",
                 choices=["1", "2"],
                 default="1",
                 show_choices=False,
             )
-            
+
             if choice == "1":
                 from opun8.commands.deploy import deploy
                 deploy()
@@ -221,9 +247,6 @@ def _show_history_screen() -> None:
 
         _display_history_table(deployments)
 
-        # ──────────────────────────────────────────────────────
-        # BEAUTIFUL NAVIGATION — ✅ FIXED
-        # ──────────────────────────────────────────────────────
         console.print()
         console.print(Panel(
             f"[bold cyan]{msg._emoji_or_empty('point')} WHAT WOULD YOU LIKE TO DO, FRIEND? {msg._sym('smile')}[/bold cyan]\n\n"
@@ -236,14 +259,13 @@ def _show_history_screen() -> None:
         ))
         console.print()
 
-        # ✅ FIX: choices must include 'b' and 'q' for validation
         choice = _safe_prompt(
             f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option (b to go back)",
             choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "b", "q"],
             default="b",
             show_choices=False,
         )
-        
+
         if choice is None:
             continue
 
@@ -264,25 +286,20 @@ def _show_history_screen() -> None:
             console.print("[red]❌ Invalid selection.[/red]")
             continue
 
-        _show_deployment_details(deployments[idx])
+        _render_deployment_below(deployments[idx])
 
 
 def _display_history_table(deployments: List[Dict[str, Any]]) -> None:
     """Display the deployment history in a FULL-WIDTH beautiful table."""
-    
-    # Platform colors
+
     platform_colors = {
         "vercel": "cyan",
         "netlify": "magenta",
         "render": "green",
     }
 
-    # Get terminal width for full-width display
     term_width = _get_terminal_width()
-    
-    # Calculate column widths based on terminal width
-    # Total width = 4 + 22 + 14 + 32 + 16 = 88 minimum
-    # We'll let Rich auto-size but set minimums
+
     num_width = 5
     project_width = 22
     platform_width = 14
@@ -321,14 +338,11 @@ def _display_history_table(deployments: List[Dict[str, Any]]) -> None:
         platform_icon = PLATFORM_ICONS.get(platform, "●")
         color = platform_colors.get(platform, "white")
 
-        # Colored platform text
         platform_text = Text(f"{platform_icon} {platform_display}", style=color)
 
-        # Status indicator (green dot for success)
         status = deployment.get("status", "success")
         status_indicator = "[green]●[/green]" if status == "success" else "[yellow]●[/yellow]"
 
-        # Number with padding
         num_str = f" {idx} "
 
         table.add_row(
@@ -371,74 +385,71 @@ def _format_relative_date(timestamp: Optional[str]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# DEPLOYMENT DETAIL SCREEN — BEAUTIFUL & ENGAGING
+# RENDER DETAIL VIEW BELOW THE TABLE (NO CLEARING)
 # ──────────────────────────────────────────────────────────────
 
-def _show_deployment_details(deployment: Dict[str, Any]) -> None:
+def _render_deployment_below(deployment: Dict[str, Any]) -> None:
     """
-    Detail screen for a single deployment.
+    Render deployment details BELOW the history table.
+    Does NOT clear the screen — everything stacks vertically.
     """
-    current = deployment
     count = get_deployment_count()
     badge = get_badge_info(count)
 
-    while True:
-        deployment_id = current.get("id")
-        if deployment_id:
-            refreshed = get_deployment(deployment_id)
-            if refreshed:
-                current = refreshed
+    console.print()
+    console.print("─" * min(_get_terminal_width(), 100))
+    console.print()
 
-        _render_deployment_panel(current, badge, count)
+    _render_deployment_panel(deployment, badge, count)
 
-        # ──────────────────────────────────────────────────────
-        # BEAUTIFUL ACTIONS MENU
-        # ──────────────────────────────────────────────────────
-        console.print()
-        console.print(Panel(
-            f"[bold green]{msg._emoji_or_empty('point')} WHAT SHOULD WE DO WITH THIS PROJECT, FRIEND? {msg._sym('smile')}[/bold green]\n\n"
-            f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]REDEPLOY NOW![/white] [dim](Update the website live)[/dim]\n"
-            f"  [bold cyan]2[/] {msg._emoji_or_empty('pencil')} [white]Rename in history[/white]\n"
-            f"  [bold cyan]3[/] {msg._emoji_or_empty('folder')} [white]Change project folder[/white]\n"
-            f"  [bold cyan]4[/] {msg._emoji_or_empty('trash')} [white]Delete from history[/white] [dim](optionally from platform)[/dim]\n"
-            f"  [bold cyan]5[/] {msg._emoji_or_empty('back')} [white]Go back to the list[/white]\n\n"
-            f"[dim]{msg._emoji_or_empty('bulb')} Not sure? Just press [bold cyan]ENTER[/bold cyan] and I'll safely redeploy it for you![/dim]",
-            border_style="green",
-            padding=(1, 2),
-            width=PANEL_WIDTH,
-        ))
-        console.print()
+    console.print()
+    console.print(Panel(
+        f"[bold green]{msg._emoji_or_empty('point')} WHAT SHOULD WE DO WITH THIS PROJECT, FRIEND? {msg._sym('smile')}[/bold green]\n\n"
+        f"  [bold cyan]1[/] {msg._sym('rocket')}  [white]REDEPLOY NOW![/white] [dim](Update the website live)[/dim]\n"
+        f"  [bold cyan]2[/] {msg._emoji_or_empty('pencil')} [white]Rename in history[/white]\n"
+        f"  [bold cyan]3[/] {msg._emoji_or_empty('folder')} [white]Change project folder[/white]\n"
+        f"  [bold cyan]4[/] {msg._emoji_or_empty('trash')} [white]Delete from history[/white] [dim](optionally from platform)[/dim]\n"
+        f"  [bold cyan]5[/] {msg._emoji_or_empty('back')} [white]Go back to the list[/white]\n\n"
+        f"[dim]{msg._emoji_or_empty('bulb')} Not sure? Just press [bold cyan]ENTER[/bold cyan] and I'll safely redeploy it for you![/dim]",
+        border_style="green",
+        padding=(1, 2),
+        width=PANEL_WIDTH,
+    ))
+    console.print()
 
-        choice = _safe_prompt(
-            f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option",
-            choices=["1", "2", "3", "4", "5"],
-            default="1",
-            show_choices=False,
-        )
+    choice = _safe_prompt(
+        f"[bold cyan]{msg._emoji_or_empty('arrow')}[/] Select an option",
+        choices=["1", "2", "3", "4", "5"],
+        default="1",
+        show_choices=False,
+    )
 
-        if choice is None or choice == "5":
-            return
-        elif choice == "1":
-            _redeploy(current)
-            return
-        elif choice == "2":
-            renamed = _rename_in_history(current)
-            if renamed:
-                current = renamed
-        elif choice == "3":
-            updated = _set_project_folder(current)
-            if updated:
-                current = updated
-        elif choice == "4":
-            if _delete_deployment(current):
-                return
+    current = deployment
+
+    if choice is None or choice == "5":
+        return
+    elif choice == "1":
+        _redeploy(current)
+        return
+    elif choice == "2":
+        _rename_in_history(current)
+        return
+    elif choice == "3":
+        updated = _set_project_folder(current)
+        if updated:
+            current = updated
+            console.print("[green]✅ Folder updated successfully![/green]")
+            # Refresh the detail view to show the new folder path
+            _render_deployment_panel(current, badge, count)
+        return
+    elif choice == "4":
+        _delete_deployment(current)
+        return
 
 
 def _render_deployment_panel(deployment: Dict[str, Any], badge: Dict[str, Any], count: int) -> None:
     """Render the beautiful deployment detail panel."""
-    console.clear()
-    console.print("\n")
-
+    # ✅ FIX: No console.clear() here — handled by caller
     project_name = deployment.get("project_name", "Unknown")
     platform = (deployment.get("platform") or "unknown").capitalize()
     url = deployment.get("url", "N/A")
@@ -456,20 +467,18 @@ def _render_deployment_panel(deployment: Dict[str, Any], badge: Dict[str, Any], 
             date_display = timestamp
 
     project_path = deployment.get("project_path") or "Not tracked"
+    repo_url = deployment.get("repo_url") or "Not from GitHub"
 
-    # Status color
     status_color = "green" if status == "success" else "yellow"
     status_icon = "✅" if status == "success" else "⚠️"
 
-    # ──────────────────────────────────────────────────────
-    # BEAUTIFUL DETAIL PANEL
-    # ──────────────────────────────────────────────────────
     console.print(Panel(
         f"[bold cyan]{platform_icon} {_escape_text(project_name)}[/bold cyan]\n\n"
         f"[dim]Platform:[/dim] {_escape_text(platform)}\n"
         f"[dim]URL:[/dim] [cyan]{_escape_text(url)}[/cyan]\n"
         f"[dim]Deployment ID:[/dim] [dim]{_escape_text(deployment_id)}[/dim]\n"
         f"[dim]Project folder:[/dim] [dim]{_escape_text(project_path)}[/dim]\n"
+        f"[dim]GitHub Repo:[/dim] [dim]{_escape_text(repo_url)}[/dim]\n"
         f"[dim]Date:[/dim] {_escape_text(date_display)}\n"
         f"[dim]Status:[/dim] [{status_color}]{status_icon} {_escape_text(status.upper())}[/{status_color}]\n"
         f"[dim]Environment Variables:[/dim] {', '.join(_escape_text(v) for v in env_vars) if env_vars else 'None'}",
@@ -479,9 +488,6 @@ def _render_deployment_panel(deployment: Dict[str, Any], badge: Dict[str, Any], 
     ))
     console.print()
 
-    # ──────────────────────────────────────────────────────
-    # BADGE PROGRESS
-    # ──────────────────────────────────────────────────────
     next_msg = ""
     if badge.get("next"):
         remaining = badge["next"] - count
@@ -545,7 +551,52 @@ def _redeploy(deployment: Dict[str, Any]) -> None:
     console.print(f"[dim]Redeploying: {deployment.get('project_name', 'Unknown')}[/dim]")
     console.print()
 
-    project_path = _choose_redeploy_project_path(deployment)
+    source_type = _choose_redeploy_source(deployment)
+    if source_type is None:
+        console.print("[dim]Redeploy cancelled.[/dim]")
+        return
+
+    project_path: Optional[Path] = None
+
+    if source_type == "github_same":
+        repo_url = deployment.get("repo_url")
+        if not repo_url:
+            msg.error("No GitHub URL found for this deployment.")
+            return
+        project_path = _clone_github_repo_for_redeploy(repo_url, deployment.get("project_name", "repo"))
+        if project_path is None:
+            return
+
+    elif source_type == "github_other":
+        project_path = _select_github_repo_for_redeploy()
+        if project_path is None:
+            return
+
+    elif source_type == "local":
+        tracked_path = deployment.get("project_path")
+        if not tracked_path:
+            msg.error("No tracked project folder found.")
+            return
+        project_path = Path(tracked_path).expanduser()
+        if not project_path.exists():
+            console.print(f"[red]❌ Project folder not found: {project_path}[/red]")
+            console.print("[dim]Would you like to select a different folder?[/dim]")
+            if _safe_confirm("Select a different folder?", default=True):
+                project_path = _prompt_for_project_path()
+                if project_path is None:
+                    return
+            else:
+                return
+
+    elif source_type == "local_select":
+        project_path = _prompt_for_project_path()
+        if project_path is None:
+            return
+
+    else:
+        console.print("[red]Unknown source type.[/red]")
+        return
+
     if project_path is None:
         console.print("[dim]Redeploy cancelled.[/dim]")
         return
@@ -565,59 +616,162 @@ def _redeploy(deployment: Dict[str, Any]) -> None:
     elif platform == "render":
         _redeploy_render(deployment, project_path)
     elif platform == "netlify":
-        console.print("[yellow]📦 Netlify redeploy coming soon![/yellow]")
-        console.print("[dim]Please redeploy manually from the Netlify dashboard.[/dim]")
+        _redeploy_netlify(deployment, project_path)
     else:
         console.print(f"[red]Unknown platform: {platform}[/red]")
         console.print("[dim]Please redeploy manually from the platform dashboard.[/dim]")
 
 
-def _choose_redeploy_project_path(deployment: Dict[str, Any]) -> Optional[Path]:
-    """Ask which local project folder this redeploy should use."""
+def _choose_redeploy_source(deployment: Dict[str, Any]) -> Optional[str]:
+    """
+    Ask the user which source to use for redeploy.
+
+    Returns:
+        "github_same", "github_other", "local", "local_select", or None for cancel.
+    """
+    repo_url = deployment.get("repo_url")
+    has_github_repo = repo_url is not None
+
     tracked_raw = deployment.get("project_path")
     tracked_path = Path(tracked_raw).expanduser() if tracked_raw else None
     tracked_valid = bool(tracked_path and tracked_path.is_dir())
 
-    console.print("[bold]Which project folder should this redeploy use?[/bold]")
+    console.print("[bold]Which project source should this redeploy use?[/bold]")
     console.print()
+
+    options = []
+    option_texts = []
+    option_num = 1
+
+    if has_github_repo:
+        options.append("github_same")
+        option_texts.append(
+            f"  [bold cyan]{option_num}[/] 🐙  [white]Use same GitHub repo[/white]  [dim]({_truncate(repo_url, 40)})[/dim]"
+        )
+        option_num += 1
+
+        options.append("github_other")
+        option_texts.append(
+            f"  [bold cyan]{option_num}[/] 🐙  [white]Select a different GitHub repo[/white]"
+        )
+        option_num += 1
 
     if tracked_valid:
-        console.print(f"  [bold cyan]1[/] 📁  [white]Use tracked project[/white]  [dim]({tracked_path})[/dim]")
-        console.print("  [bold cyan]2[/] 📂  [white]Select a different project[/white]")
-        console.print("  [bold cyan]3[/] 🔙  [white]Cancel[/white]")
-        console.print()
-        choice = _safe_prompt(
-            "[bold cyan]➜[/] Select an option",
-            choices=["1", "2", "3"],
-            default="1",
-            show_choices=False,
+        options.append("local")
+        option_texts.append(
+            f"  [bold cyan]{option_num}[/] 📁  [white]Use tracked project[/white]  [dim]({tracked_path})[/dim]"
         )
-        if choice is None or choice == "3":
-            return None
-        if choice == "1":
-            return tracked_path
-        return _prompt_for_project_path()
+        option_num += 1
 
-    if tracked_raw:
-        console.print(f"[yellow]⚠️  The originally tracked project folder no longer exists:[/yellow]")
-        console.print(f"[dim]   {tracked_raw}[/dim]")
-        console.print()
-    else:
-        console.print("[dim]This deployment was recorded before Opun8 tracked project folders.[/dim]")
-        console.print()
+    options.append("local_select")
+    option_texts.append(
+        f"  [bold cyan]{option_num}[/] 📂  [white]Select a local project folder[/white]"
+    )
+    option_num += 1
 
-    console.print("  [bold cyan]1[/] 📂  [white]Select a project folder[/white]")
-    console.print("  [bold cyan]2[/] 🔙  [white]Cancel[/white]")
+    options.append("cancel")
+    option_texts.append(
+        f"  [bold cyan]{option_num}[/] 🔙  [white]Cancel[/white]"
+    )
+
+    for text in option_texts:
+        console.print(text)
     console.print()
+
     choice = _safe_prompt(
         "[bold cyan]➜[/] Select an option",
-        choices=["1", "2"],
+        choices=[str(i) for i in range(1, len(options) + 1)],
         default="1",
         show_choices=False,
     )
-    if choice is None or choice == "2":
+
+    if choice is None:
         return None
-    return _prompt_for_project_path()
+
+    selected_idx = int(choice) - 1
+    if selected_idx >= len(options):
+        return None
+
+    return options[selected_idx]
+
+
+def _clone_github_repo_for_redeploy(repo_url: str, project_name: str) -> Optional[Path]:
+    """Clone a GitHub repo for redeploy."""
+    console.print()
+    console.print(f"[dim]Cloning {repo_url}...[/dim]")
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="opun8_redeploy_"))
+    clone_path = temp_dir / _sanitize_repo_name(project_name)
+
+    try:
+        token = get_github_token()
+        git_service = GitService()
+        success, message = git_service.clone_repository(
+            repo_url=repo_url,
+            target_path=str(clone_path),
+            token=token,
+        )
+
+        if not success:
+            safe_message = _escape_rich_markup(message)
+            console.print(f"[red]❌ Clone failed: {safe_message}[/red]")
+            return None
+
+        console.print(f"[green]✅ Cloned to {clone_path}[/green]")
+        return clone_path
+
+    except Exception as e:
+        error_msg = _escape_rich_markup(e)
+        console.print(f"[red]Error cloning: {error_msg}[/red]")
+        return None
+
+
+def _select_github_repo_for_redeploy() -> Optional[Path]:
+    """Let user select a GitHub repo to deploy."""
+    console.print()
+    console.print("[dim]Fetching your GitHub repositories...[/dim]")
+
+    repos = list_github_repos()
+    if not repos:
+        console.print("[yellow]No GitHub repositories found.[/yellow]")
+        return None
+
+    console.print("[bold]Select a repository:[/bold]")
+    console.print()
+
+    for i, repo in enumerate(repos[:20], 1):
+        private_tag = "[dim](private)[/dim]" if repo.get("private") else ""
+        console.print(f"  [bold cyan]{i:2}[/]  [white]{_escape_text(repo.get('name', 'Unknown'))}[/white] {private_tag}")
+
+    console.print()
+    choice = _safe_prompt(
+        "[bold cyan]➜[/] Select a repository",
+        choices=[str(i) for i in range(1, min(len(repos), 20) + 1)],
+        default="1",
+        show_choices=False,
+    )
+
+    if choice is None:
+        return None
+
+    idx = int(choice) - 1
+    if idx >= len(repos):
+        console.print("[red]Invalid selection.[/red]")
+        return None
+
+    repo = repos[idx]
+    repo_name = repo.get("name", "unknown")
+    clone_url = repo.get("clone_url")
+
+    if not clone_url:
+        username = get_authenticated_user()
+        if username:
+            clone_url = f"https://github.com/{username}/{repo_name}"
+        else:
+            console.print("[red]Could not determine clone URL.[/red]")
+            return None
+
+    return _clone_github_repo_for_redeploy(clone_url, repo_name)
 
 
 def _prompt_for_project_path() -> Optional[Path]:
@@ -691,8 +845,14 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
     token = get_vercel_token()
 
     if not token:
-        msg.error("Not connected to Vercel.", suggestion="Run `opun8 vercel` to connect.")
-        return
+        if not _safe_confirm("Not connected to Vercel. Connect now?", default=True):
+            msg.error("Not connected to Vercel.", suggestion="Run `opun8 vercel` to connect.")
+            return
+        login_to_vercel()
+        token = get_vercel_token()
+        if not token:
+            msg.error("Failed to connect to Vercel.")
+            return
 
     project_name = deployment.get("project_name") or project_path.name
     team_id = (get_vercel_scope() or {}).get("team_id")
@@ -728,6 +888,7 @@ def _redeploy_vercel(deployment: Dict[str, Any], project_path: Path) -> None:
         team_id=team_id,
         env_vars=list(env_vars.keys()) if env_vars else [],
         project_path=str(project_path),
+        repo_url=deployment.get("repo_url"),
     )
 
     console.print()
@@ -745,12 +906,21 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
     token = get_render_token()
 
     if not token:
-        msg.error("Not connected to Render.", suggestion="Run `opun8 render` to connect.")
-        return
+        if not _safe_confirm("Not connected to Render. Connect now?", default=True):
+            msg.error("Not connected to Render.", suggestion="Run `opun8 render` to connect.")
+            return
+        login_to_render()
+        token = get_render_token()
+        if not token:
+            msg.error("Failed to connect to Render.")
+            return
 
     project_name = deployment.get("project_name") or project_path.name
     owner_id = get_render_owner_id()
-    existing_service_id = deployment.get("project_id")
+    if not owner_id:
+        owner_id = prompt_owner_selection(token)
+        if owner_id is None:
+            console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
 
     console.print()
     console.print("[dim]Would you like to update environment variables?[/dim]")
@@ -762,6 +932,8 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
     console.print("[dim]Deploying to Render...[/dim]")
     console.print("[dim]This may take a few minutes.[/dim]")
 
+    repo_url = deployment.get("repo_url")
+
     success, url, service_id = deploy_to_render(
         token=token,
         project_name=project_name,
@@ -769,21 +941,12 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
         framework=None,
         env_vars=env_vars,
         owner_id=owner_id,
-        repo_url=None,
+        repo_url=repo_url,
         region="oregon",
     )
 
     if not success:
         return
-
-    deployment_id = deployment.get("id")
-    if deployment_id:
-        update_deployment(deployment_id, {
-            "url": url,
-            "project_id": service_id,
-            "timestamp": datetime.now().isoformat(),
-            "status": "success",
-        })
 
     result = add_deployment(
         project_name=project_name,
@@ -793,10 +956,68 @@ def _redeploy_render(deployment: Dict[str, Any], project_path: Path) -> None:
         team_id=owner_id,
         env_vars=list(env_vars.keys()) if env_vars else [],
         project_path=str(project_path),
+        repo_url=repo_url,
     )
 
     console.print()
     msg.deploy_success(url, "render", project_name)
+
+    show_badge_notification(result.get("badge_unlocked"))
+
+
+# ──────────────────────────────────────────────────────────────
+# REDEPLOY: NETLIFY
+# ──────────────────────────────────────────────────────────────
+
+def _redeploy_netlify(deployment: Dict[str, Any], project_path: Path) -> None:
+    """Redeploy to Netlify."""
+    token = get_netlify_token()
+
+    if not token:
+        if not _safe_confirm("Not connected to Netlify. Connect now?", default=True):
+            msg.error("Not connected to Netlify.", suggestion="Run `opun8 netlify` to connect.")
+            return
+        login_to_netlify()
+        token = get_netlify_token()
+        if not token:
+            msg.error("Failed to connect to Netlify.")
+            return
+
+    project_name = deployment.get("project_name") or project_path.name
+
+    console.print()
+    console.print("[dim]Would you like to update environment variables?[/dim]")
+    update_env = bool(_safe_confirm("[bold cyan]➜[/] Update env vars?", default=False))
+
+    env_vars = _load_env_vars(project_path) if update_env else {}
+
+    console.print()
+    console.print("[dim]Deploying to Netlify...[/dim]")
+    console.print("[dim]This may take a moment.[/dim]\n")
+
+    success, url, site_id = deploy_to_netlify(
+        token=token,
+        site_name=project_name,
+        project_path=project_path,
+        env_vars=env_vars,
+    )
+
+    if not success:
+        return
+
+    result = add_deployment(
+        project_name=project_name,
+        url=url,
+        platform="netlify",
+        project_id=site_id,
+        team_id=None,
+        env_vars=list(env_vars.keys()) if env_vars else [],
+        project_path=str(project_path),
+        repo_url=deployment.get("repo_url"),
+    )
+
+    console.print()
+    msg.deploy_success(url, "netlify", project_name)
 
     show_badge_notification(result.get("badge_unlocked"))
 

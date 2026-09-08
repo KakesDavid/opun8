@@ -208,7 +208,7 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
         raise typer.Exit(0)
     except Exception as exc:
         logger.exception("Unexpected error while deploying repository %s", repo_name)
-        error_msg = _escape_rich_markup(exc)
+        error_msg = _escape_rich_markup(exc) # type: ignore
         console.print(f"[red]Unexpected error: {error_msg}[/red]")
         status = "failed"
         raise typer.Exit(1)
