@@ -6,6 +6,7 @@ Cross-platform file locking support (Unix fcntl + Windows msvcrt).
 
 import json
 import os
+import sys
 import tempfile
 import uuid
 import contextlib
@@ -29,17 +30,19 @@ LOCK_FILE = HISTORY_DIR / "deployment_history.lock"
 # CROSS-PLATFORM FILE LOCKING
 # ──────────────────────────────────────────────────────────────
 
-try:
-    import fcntl
-    HAS_FCNTL = True
-except ImportError:
-    HAS_FCNTL = False
+# fcntl is part of the POSIX standard library (always present on
+# Linux/macOS); msvcrt is part of the Windows standard library (always
+# present there). Guarding on sys.platform — rather than try/except
+# ImportError — lets static type checkers (Pylance/mypy) statically
+# eliminate whichever branch doesn't apply to the target platform, so
+# fcntl/msvcrt are never flagged as "possibly unbound" or unresolvable.
+HAS_MSVCRT = sys.platform == "win32"
+HAS_FCNTL = not HAS_MSVCRT
 
-try:
+if HAS_MSVCRT:
     import msvcrt
-    HAS_MSVCRT = True
-except ImportError:
-    HAS_MSVCRT = False
+else:
+    import fcntl
 
 
 @contextlib.contextmanager
@@ -60,12 +63,20 @@ def _locked():
         console.print("[yellow]⚠️  No file locking available. Concurrent writes may cause issues.[/yellow]")
         yield
         return
-
-    lock_fd = open(LOCK_FILE, "w")
+    
+    lock_fd = open(LOCK_FILE, "a+")
     try:
         if HAS_FCNTL:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         elif HAS_MSVCRT:
+            # Ensure there's at least one byte to lock, and make sure
+            # we're locking/unlocking the same byte range (position 0)
+            # each time — otherwise lock() and unlock() can target
+            # different offsets and the lock never actually releases.
+            if os.path.getsize(LOCK_FILE) == 0:
+                lock_fd.write("0")
+                lock_fd.flush()
+            lock_fd.seek(0)
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
         yield
     finally:
@@ -73,6 +84,7 @@ def _locked():
             if HAS_FCNTL:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             elif HAS_MSVCRT:
+                lock_fd.seek(0)
                 msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception:
             pass  # Best effort
@@ -98,6 +110,17 @@ def _get_default_history() -> Dict[str, Any]:
 class HistoryReadError(Exception):
     """Raised when the history file cannot be read and it is not safe to
     silently fall back to a fresh/default history (data would be lost)."""
+
+
+class HistoryWriteError(Exception):
+    """Raised when the history file cannot be written to disk.
+
+    Callers (add_deployment, delete_deployment, update_deployment,
+    clear_history, etc.) rely on this propagating rather than being
+    swallowed: if it were swallowed, a failed write would still report
+    success to the caller — e.g. add_deployment would return a
+    deployment record and even unlock a badge for a deployment that was
+    never actually persisted."""
 
 
 # ──────────────────────────────────────────────────────────────
