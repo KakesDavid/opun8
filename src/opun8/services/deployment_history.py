@@ -267,6 +267,7 @@ def add_deployment(
     team_id: Optional[str] = None,
     env_vars: Optional[List[str]] = None,
     project_path: Optional[str] = None,
+    repo_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Add a new deployment to history.
@@ -282,6 +283,8 @@ def add_deployment(
             deployment was created from. Recorded so that a later
             "redeploy" can offer to reuse this exact folder instead of
             silently assuming the current working directory.
+        repo_url: GitHub repository URL if deployed from a repo. Used
+            during redeploy to re-clone the repository.
 
     Returns:
         The created deployment record, with a "badge_unlocked" key set to
@@ -312,6 +315,7 @@ def add_deployment(
             "project_id": project_id,
             "team_id": team_id,
             "project_path": project_path,
+            "repo_url": repo_url,
             "env_vars": env_vars or [],
             "timestamp": datetime.now().isoformat(),
             "status": "success",
