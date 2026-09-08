@@ -16,6 +16,7 @@ bouncing between menus doesn't grow the call stack.
 ✅ FIX: Repo listing uses .get() and consistent 20-item display
 ✅ FIX: clone_url fallback guards against None username
 ✅ FIX: Added prompt_select_folder() for GUI folder selection
+✅ FIX: deploy() call in history_detail now uses correct signature (no parameters)
 
 Version: 0.1.7
 """
@@ -914,14 +915,8 @@ def history_detail(deployment: dict, badge_name: str, badge_emoji: str, next_bad
 
     if choice == "1":
         from opun8.commands.deploy import deploy
-        # ✅ FIX: Pass platform if valid, otherwise use None
-        valid_platforms = {"vercel", "netlify", "render"}
-        platform_name = platform if platform in valid_platforms else None
-        try:
-            deploy(project_folder=folder, platform=platform_name)
-        except TypeError:
-            # Signature mismatch — fall back to no arguments
-            deploy()
+        # ✅ FIX: deploy() doesn't accept parameters — call it with no arguments
+        deploy()
     else:
         from opun8.commands.history import history
         history()

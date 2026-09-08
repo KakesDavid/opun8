@@ -674,7 +674,7 @@ def _deploy_github_repo(platform: Platform) -> Optional[ProjectInfo]:
     if selected_repo is None:
         return None
 
-    repo_name = selected_repo.get("name")
+    repo_name = selected_repo.get("name", "repo")
     repo_url = selected_repo.get("clone_url") or f"https://github.com/{username}/{repo_name}"
 
     # Step 5: Confirm selection
