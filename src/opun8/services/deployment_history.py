@@ -67,7 +67,7 @@ def _locked():
     lock_fd = open(LOCK_FILE, "a+")
     try:
         if HAS_FCNTL:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX) # type: ignore
         elif HAS_MSVCRT:
             # Ensure there's at least one byte to lock, and make sure
             # we're locking/unlocking the same byte range (position 0)
@@ -82,7 +82,7 @@ def _locked():
     finally:
         try:
             if HAS_FCNTL:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                fcntl.flock(lock_fd, fcntl.LOCK_UN) # type: ignore
             elif HAS_MSVCRT:
                 lock_fd.seek(0)
                 msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)

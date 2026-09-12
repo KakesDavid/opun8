@@ -1412,8 +1412,10 @@ def doctor_nodejs_download() -> None:
         border_style="green",
         padding=(1, 2),
         width=_panel_width(60),
+    
     ))
     console.print()
+
 
 
 def doctor_nodejs_success(version: str) -> None:

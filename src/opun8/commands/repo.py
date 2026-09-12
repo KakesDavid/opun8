@@ -27,6 +27,8 @@ Changelog:
 ✅ FIX: status is now set to "failed" when project detection fails
 ✅ FIX: repo_name is sanitized before being used to build filesystem paths
 ✅ FIX: _detect_project() now guards os.chdir() with a lock
+✅ FIX: _escape_rich_markup() now accepts any object (e.g. Exception), not
+        just str, fixing type-checker errors at every "exc" call site
 """
 
 import logging
@@ -124,9 +126,15 @@ def _sanitize_repo_name(repo_name: str) -> str:
     return name
 
 
-def _escape_rich_markup(text: str) -> str:
+def _escape_rich_markup(text: object) -> str:
     """
     Escape square brackets so Rich doesn't interpret them as markup tags.
+
+    Accepts any object (not just str) since call sites frequently pass an
+    Exception instance directly (e.g. `_escape_rich_markup(exc)`). We
+    stringify first, so this is safe for exceptions, None, ints, etc., and
+    it fixes the type-checker errors that showed up on `exc` under the
+    previous `text: str` annotation.
 
     ✅ FIX #1: Prevents MarkupError on clone failure messages containing
     brackets (e.g., "[email protected]", ref names, auth errors).
@@ -208,7 +216,7 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
         raise typer.Exit(0)
     except Exception as exc:
         logger.exception("Unexpected error while deploying repository %s", repo_name)
-        error_msg = _escape_rich_markup(exc) # type: ignore
+        error_msg = _escape_rich_markup(exc)
         console.print(f"[red]Unexpected error: {error_msg}[/red]")
         status = "failed"
         raise typer.Exit(1)

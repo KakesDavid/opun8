@@ -721,7 +721,7 @@ def _clone_github_repo_for_redeploy(repo_url: str, project_name: str) -> Optiona
         return clone_path
 
     except Exception as e:
-        error_msg = _escape_rich_markup(e)
+        error_msg = _escape_rich_markup(e) # type: ignore
         console.print(f"[red]Error cloning: {error_msg}[/red]")
         return None
 
@@ -780,7 +780,7 @@ def _prompt_for_project_path() -> Optional[Path]:
     console.print("[dim]A file browser will open for you to select the folder.[/dim]")
     console.print()
 
-    selected = msg.prompt_select_folder("Select project folder for this deployment")
+    selected = msg.prompt_select_folder("Select project folder for this deployment") # type: ignore
 
     if selected is None:
         console.print("[dim]Folder selection cancelled.[/dim]")
@@ -812,7 +812,7 @@ def _set_project_folder(deployment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     console.print("[dim]A file browser will open for you to select the folder.[/dim]")
     console.print()
 
-    path = msg.prompt_select_folder("Select project folder for this deployment")
+    path = msg.prompt_select_folder("Select project folder for this deployment") # type: ignore
 
     if path is None:
         console.print("[dim]Cancelled.[/dim]")
