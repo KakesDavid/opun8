@@ -18,7 +18,7 @@ Supported Platforms:
     - Render (Full-stack, Python, Node.js)
 
 Author: OPUN8 Team
-Version: 0.1.6
+Version: 0.1.7
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from opun8.services.build_service import get_build_service
 from opun8.services.cost_estimator import get_cost_estimator
 from opun8.services.deployment_history import add_deployment
 from opun8.services.git_service import GitService
+from opun8.services.recent_projects import add_recent_project
 from opun8.ui import messages as msg
 from opun8.ui.cost_display import display_cost_estimate, display_savings_tip
 from opun8.ui.messages import (
@@ -149,6 +150,7 @@ class SuccessResult:
     project_name: str
     platform: Platform
     project_id: Optional[str] = None
+    project_path: Optional[str] = None   # ✅ NEW: for recent projects tracking
 
 
 # =============================================================================
@@ -947,7 +949,7 @@ def _ask_platform() -> Optional[Platform]:
 
 
 # =============================================================================
-# VERCEL DEPLOYMENT  ✅ FIXED (returns bool)
+# VERCEL DEPLOYMENT
 # =============================================================================
 
 def _handle_vercel_deploy(
@@ -995,6 +997,8 @@ def _handle_vercel_deploy(
         )
 
         if success:
+            resolved_path = project_path or str(cwd_path)
+
             _record_deployment_history(
                 project_name=project_name,
                 url=url,
@@ -1002,7 +1006,7 @@ def _handle_vercel_deploy(
                 team_id=team_id,
                 platform="vercel",
                 env_vars=[],
-                project_path=project_path or str(cwd_path),
+                project_path=resolved_path,
                 repo_url=repo_url,
             )
 
@@ -1011,6 +1015,7 @@ def _handle_vercel_deploy(
                 project_name=project_name,
                 project_id=project_id,
                 platform=Platform.VERCEL,
+                project_path=resolved_path,
             ))
             return True
         else:
@@ -1062,7 +1067,7 @@ def _ensure_vercel_auth() -> bool:
 
 
 # =============================================================================
-# NETLIFY DEPLOYMENT  ✅ FIXED (returns bool)
+# NETLIFY DEPLOYMENT
 # =============================================================================
 
 def _handle_netlify_deploy(
@@ -1107,6 +1112,8 @@ def _handle_netlify_deploy(
         )
 
         if success:
+            resolved_path = project_path or str(cwd_path)
+
             _record_deployment_history(
                 project_name=site_name,
                 url=url,
@@ -1114,7 +1121,7 @@ def _handle_netlify_deploy(
                 team_id=None,
                 platform="netlify",
                 env_vars=[],
-                project_path=project_path or str(cwd_path),
+                project_path=resolved_path,
                 repo_url=repo_url,
             )
 
@@ -1123,6 +1130,7 @@ def _handle_netlify_deploy(
                 project_name=site_name,
                 project_id=site_id,
                 platform=Platform.NETLIFY,
+                project_path=resolved_path,
             ))
             return True
         else:
@@ -1174,7 +1182,7 @@ def _ensure_netlify_auth() -> bool:
 
 
 # =============================================================================
-# RENDER DEPLOYMENT  ✅ FIXED (returns bool)
+# RENDER DEPLOYMENT
 # =============================================================================
 
 def _handle_render_deploy(
@@ -1230,6 +1238,8 @@ def _handle_render_deploy(
         )
 
         if success:
+            resolved_path = project_path or str(cwd_path)
+
             _record_deployment_history(
                 project_name=project_name,
                 url=url,
@@ -1237,7 +1247,7 @@ def _handle_render_deploy(
                 team_id=owner_id,
                 platform="render",
                 env_vars=[],
-                project_path=project_path or str(cwd_path),
+                project_path=resolved_path,
                 repo_url=repo_url,
             )
 
@@ -1246,6 +1256,7 @@ def _handle_render_deploy(
                 project_name=project_name,
                 project_id=service_id,
                 platform=Platform.RENDER,
+                project_path=resolved_path,
             ))
             return True
         else:
@@ -1340,6 +1351,13 @@ def _record_deployment_history(
 
 def _show_success(result: SuccessResult) -> None:
     """Display the success screen with partner tone."""
+    # ✅ FIX: Track this project as recently worked on
+    if result.project_path:
+        try:
+            add_recent_project(result.project_path)
+        except Exception as exc:
+            _debug_log(f"Could not track recent project: {exc}")
+
     full_url = _normalize_url(result.url)
 
     console.print()
