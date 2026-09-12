@@ -467,7 +467,11 @@ def _show_platform_deploy_menu(project_info: ProjectInfo, platform: Platform) ->
 
         if choice == "1":
             # Deploy Now
-            _deploy_to_platform(project_info, platform)
+            _deploy_to_platform(
+                project_info,
+                platform,
+                project_path=str(Path.cwd()),
+            )
             continue
 
         elif choice == "2":
@@ -778,8 +782,13 @@ def _deploy_github_repo(platform: Platform) -> Optional[ProjectInfo]:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return None
 
-        # ✅ Pass project_info to deployment
-        _deploy_to_platform(project_info, platform, repo_url=repo_url)
+        # ✅ Pass project_info + project_path + repo_url to deployment
+        _deploy_to_platform(
+            project_info,
+            platform,
+            project_path=str(cloned_path),
+            repo_url=repo_url,
+        )
 
         # ✅ Restore original directory BEFORE cleanup
         os.chdir(previous_cwd)
@@ -803,6 +812,7 @@ def _deploy_github_repo(platform: Platform) -> Optional[ProjectInfo]:
 def _deploy_to_platform(
     project_info: ProjectInfo,
     platform: Platform,
+    project_path: Optional[str] = None,
     repo_url: Optional[str] = None,
 ) -> bool:
     """
@@ -843,11 +853,11 @@ def _deploy_to_platform(
 
     # Execute deployment
     if platform == Platform.VERCEL:
-        return _handle_vercel_deploy(project_info)
+        return _handle_vercel_deploy(project_info, project_path=project_path, repo_url=repo_url)
     elif platform == Platform.NETLIFY:
-        return _handle_netlify_deploy(project_info)
+        return _handle_netlify_deploy(project_info, project_path=project_path, repo_url=repo_url)
     elif platform == Platform.RENDER:
-        return _handle_render_deploy(project_info, repo_url)
+        return _handle_render_deploy(project_info, project_path=project_path, repo_url=repo_url)
     
     return False
 
@@ -940,7 +950,11 @@ def _ask_platform() -> Optional[Platform]:
 # VERCEL DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_vercel_deploy(project_info: ProjectInfo) -> bool:
+def _handle_vercel_deploy(
+    project_info: ProjectInfo,
+    project_path: Optional[str] = None,
+    repo_url: Optional[str] = None,
+) -> bool:
     """Deploy the project to Vercel."""
     try:
         console.print()
@@ -964,8 +978,8 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> bool:
             return False
 
         team_id = (get_vercel_scope() or {}).get("team_id")
-        project_path = Path.cwd()
-        project_name = project_info.metadata.get("name", project_path.name)
+        cwd_path = Path.cwd()
+        project_name = project_info.metadata.get("name", cwd_path.name)
 
         console.print()
         console.print(f"[bold cyan]{_emoji_or_empty('rocket')} Deploying to Vercel...[/bold cyan]")
@@ -975,7 +989,7 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> bool:
         success, url, project_id = deploy_to_vercel(
             token=token,
             project_name=project_name,
-            project_path=project_path,
+            project_path=cwd_path,
             framework=project_info.framework,
             team_id=team_id,
         )
@@ -988,6 +1002,8 @@ def _handle_vercel_deploy(project_info: ProjectInfo) -> bool:
                 team_id=team_id,
                 platform="vercel",
                 env_vars=[],
+                project_path=project_path or str(cwd_path),
+                repo_url=repo_url,
             )
 
             _show_success(SuccessResult(
@@ -1049,7 +1065,11 @@ def _ensure_vercel_auth() -> bool:
 # NETLIFY DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
+def _handle_netlify_deploy(
+    project_info: ProjectInfo,
+    project_path: Optional[str] = None,
+    repo_url: Optional[str] = None,
+) -> bool:
     """Deploy the project to Netlify."""
     try:
         console.print()
@@ -1072,8 +1092,8 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
             )
             return False
 
-        project_path = Path.cwd()
-        site_name = project_info.metadata.get("name", project_path.name)
+        cwd_path = Path.cwd()
+        site_name = project_info.metadata.get("name", cwd_path.name)
 
         console.print()
         console.print(f"[bold cyan]{_emoji_or_empty('rocket')} Deploying to Netlify...[/bold cyan]")
@@ -1083,7 +1103,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
         success, url, site_id = deploy_to_netlify(
             token=token,
             site_name=site_name,
-            project_path=project_path,
+            project_path=cwd_path,
         )
 
         if success:
@@ -1094,6 +1114,8 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
                 team_id=None,
                 platform="netlify",
                 env_vars=[],
+                project_path=project_path or str(cwd_path),
+                repo_url=repo_url,
             )
 
             _show_success(SuccessResult(
@@ -1128,7 +1150,7 @@ def _handle_netlify_deploy(project_info: ProjectInfo) -> bool:
         _log_debug_exception("_handle_netlify_deploy() unexpected error", exc)
         msg.error(
             f"Deployment failed: {escape(str(exc))}",
-            suggestion="Check your internet connection and try again.",
+            suggestion="Check your internet connection and try again later.",
         )
         return False
 
@@ -1155,7 +1177,11 @@ def _ensure_netlify_auth() -> bool:
 # RENDER DEPLOYMENT  ✅ FIXED (returns bool)
 # =============================================================================
 
-def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = None) -> bool:
+def _handle_render_deploy(
+    project_info: ProjectInfo,
+    project_path: Optional[str] = None,
+    repo_url: Optional[str] = None,
+) -> bool:
     """Deploy the project to Render."""
     try:
         console.print()
@@ -1184,18 +1210,18 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
             if owner_id is None:
                 console.print("[yellow]No workspace selected. Using personal account.[/yellow]")
 
-        project_path = Path.cwd()
-        project_name = project_info.metadata.get("name", project_path.name)
+        cwd_path = Path.cwd()
+        project_name = project_info.metadata.get("name", cwd_path.name)
 
         console.print()
-        console.print(f"[bold cyan]{_emoji_or_empty('rocket')} Deploying to Render...[/bold cyan]")
+        console.print(f"[bold cyan]{_emoji_or_empty('rocket')} Deploying our project to Render...[/bold cyan]")
         console.print("[dim]This may take a few minutes.[/dim]")
         console.print()
 
         success, url, service_id = deploy_to_render(
             token=token,
             project_name=project_name,
-            project_path=project_path,
+            project_path=cwd_path,
             framework=project_info.framework,
             owner_id=owner_id,
             repo_url=repo_url,
@@ -1211,6 +1237,8 @@ def _handle_render_deploy(project_info: ProjectInfo, repo_url: Optional[str] = N
                 team_id=owner_id,
                 platform="render",
                 env_vars=[],
+                project_path=project_path or str(cwd_path),
+                repo_url=repo_url,
             )
 
             _show_success(SuccessResult(
@@ -1279,6 +1307,8 @@ def _record_deployment_history(
     team_id: Optional[str],
     platform: str,
     env_vars: list[str],
+    project_path: Optional[str] = None,
+    repo_url: Optional[str] = None,
 ) -> None:
     """Save a successful deployment to local history."""
     try:
@@ -1289,6 +1319,8 @@ def _record_deployment_history(
             project_id=project_id,
             team_id=team_id,
             env_vars=env_vars,
+            project_path=project_path,
+            repo_url=repo_url,
         )
     except Exception as exc:
         console.print(
@@ -1416,7 +1448,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
 
         token = get_vercel_token()
         if not token:
-            console.print(f"[red]{_sym('error')} Not connected to Vercel. Please run `opun8 vercel` first.[/red]")
+            console.print(f"[red]{_sym('error')} You're not connected to Vercel. Please run `opun8 vercel` first.[/red]")
             return
 
         team_id = (get_vercel_scope() or {}).get("team_id")
@@ -1430,7 +1462,7 @@ def _rename_url_flow(result: SuccessResult) -> None:
         )
 
         if confirm is None or not confirm:
-            console.print("[dim]Skipping rename.[/dim]")
+            console.print("[dim]Skipping rename project.[/dim]")
             return
 
         console.print("[dim]Renaming deployment...[/dim]")
