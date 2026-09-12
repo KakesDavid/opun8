@@ -209,7 +209,7 @@ def deploy_repository(repo_url: str, repo_name: str, platform: str = "vercel") -
             )
         else:
             # Vercel and Netlify deploy from local files.
-            status = _run_deployment(platform, project_info, project_path, safe_repo_name)
+            status = _run_deployment(platform, project_info, project_path, safe_repo_name, repo_url)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]⚠️ Operation cancelled.[/yellow]")
@@ -239,6 +239,7 @@ def _run_deployment(
     project_info: ProjectInfo,
     project_path: Path,
     repo_name: str,
+    repo_url: str,
 ) -> DeployStatus:
     """
     Dispatch deployment to the requested LOCAL-FILE platform (vercel/netlify)
@@ -252,6 +253,8 @@ def _run_deployment(
     clear error instead of silently reporting failure.
 
     ✅ FIX #4: "render" now produces a clear error message instead of silently failing.
+    ✅ FIX: repo_url is now accepted and forwarded to _deploy_to_vercel() /
+            _deploy_to_netlify() so it reaches deployment history.
     """
     console.print(f"[bold]Step 3: Deploying to {platform.capitalize()}[/bold]\n")
 
@@ -276,9 +279,9 @@ def _run_deployment(
         return "failed"
 
     if platform == "vercel":
-        success = _deploy_to_vercel(project_info, project_path, repo_name)
+        success = _deploy_to_vercel(project_info, project_path, repo_name, repo_url)
     else:  # platform == "netlify"
-        success = _deploy_to_netlify(project_info, project_path, repo_name)
+        success = _deploy_to_netlify(project_info, project_path, repo_name, repo_url)
 
     return "success" if success else "failed"
 
@@ -351,6 +354,8 @@ def _run_render_deployment_from_github(
                 team_id=owner_id,
                 env_vars=list(env_vars.keys()) if env_vars else [],
                 platform="render",
+                project_path=project_path,
+                repo_url=repo_url,
             )
 
             live_url = url if url.startswith("http") else f"https://{url}"
@@ -489,12 +494,13 @@ def _show_project_summary(project_info: ProjectInfo) -> None:
 # VERCEL DEPLOYMENT
 # ──────────────────────────────────────────────────────────────
 
-def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
+def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: str, repo_url: str) -> bool:
     """
     Deploy the project to Vercel and record the result in deployment history.
 
     ✅ FIX: Ensures path is resolved before deployment.
     ✅ FIX: Adds debug logging to track file discovery.
+    ✅ FIX: repo_url is now accepted and forwarded to deployment history.
     """
     try:
         # ✅ FIX: Ensure path is resolved
@@ -559,6 +565,8 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
             team_id=team_id,
             env_vars=list(env_vars.keys()),
             platform="vercel",
+            project_path=project_path,
+            repo_url=repo_url,
         )
 
         live_url = url if url.startswith("http") else f"https://{url}"
@@ -593,11 +601,12 @@ def _deploy_to_vercel(project_info: ProjectInfo, project_path: Path, repo_name: 
 # NETLIFY DEPLOYMENT
 # ──────────────────────────────────────────────────────────────
 
-def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name: str) -> bool:
+def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name: str, repo_url: str) -> bool:
     """
     Deploy the project to Netlify and record the result in deployment history.
 
     ✅ FIX: Ensures path is resolved before deployment.
+    ✅ FIX: repo_url is now accepted and forwarded to deployment history.
     """
     try:
         # ✅ FIX: Ensure path is resolved
@@ -647,6 +656,8 @@ def _deploy_to_netlify(project_info: ProjectInfo, project_path: Path, repo_name:
             team_id=None,
             env_vars=list(env_vars.keys()),
             platform="netlify",
+            project_path=project_path,
+            repo_url=repo_url,
         )
 
         live_url = url if url.startswith("http") else f"https://{url}"
@@ -746,21 +757,33 @@ def _record_deployment_history(
     team_id: Optional[str],
     env_vars: list[str],
     platform: str,
+    project_path: Optional[Path] = None,
+    repo_url: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Save deployment to history and show badge notification if unlocked.
+
+    ✅ FIX: project_path and repo_url are now accepted and forwarded to
+    add_deployment(), instead of being silently dropped. Every call site
+    (Vercel, Netlify, Render) had these values in scope but never passed
+    them through, so they were never recorded.
+
+    Assumes add_deployment() accepts `project_path` and `repo_url` keyword
+    arguments — if it doesn't yet, it needs the same two params added.
 
     Returns:
         The deployment record, or None if saving failed.
     """
     try:
-        deployment_record = add_deployment(
+        deployment_record: Dict[str, Any] = add_deployment(
             project_name=project_name,
             url=url,
             platform=platform,
             project_id=project_id,
             team_id=team_id,
             env_vars=env_vars,
+            project_path=str(project_path) if project_path is not None else None,
+            repo_url=repo_url,
         )
         badge_info = deployment_record.get("badge_unlocked")
         if badge_info:
