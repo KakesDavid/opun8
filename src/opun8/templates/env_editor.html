@@ -5,12 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Environment Variables — Opun8</title>
     <style>
-        /* ──────────────────────────────────────────────
-           RESET & BASE
-           ────────────────────────────────────────────── */
-        *,
-        *::before,
-        *::after {
+        *, *::before, *::after {
             box-sizing: border-box;
             margin: 0;
             padding: 0;
@@ -18,237 +13,143 @@
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            background: #0a0e17;
-            color: #e0e0e0;
+            background: #f5f5f5;
+            color: #333;
             display: flex;
             justify-content: center;
-            align-items: center;
+            align-items: flex-start;
             min-height: 100vh;
-            margin: 0;
-            padding: 20px;
+            padding: 40px 20px;
             line-height: 1.5;
         }
 
-        /* ──────────────────────────────────────────────
-           CARD
-           ────────────────────────────────────────────── */
         .card {
-            background: #141b2d;
-            border: 1px solid #00d4ff;
-            border-radius: 16px;
+            background: #ffffff;
+            border-radius: 12px;
             padding: 32px;
-            max-width: 720px;
+            max-width: 640px;
             width: 100%;
-            box-shadow: 0 20px 60px rgba(0, 212, 255, 0.08);
-            transition: box-shadow 0.3s ease;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
         }
 
-        .card:hover {
-            box-shadow: 0 20px 60px rgba(0, 212, 255, 0.15);
-        }
-
-        /* ──────────────────────────────────────────────
-           HEADER
-           ────────────────────────────────────────────── */
-        .card-header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 4px;
-        }
-
-        .card-header h1 {
-            color: #00d4ff;
-            font-size: 24px;
+        .card h1 {
+            font-size: 22px;
             font-weight: 700;
-            margin: 0;
-            letter-spacing: -0.5px;
-        }
-
-        .card-header .icon {
-            color: #00d4ff;
+            color: #111;
+            margin-bottom: 6px;
         }
 
         .subtitle {
-            color: #666;
-            margin-top: 0;
-            margin-bottom: 24px;
+            color: #888;
             font-size: 14px;
-            padding-left: 34px;
+            margin-bottom: 28px;
         }
 
-        /* ──────────────────────────────────────────────
-           VARIABLE ROWS
-           ────────────────────────────────────────────── */
         .var-row {
             display: flex;
             align-items: center;
-            gap: 12px;
-            padding: 8px 0;
-            border-bottom: 1px solid #1a2340;
-            transition: background 0.15s ease;
-        }
-
-        .var-row:hover {
-            background: rgba(255, 255, 255, 0.02);
+            gap: 10px;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
         }
 
         .var-row input[type="checkbox"] {
-            width: 18px;
-            height: 18px;
-            accent-color: #00d4ff;
+            width: 16px;
+            height: 16px;
             cursor: pointer;
             flex-shrink: 0;
+            accent-color: #0066ff;
         }
 
-        .var-row .var-name {
-            flex: 0 0 140px;
-            font-weight: 600;
-            color: #00d4ff;
-            font-size: 13px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-        }
-
-        .var-row .var-input {
-            flex: 1;
-            min-width: 0;
+        .var-row .name-input {
+            flex: 0 0 150px;
             padding: 8px 12px;
-            background: #0a0e17;
-            border: 1px solid #1a2340;
+            border: 1px solid #ddd;
             border-radius: 6px;
-            color: #e0e0e0;
             font-size: 13px;
             font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            color: #333;
+            background: #f9f9f9;
             outline: none;
         }
 
-        .var-row .var-input::placeholder {
-            color: #444;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        .var-row .value-wrapper {
+            flex: 1;
+            min-width: 0;
+            position: relative;
+            display: flex;
+            align-items: center;
         }
 
-        .var-row .var-input:focus {
-            border-color: #00d4ff;
-            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+        .var-row .value-wrapper input {
+            width: 100%;
+            padding: 8px 36px 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 13px;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            color: #333;
+            outline: none;
+            transition: border-color 0.15s;
         }
 
-        .var-row .var-input.sensitive {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            letter-spacing: 2px;
+        .var-row .value-wrapper input:focus {
+            border-color: #0066ff;
+        }
+
+        .var-row .toggle-btn {
+            position: absolute;
+            right: 6px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            color: #aaa;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            transition: color 0.15s, background 0.15s;
+        }
+
+        .var-row .toggle-btn:hover {
+            color: #0066ff;
+            background: #f0f6ff;
+        }
+
+        .var-row .toggle-btn svg {
+            width: 16px;
+            height: 16px;
+            display: block;
         }
 
         .var-row .delete-btn {
             background: none;
             border: none;
-            color: #ff4444;
+            color: #ccc;
             cursor: pointer;
-            padding: 4px 6px;
+            padding: 4px;
+            font-size: 18px;
+            line-height: 1;
             border-radius: 4px;
-            display: flex;
-            align-items: center;
-            transition: background 0.2s ease, color 0.2s ease;
             flex-shrink: 0;
-            opacity: 0.5;
-        }
-
-        .var-row:hover .delete-btn {
-            opacity: 1;
+            transition: color 0.15s, background 0.15s;
         }
 
         .var-row .delete-btn:hover {
-            background: rgba(255, 68, 68, 0.12);
-            color: #ff6666;
+            color: #ff4444;
+            background: #fff0f0;
         }
 
-        /* ──────────────────────────────────────────────
-           BUTTONS
-           ────────────────────────────────────────────── */
-        .actions {
-            display: flex;
-            gap: 12px;
-            margin-top: 24px;
-            flex-wrap: wrap;
-        }
-
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 13px;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            transition: background 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
-            font-family: inherit;
-            text-decoration: none;
-            user-select: none;
-        }
-
-        /* ✅ FIX: Added type="button" to all buttons via JS, but also safe */
-        .btn:active {
-            transform: scale(0.97);
-        }
-
-        .btn-primary {
-            background: #00d4ff;
-            color: #0a0e17;
-        }
-
-        .btn-primary:hover {
-            background: #00e5ff;
-            box-shadow: 0 4px 16px rgba(0, 212, 255, 0.25);
-        }
-
-        .btn-secondary {
-            background: #1a2340;
-            color: #e0e0e0;
-        }
-
-        .btn-secondary:hover {
-            background: #2a3350;
-            box-shadow: 0 4px 16px rgba(26, 35, 64, 0.3);
-        }
-
-        .btn-danger {
-            background: #cc3333;
-            color: #fff;
-        }
-
-        .btn-danger:hover {
-            background: #ff4444;
-            box-shadow: 0 4px 16px rgba(204, 51, 51, 0.3);
-        }
-
-        .btn-success {
-            background: #00cc88;
-            color: #0a0e17;
-        }
-
-        .btn-success:hover {
-            background: #00dd99;
-            box-shadow: 0 4px 16px rgba(0, 204, 136, 0.25);
-        }
-
-        .btn .icon {
-            display: inline-flex;
-        }
-
-        /* ──────────────────────────────────────────────
-           ADD ROW  ✅ FIXED
-           ────────────────────────────────────────────── */
         .add-row {
             display: none;
-            gap: 12px;
+            gap: 10px;
             margin-top: 16px;
-            padding: 12px 0;
-            border-top: 1px dashed #1a2340;
-            flex-wrap: wrap; /* ✅ FIX: Allows wrapping on narrow screens */
+            padding-top: 16px;
+            border-top: 1px dashed #ddd;
+            flex-wrap: wrap;
         }
 
         .add-row.visible {
@@ -256,396 +157,190 @@
         }
 
         .add-row input {
-            flex: 1 1 160px; /* ✅ FIX: Has a basis so it can shrink */
-            min-width: 0; /* ✅ FIX: Lets the input actually shrink */
+            flex: 1 1 160px;
+            min-width: 0;
             padding: 8px 12px;
-            background: #0a0e17;
-            border: 1px solid #1a2340;
+            border: 1px solid #ddd;
             border-radius: 6px;
-            color: #e0e0e0;
             font-size: 13px;
             font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            color: #333;
             outline: none;
         }
 
         .add-row input:focus {
-            border-color: #00d4ff;
-            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+            border-color: #0066ff;
         }
 
-        .add-row input::placeholder {
-            color: #444;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 24px;
+            flex-wrap: wrap;
         }
 
-        .add-row .btn {
-            padding: 8px 16px;
-            flex-shrink: 0;
+        .btn {
+            padding: 10px 18px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 13px;
+            transition: background 0.15s;
+            font-family: inherit;
         }
 
-        /* ──────────────────────────────────────────────
-           STATS & MESSAGES
-           ────────────────────────────────────────────── */
+        .btn-primary {
+            background: #0066ff;
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            background: #0052cc;
+        }
+
+        .btn-secondary {
+            background: #f0f0f0;
+            color: #333;
+        }
+
+        .btn-secondary:hover {
+            background: #e0e0e0;
+        }
+
+        .btn-success {
+            background: #00a86b;
+            color: #fff;
+        }
+
+        .btn-success:hover {
+            background: #008f5a;
+        }
+
+        .btn-danger {
+            background: #ff4444;
+            color: #fff;
+        }
+
+        .btn-danger:hover {
+            background: #cc3333;
+        }
+
         .stats {
-            color: #555;
+            color: #888;
             font-size: 13px;
             margin-top: 16px;
-            font-variant-numeric: tabular-nums;
         }
 
         .message {
-            margin-top: 10px;
+            margin-top: 12px;
             padding: 10px 14px;
-            border-radius: 8px;
+            border-radius: 6px;
             font-size: 13px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            opacity: 0;
-            transition: opacity 0.3s ease;
+            display: none;
         }
 
         .message.visible {
-            opacity: 1;
+            display: block;
         }
 
         .message-error {
-            background: rgba(255, 68, 68, 0.1);
-            color: #ff6666;
-            border: 1px solid rgba(255, 68, 68, 0.15);
+            background: #fff0f0;
+            color: #cc3333;
+            border: 1px solid #ffd0d0;
         }
 
         .message-success {
-            background: rgba(0, 212, 255, 0.08);
-            color: #00d4ff;
-            border: 1px solid rgba(0, 212, 255, 0.12);
+            background: #f0fff4;
+            color: #008f5a;
+            border: 1px solid #c0f0d0;
         }
 
         .message-info {
-            background: rgba(255, 255, 255, 0.04);
-            color: #888;
-            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: #f0f6ff;
+            color: #0052cc;
+            border: 1px solid #d0e0ff;
         }
 
-        .message .icon {
-            flex-shrink: 0;
-        }
-
-        /* ──────────────────────────────────────────────
-           EMPTY STATE
-           ────────────────────────────────────────────── */
         .empty-state {
             text-align: center;
             padding: 40px 20px;
-            color: #555;
+            color: #888;
             font-size: 14px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 8px;
         }
 
-        .empty-state .icon {
-            color: #333;
-            margin-bottom: 4px;
-        }
-
-        .empty-state .sub-text {
-            font-size: 12px;
-            color: #444;
-        }
-
-        /* ──────────────────────────────────────────────
-           DONE STATE (after save/cancel)
-           ────────────────────────────────────────────── */
         .done-state {
             text-align: center;
-            padding: 30px 20px;
+            padding: 40px 20px;
         }
 
-        .done-state .icon {
-            display: block;
-            margin: 0 auto 12px;
-            color: #00d4ff;
+        .done-state .done-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+            margin-top: 10px;
         }
 
-        .done-state .subtitle {
-            padding-left: 0;
-            color: #666;
-            margin-top: 8px;
+        .done-state .done-sub {
+            color: #888;
+            font-size: 13px;
+            margin-top: 6px;
         }
 
         .hidden {
             display: none !important;
         }
 
-        .flex-center {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-
-        /* ──────────────────────────────────────────────
-           ICONS
-           ────────────────────────────────────────────── */
-        .icon {
-            display: inline-flex;
-            flex-shrink: 0;
-            vertical-align: middle;
-        }
-
-        .icon svg {
-            display: block;
-            width: 100%;
-            height: 100%;
-        }
-
-        .icon-lock {
-            width: 20px;
-            height: 20px;
-        }
-
-        .icon-btn {
-            width: 16px;
-            height: 16px;
-        }
-
-        .icon-close {
-            width: 14px;
-            height: 14px;
-        }
-
-        .icon-lg {
-            width: 32px;
-            height: 32px;
-        }
-
-        /* ──────────────────────────────────────────────
-           SCROLLABLE CONTAINER
-           ────────────────────────────────────────────── */
-        .vars-scroll {
-            max-height: 400px;
-            overflow-y: auto;
-            margin: 0 -4px;
-            padding: 0 4px;
-        }
-
-        .vars-scroll::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .vars-scroll::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        .vars-scroll::-webkit-scrollbar-thumb {
-            background: #1a2340;
-            border-radius: 2px;
-        }
-
-        .vars-scroll::-webkit-scrollbar-thumb:hover {
-            background: #2a3350;
-        }
-
-        /* ──────────────────────────────────────────────
-           RESPONSIVE
-           ────────────────────────────────────────────── */
-        @media (max-width: 640px) {
+        @media (max-width: 520px) {
             .card {
-                padding: 20px 16px;
-                border-radius: 12px;
-            }
-
-            .card-header h1 {
-                font-size: 20px;
-            }
-
-            .subtitle {
-                padding-left: 0;
-                font-size: 13px;
-                margin-bottom: 16px;
+                padding: 20px;
             }
 
             .var-row {
                 flex-wrap: wrap;
-                gap: 6px;
-                padding: 6px 0;
             }
 
-            .var-row .var-name {
-                flex: 0 0 100%;
-                font-size: 12px;
-            }
-
-            .var-row .var-input {
+            .var-row .name-input {
                 flex: 1 1 100%;
-                font-size: 12px;
-                padding: 6px 10px;
             }
 
-            .var-row input[type="checkbox"] {
-                margin-right: 4px;
-                width: 16px;
-                height: 16px;
-            }
-
-            .var-row .delete-btn {
-                padding: 4px;
-                opacity: 1;
-            }
-
-            .actions {
-                gap: 8px;
+            .var-row .value-wrapper {
+                flex: 1 1 100%;
             }
 
             .actions .btn {
                 flex: 1 1 100%;
-                justify-content: center;
-                padding: 10px 16px;
-                font-size: 12px;
-            }
-
-            .add-row {
-                gap: 8px;
-            }
-
-            .add-row input {
-                flex: 1 1 100%;
-                font-size: 12px;
-                padding: 6px 10px;
-            }
-
-            .add-row .btn {
-                flex: 1 1 calc(50% - 4px);
-                justify-content: center;
-            }
-
-            .stats {
-                font-size: 12px;
-                margin-top: 12px;
-            }
-
-            .vars-scroll {
-                max-height: 300px;
-            }
-
-            .btn .icon-btn {
-                width: 14px;
-                height: 14px;
-            }
-        }
-
-        @media (max-width: 400px) {
-            .card {
-                padding: 16px 12px;
-            }
-
-            .card-header h1 {
-                font-size: 18px;
-            }
-
-            .var-row .var-name {
-                font-size: 11px;
-                flex: 0 0 80px;
-            }
-
-            .add-row .btn {
-                font-size: 11px;
-                padding: 6px 12px;
-            }
-
-            .actions .btn {
-                font-size: 11px;
-                padding: 8px 12px;
             }
         }
     </style>
 </head>
 <body>
     <div class="card" id="app">
-        <!-- ─── HEADER ─── -->
-        <div class="card-header">
-            <span class="icon icon-lock" id="icon-lock" aria-hidden="true"></span>
-            <h1>Environment Variables</h1>
-        </div>
-        <p class="subtitle">Configure the variables for your deployment.</p>
+        <h1>Environment Variables</h1>
+        <p class="subtitle">Configure variables for your deployment.</p>
 
-        <!-- ─── VARIABLES ─── -->
-        <div class="vars-scroll" id="vars-container">
-            <div class="empty-state" id="loading-state">
-                <span class="icon icon-lg" id="icon-spinner" aria-hidden="true"></span>
-                Loading variables...
-            </div>
+        <div id="vars-container">
+            <div class="empty-state">Loading variables...</div>
         </div>
 
-        <!-- ─── ADD ROW ─── -->
         <div class="add-row" id="add-row">
-            <input type="text" id="new-var-name" placeholder="Variable name (e.g., API_KEY)" autocomplete="off" spellcheck="false" />
-            <input type="password" id="new-var-value" placeholder="Value" autocomplete="off" />
-            <button class="btn btn-success" onclick="addVariable()" type="button">
-                <span class="icon icon-btn" id="icon-add-confirm" aria-hidden="true"></span> Add
-            </button>
-            <button class="btn btn-secondary" onclick="cancelAdd()" type="button">
-                <span class="icon icon-btn" id="icon-add-cancel" aria-hidden="true"></span> Cancel
-            </button>
+            <input type="text" id="new-var-name" placeholder="VARIABLE_NAME" autocomplete="off" spellcheck="false" />
+            <input type="text" id="new-var-value" placeholder="value" autocomplete="off" />
+            <button class="btn btn-success" onclick="addVariable()" type="button">Add</button>
+            <button class="btn btn-secondary" onclick="cancelAdd()" type="button">Cancel</button>
         </div>
 
-        <!-- ─── ACTIONS ─── -->
         <div class="actions" id="actions">
-            <button class="btn btn-secondary" onclick="showAddRow()" id="add-btn" type="button">
-                <span class="icon icon-btn" id="icon-add" aria-hidden="true"></span> Add Variable
-            </button>
-            <button class="btn btn-primary" onclick="saveAndDeploy()" id="save-btn" type="button">
-                <span class="icon icon-btn" id="icon-save" aria-hidden="true"></span> Save &amp; Deploy
-            </button>
-            <button class="btn btn-danger" onclick="cancel()" id="cancel-btn" type="button">
-                <span class="icon icon-btn" id="icon-cancel" aria-hidden="true"></span> Cancel
-            </button>
+            <button class="btn btn-secondary" onclick="showAddRow()" id="add-btn" type="button">+ Add Variable</button>
+            <button class="btn btn-primary" onclick="saveAndDeploy()" type="button">Save &amp; Deploy</button>
+            <button class="btn btn-danger" onclick="cancel()" type="button">Cancel</button>
         </div>
 
-        <!-- ─── STATS ─── -->
-        <div class="stats" id="stats">Loading...</div>
-
-        <!-- ─── MESSAGE ─── -->
+        <div class="stats" id="stats"></div>
         <div class="message" id="message"></div>
     </div>
 
-    <!-- ════════════════════════════════════════════════════
-    JAVASCRIPT
-    ════════════════════════════════════════════════════ -->
     <script>
-        /* ──────────────────────────────────────────────
-           SVG ICONS
-           ────────────────────────────────────────────── */
-        const ICONS = {
-            lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
-            plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
-            save: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>',
-            close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
-            alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a1 1 0 0 0 .9 1.5h18.6a1 1 0 0 0 .9-1.5L13.7 3.9a1 1 0 0 0-1.7 0Z"/></svg>',
-            check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.1V12a10 10 0 1 1-5.9-9.1"/><path d="m9 11 3 3L22 4"/></svg>',
-            spinner: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="1s" repeatCount="indefinite"/></svg>',
-        };
-
-        function icon(name) {
-            return ICONS[name] || '';
-        }
-
-        // Set icons with aria-hidden
-        document.getElementById('icon-lock').innerHTML = icon('lock');
-        document.getElementById('icon-add').innerHTML = icon('plus');
-        document.getElementById('icon-save').innerHTML = icon('save');
-        document.getElementById('icon-cancel').innerHTML = icon('close');
-        document.getElementById('icon-add-confirm').innerHTML = icon('plus');
-        document.getElementById('icon-add-cancel').innerHTML = icon('close');
-        document.getElementById('icon-spinner').innerHTML = icon('spinner');
-
-        // ✅ FIX: All buttons already have type="button" in HTML
-
-        /* ──────────────────────────────────────────────
-           ✅ FIX 2: Proper escapeHtml that handles quotes
-           ────────────────────────────────────────────── */
         function escapeHtml(text) {
             if (!text) return '';
             return String(text)
@@ -656,15 +351,12 @@
                 .replace(/'/g, '&#39;');
         }
 
-        /* ──────────────────────────────────────────────
-           STATE
-           ────────────────────────────────────────────── */
-        let vars = [];
-        let hasAutoFocused = false; // ✅ FIX 3: Track focus state
+        const ICON_EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+        const ICON_EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
 
-        /* ──────────────────────────────────────────────
-           LOAD VARIABLES
-           ────────────────────────────────────────────── */
+        let vars = [];
+        const visibleState = {};
+
         function loadVars() {
             fetch('/api/vars')
                 .then((r) => r.json())
@@ -674,64 +366,47 @@
                 })
                 .catch(() => {
                     document.getElementById('vars-container').innerHTML =
-                        '<div class="empty-state">' +
-                        icon('alert') +
-                        '<span>Could not load variables</span>' +
-                        '<span class="sub-text">Please check your connection and try again.</span>' +
-                        '</div>';
-                    document.getElementById('stats').textContent = 'Error loading variables';
+                        '<div class="empty-state">Could not load variables.</div>';
                 });
         }
 
-        /* ──────────────────────────────────────────────
-           ✅ FIX 3: RENDER VARIABLES with proper focus
-           ────────────────────────────────────────────── */
         function renderVars() {
             const container = document.getElementById('vars-container');
             const selected = vars.filter((v) => v.selected).length;
-            const stats = document.getElementById('stats');
-
-            stats.textContent = 'Selected: ' + selected + ' of ' + vars.length + ' variables';
+            document.getElementById('stats').textContent =
+                'Selected ' + selected + ' of ' + vars.length + ' variables';
 
             if (vars.length === 0) {
                 container.innerHTML =
-                    '<div class="empty-state">' +
-                    '<span style="font-size:32px;margin-bottom:8px;">📭</span>' +
-                    '<span>No variables detected</span>' +
-                    '<span class="sub-text">Add one using the button below.</span>' +
-                    '</div>';
+                    '<div class="empty-state">No variables detected. Add one below.</div>';
                 return;
             }
 
             let html = '';
             vars.forEach((v, i) => {
-                const inputType = v.sensitive ? 'password' : 'text';
-                const sensitiveClass = v.sensitive ? 'sensitive' : '';
-                const displayValue = v.sensitive && v.value ? '' : v.value;
+                const isVisible = visibleState[v.name] === true;
+                const inputType = isVisible ? 'text' : 'password';
+                const toggleIcon = isVisible ? ICON_EYE_OFF : ICON_EYE;
                 html += `
-                            <div class="var-row">
-                                <input type="checkbox" ${v.selected ? 'checked' : ''} onchange="toggleSelection(${i})" id="chk_${i}" />
-                                <span class="var-name" title="${escapeHtml(v.name)}">${escapeHtml(v.name)}</span>
-                                <input class="var-input ${sensitiveClass}" type="${inputType}" value="${escapeHtml(displayValue)}" onchange="updateValue(${i}, this.value)" placeholder="Enter ${escapeHtml(v.name)}" spellcheck="false" />
-                                <button class="delete-btn" onclick="deleteVariable(${i})" title="Delete ${escapeHtml(v.name)}" type="button">${icon('close')}</button>
-                            </div>
-                        `;
+                    <div class="var-row">
+                        <input type="checkbox" ${v.selected ? 'checked' : ''} onchange="toggleSelection(${i})" />
+                        <input type="text" class="name-input" value="${escapeHtml(v.name)}" readonly />
+                        <div class="value-wrapper">
+                            <input type="${inputType}" value="${escapeHtml(v.value || '')}" onchange="updateValue(${i}, this.value)" placeholder="value" spellcheck="false" />
+                            <button class="toggle-btn" onclick="toggleVisibility('${escapeHtml(v.name)}')" title="${isVisible ? 'Hide' : 'Show'}" type="button">${toggleIcon}</button>
+                        </div>
+                        <button class="delete-btn" onclick="deleteVariable(${i})" title="Delete" type="button">×</button>
+                    </div>
+                `;
             });
             container.innerHTML = html;
-
-            // ✅ FIX 3: Focus once, only if not already focused
-            if (!hasAutoFocused) {
-                const firstInput = container.querySelector('.var-input');
-                if (firstInput) {
-                    firstInput.focus();
-                }
-                hasAutoFocused = true;
-            }
         }
 
-        /* ──────────────────────────────────────────────
-           API CALLS
-           ────────────────────────────────────────────── */
+        function toggleVisibility(name) {
+            visibleState[name] = !visibleState[name];
+            renderVars();
+        }
+
         function toggleSelection(index) {
             const v = vars[index];
             if (!v) return;
@@ -766,12 +441,8 @@
             }
         }
 
-        /* ──────────────────────────────────────────────
-           ADD VARIABLE
-           ────────────────────────────────────────────── */
         function showAddRow() {
-            const row = document.getElementById('add-row');
-            row.classList.add('visible');
+            document.getElementById('add-row').classList.add('visible');
             document.getElementById('new-var-name').focus();
             hideMessage();
         }
@@ -795,9 +466,8 @@
                 return;
             }
 
-            // Validate name format
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-                showMessage('Use only letters, numbers, and underscores; don\'t start with a number.', 'error');
+                showMessage('Use letters, numbers, and underscores only. Cannot start with a number.', 'error');
                 nameInput.focus();
                 return;
             }
@@ -817,100 +487,62 @@
                         showMessage(data.error || data.message || 'Could not add variable.', 'error');
                     }
                 })
-                .catch(() => {
-                    showMessage('Network error. Please try again.', 'error');
-                });
+                .catch(() => showMessage('Network error. Please try again.', 'error'));
         }
 
-        /* ──────────────────────────────────────────────
-           SAVE & DEPLOY
-           ────────────────────────────────────────────── */
         function saveAndDeploy() {
             showMessage('Saving...', 'info');
             fetch('/api/save', { method: 'POST' })
                 .then((r) => r.json())
                 .then((data) => {
                     if (data.success) {
-                        showDoneState('✅ Variables saved — deployment will continue in your terminal.', 'success');
+                        showDoneState('Variables saved. Deployment will continue in your terminal.');
                     } else {
                         showMessage(data.error || 'Save failed.', 'error');
                     }
                 })
-                .catch(() => {
-                    showMessage('Network error. Please try again.', 'error');
-                });
+                .catch(() => showMessage('Network error. Please try again.', 'error'));
         }
 
-        /* ──────────────────────────────────────────────
-           CANCEL
-           ────────────────────────────────────────────── */
         function cancel() {
             if (confirm('Cancel deployment?')) {
                 fetch('/api/cancel', { method: 'POST' }).then(() => {
-                    showDoneState('❌ Cancelled.', 'error');
+                    showDoneState('Cancelled.');
                 });
             }
         }
 
-        /* ──────────────────────────────────────────────
-           DONE STATE
-           ────────────────────────────────────────────── */
-        function showDoneState(message, type) {
-            const actions = document.getElementById('actions');
-            const addRow = document.getElementById('add-row');
-            const container = document.getElementById('vars-container');
-
-            actions.classList.add('hidden');
-            addRow.classList.remove('visible');
-
-            const iconName = type === 'success' ? 'check' : 'alert';
-            container.innerHTML =
+        function showDoneState(message) {
+            document.getElementById('actions').classList.add('hidden');
+            document.getElementById('add-row').classList.remove('visible');
+            document.getElementById('vars-container').innerHTML =
                 '<div class="done-state">' +
-                '<span class="icon icon-lg" style="color:' +
-                (type === 'success' ? '#00d4ff' : '#ff4444') +
-                ';">' +
-                icon(iconName) +
-                '</span>' +
-                '<div style="font-size:18px;font-weight:600;margin-top:8px;">' +
-                escapeHtml(message) +
-                '</div>' +
-                '<p class="subtitle">You can close this tab now.</p>' +
+                '<div class="done-title">' + escapeHtml(message) + '</div>' +
+                '<div class="done-sub">You can close this tab now.</div>' +
                 '</div>';
-
             document.getElementById('stats').textContent = '';
             hideMessage();
-
-            // Best-effort close (works only if tab was opened by script)
             try { window.close(); } catch (_) { /* ignore */ }
         }
 
-        /* ──────────────────────────────────────────────
-           MESSAGE
-           ────────────────────────────────────────────── */
         function showMessage(msg, type) {
             const el = document.getElementById('message');
             el.className = 'message visible message-' + type;
-            el.innerHTML = (type === 'error' ? icon('alert') : icon('check')) + ' ' + escapeHtml(msg);
+            el.textContent = msg;
         }
 
         function hideMessage() {
             const el = document.getElementById('message');
             el.className = 'message';
-            el.innerHTML = '';
+            el.textContent = '';
         }
 
-        /* ──────────────────────────────────────────────
-           KEYBOARD SHORTCUTS
-           ────────────────────────────────────────────── */
         document.addEventListener('keydown', function(e) {
-            // Ctrl+Enter → Save
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                 e.preventDefault();
                 saveAndDeploy();
                 return;
             }
-
-            // Escape → Cancel
             if (e.key === 'Escape') {
                 e.preventDefault();
                 const addRow = document.getElementById('add-row');
@@ -921,8 +553,6 @@
                 }
                 return;
             }
-
-            // Enter in add row → Add
             if (e.key === 'Enter') {
                 const nameInput = document.getElementById('new-var-name');
                 const valueInput = document.getElementById('new-var-value');
@@ -933,10 +563,6 @@
             }
         });
 
-        /* ──────────────────────────────────────────────
-           ✅ FIX 3: INIT — No more race condition
-           ────────────────────────────────────────────── */
-        // loadVars() will render and focus via renderVars()'s hasAutoFocused check
         loadVars();
     </script>
 </body>
